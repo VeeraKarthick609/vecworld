@@ -43,6 +43,13 @@ class GpuUnavailable(GameError):
     status, code = 503, "gpu_unavailable"
 
 
+class UnknownSession(GameError, KeyError):
+    status, code = 404, "unknown_session"
+
+    def __str__(self):
+        return "That session has expired, reload the page."
+
+
 class GameService:
     def __init__(self, space: MeaningSpace, vocab_mean: np.ndarray, embedder: Embedder,
                  generator: SceneGenerator, finder: HotspotFinder, scene_dir: Path):
@@ -63,7 +70,10 @@ class GameService:
         return s
 
     def get(self, sid: str) -> Session:
-        return self._sessions[sid]
+        try:
+            return self._sessions[sid]
+        except KeyError:
+            raise UnknownSession(sid) from None
 
     def jump(self, sid: str, text: str) -> Scene:
         s = self.get(sid)
