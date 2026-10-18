@@ -1,3 +1,4 @@
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -26,17 +27,22 @@ def _is_noun(wordnet, w: str) -> bool:
     return has_common_noun and (noun > other or other == 0)
 
 
-def build_vocab(n: int = 5000) -> list[str]:
-    """Most frequent English words whose dominant sense is a common noun, in frequency order."""
+def _corpora(*names: str) -> None:
     import nltk
-    from nltk.corpus import stopwords, wordnet
-    from wordfreq import top_n_list
 
-    for corpus in ("wordnet", "stopwords"):
+    for corpus in names:
         try:
             nltk.data.find(f"corpora/{corpus}")
         except LookupError:
             nltk.download(corpus, quiet=True)
+
+
+def build_vocab(n: int = 5000) -> list[str]:
+    """Most frequent English words whose dominant sense is a common noun, in frequency order."""
+    from nltk.corpus import stopwords, wordnet
+    from wordfreq import top_n_list
+
+    _corpora("wordnet", "stopwords")
     stop = set(stopwords.words("english")) | EXTRA_STOPWORDS
 
     out: list[str] = []
@@ -51,6 +57,18 @@ def build_vocab(n: int = 5000) -> list[str]:
         if len(out) == n:
             break
     return out
+
+
+@lru_cache(maxsize=None)
+def is_concrete(word: str) -> bool:
+    """Whether the word's dominant noun sense is a physical thing (WordNet), so it can be drawn plainly."""
+    from nltk.corpus import wordnet
+
+    _corpora("wordnet")
+    senses = wordnet.synsets(word, pos="n")
+    if not senses:
+        return False
+    return wordnet.synset("physical_entity.n.01") in senses[0].closure(lambda s: s.hypernyms())
 
 
 def centre(raw: np.ndarray, mean: np.ndarray) -> np.ndarray:

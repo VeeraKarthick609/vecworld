@@ -12,7 +12,7 @@ def test_clipseg_finds_concepts_in_generated_scene():
     from vecworld.scenes.generator import TurboGenerator
     from vecworld.scenes.hotspots import ClipSegFinder
 
-    img = TurboGenerator().fresh(scene_prompt("ship", ["sun"]), seed=3)
+    img = TurboGenerator().fresh(scene_prompt("ship", ["sun"], True), seed=3)
     finder = ClipSegFinder()
     concepts = ["ship", "sun", "waves", "cloud", "tiger", "piano", "castle"]
     finder.find(img, ["warm", "up"])

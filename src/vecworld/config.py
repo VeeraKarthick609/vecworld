@@ -17,7 +17,7 @@ CENTRE_BOX = (0.35, 0.35, 0.3, 0.3)  # the pinned centre's box when CLIPSeg can'
 MAX_TEXT_CHARS = 200
 SESSION_TTL = 3600     # seconds idle before a session (and its scene image) is dropped
 MAX_SESSIONS = 50
-STYLE = "dreamlike painterly landscape, soft volumetric light, oil painting, cohesive palette"
+STYLE = "dreamlike painterly scene, soft volumetric light, oil painting, cohesive palette"
 
 DATA_DIR = Path("data")
 SCENE_DIR = Path("var/scenes")

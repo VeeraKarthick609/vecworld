@@ -4,10 +4,25 @@ from vecworld.config import STYLE
 from vecworld.scenes.prompt import scene_prompt, zoom_crop
 
 
-def test_scene_prompt():
-    p = scene_prompt("ship", ["waves", "gull"])
-    assert p.startswith(STYLE) and "a ship in the centre" in p and "waves, gull" in p
-    assert "with" not in scene_prompt("ship", [])
+def test_concrete_prompt_is_a_plain_scene():
+    p = scene_prompt("ship", ["waves", "gull"], concrete=True)
+    assert p.startswith("a scene of a ship in the centre, with waves, gull around it")
+    assert p.endswith(STYLE)
+    assert "with" not in scene_prompt("ship", [], concrete=True).replace(STYLE, "")
+
+
+def test_vowel_gets_an():
+    assert scene_prompt("elephant", [], concrete=True).startswith("a scene of an elephant")
+
+
+def test_abstract_prompt_is_symbolic():
+    p = scene_prompt("anger", ["rage", "grief"], concrete=False)
+    assert p.startswith("a symbolic scene evoking anger, with rage, grief") and p.endswith(STYLE)
+
+
+def test_no_landscape_framing():
+    assert "landscape" not in STYLE
+    assert "landscape" not in scene_prompt("anger", ["rage"], concrete=False)
 
 
 def test_zoom_crop_clamps_and_keeps_size():

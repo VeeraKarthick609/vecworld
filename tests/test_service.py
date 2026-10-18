@@ -42,6 +42,15 @@ def test_only_located_neighbours_are_offered(svc):
     assert len(svc.finder.asked[-1]) == 1 + min(N_CANDIDATES, len(svc.space.words) - 1)
 
 
+def test_abstract_concepts_get_a_symbolic_scene(svc_factory):
+    svc = svc_factory(concrete=lambda w: w != "desert")
+    s = svc.new_session()
+    svc.jump(s.id, "desert")
+    assert svc.generator.calls[-1][1].startswith("a symbolic scene evoking desert")
+    svc.jump(s.id, "ocean")
+    assert svc.generator.calls[-1][1].startswith("a scene of an ocean")
+
+
 def test_step_pins_clicked_concept_even_when_capped(svc):
     s = svc.new_session()
     svc.jump(s.id, "ocean")

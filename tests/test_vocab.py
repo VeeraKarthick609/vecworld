@@ -1,6 +1,6 @@
 import numpy as np
 
-from vecworld.space.vocab import build_vocab, centre
+from vecworld.space.vocab import build_vocab, centre, is_concrete
 
 
 def test_build_vocab_shape():
@@ -21,3 +21,8 @@ def test_centre_unit_rows():
     raw = np.random.rand(10, 8).astype(np.float32) + 5
     out = centre(raw, raw.mean(0))
     assert np.allclose(np.linalg.norm(out, axis=1), 1, atol=1e-5)
+
+
+def test_concrete_vs_abstract():
+    assert all(map(is_concrete, ["guitar", "elephant", "kitchen", "volcano", "library", "bicycle"]))
+    assert not any(map(is_concrete, ["anger", "friendship", "loneliness"]))

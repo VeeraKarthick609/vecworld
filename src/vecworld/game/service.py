@@ -15,7 +15,7 @@ from vecworld.scenes.hotspots import Hotspot, HotspotFinder, choose
 from vecworld.scenes.prompt import scene_prompt, zoom_crop
 from vecworld.space.embedder import Embedder
 from vecworld.space.index import MeaningSpace
-from vecworld.space.vocab import centre
+from vecworld.space.vocab import centre, is_concrete
 
 MINDMAP_NEIGHBOURS = 30
 
@@ -54,7 +54,8 @@ class UnknownSession(GameError, KeyError):
 
 class GameService:
     def __init__(self, space: MeaningSpace, vocab_mean: np.ndarray, embedder: Embedder,
-                 generator: SceneGenerator, finder: HotspotFinder, scene_dir: Path, clock=time.monotonic):
+                 generator: SceneGenerator, finder: HotspotFinder, scene_dir: Path, clock=time.monotonic,
+                 concrete=is_concrete):
         self.space = space
         self.vocab_mean = vocab_mean
         self.embedder = embedder
@@ -62,6 +63,7 @@ class GameService:
         self.finder = finder
         self.scene_dir = Path(scene_dir)
         self.clock = clock
+        self.concrete = concrete
         self.scene_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()   # guards busy flags
@@ -95,7 +97,7 @@ class GameService:
             (centre_word, _), *rest = self.space.neighbours(position, k=1 + N_CANDIDATES)
             others = [w for w, _ in rest]
             img, hotspots = self._render(
-                lambda: self.generator.fresh(scene_prompt(centre_word, others[:N_PROMPT_NEIGHBOURS]), s.seed),
+                lambda: self.generator.fresh(self._prompt(centre_word, others), s.seed),
                 centre_word, others)
             return self._commit(s, position, img, hotspots)
 
@@ -112,9 +114,12 @@ class GameService:
             others = [w for w, _ in self.space.neighbours(position, k=N_CANDIDATES, exclude={concept})]
             prev = zoom_crop(s.image, clicked.x + clicked.w / 2, clicked.y + clicked.h / 2, ZOOM_FRAC)
             img, hotspots = self._render(
-                lambda: self.generator.evolve(prev, scene_prompt(concept, others[:N_PROMPT_NEIGHBOURS]), s.seed),
+                lambda: self.generator.evolve(prev, self._prompt(concept, others), s.seed),
                 concept, others)
             return self._commit(s, position, img, hotspots)
+
+    def _prompt(self, centre_word: str, others: list[str]) -> str:
+        return scene_prompt(centre_word, others[:N_PROMPT_NEIGHBOURS], self.concrete(centre_word))
 
     def _claim(self, s: Session):
         service = self
