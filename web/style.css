@@ -3,9 +3,9 @@
   --ink: #eef1f6;
   --ink-dim: rgba(238, 241, 246, 0.65);
   --glass: rgba(10, 12, 18, 0.62);
+  --glass-strong: rgba(10, 12, 18, 0.85);
   --line: rgba(255, 255, 255, 0.18);
   --gold: #ffcf5c;
-  --dot: #8fb3ff;
 }
 
 * { box-sizing: border-box; }
@@ -19,49 +19,36 @@ html, body {
   overflow: hidden;
 }
 
-/* Blurred copy of the scene fills the screen around the square stage. */
-#backdrop {
-  position: fixed; inset: -40px;
-  background-size: cover; background-position: center;
-  filter: blur(40px) brightness(0.55) saturate(1.2);
-  transition: background-image 0.6s;
-}
-
+/* The panorama fills the screen; dragging anywhere on it looks around. */
 #stage {
-  position: fixed;
-  top: 50%; left: 50%;
-  width: min(100vw, 100vh); height: min(100vw, 100vh);
-  transform: translate(-50%, -50%);
-  overflow: hidden;
+  position: fixed; inset: 0;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 }
+#stage:active { cursor: grabbing; }
+#view { display: block; width: 100%; height: 100%; }
 
-.scene {
-  position: absolute; inset: 0;
-  width: 100%; height: 100%;
-  object-fit: cover;
-  opacity: 0;
-  transition: opacity 0.3s ease, transform 0.6s ease-in;
-}
-.scene.shown { opacity: 1; }
-.scene:not([src]) { display: none; }
+#labels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
 
-#hotspots { position: absolute; inset: 0; }
-
-.hotspot {
+/* A discovery: its box on the panorama, with the name always showing at the top. */
+.label {
   position: absolute;
-  border-radius: 10px;
-  cursor: pointer;
+  padding: 0; margin: 0;
+  background: none; color: inherit; font: inherit;
   border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 10px;
   outline: 2px dashed transparent;
   outline-offset: 2px;
+  cursor: pointer;
+  pointer-events: auto;
   transition: outline-color 0.15s, background 0.15s;
 }
-.hotspot:hover, .hotspot:focus-visible {
+.label:hover, .label:focus-visible {
   outline-color: rgba(255, 255, 255, 0.8);
   background: rgba(255, 255, 255, 0.06);
 }
-/* Labels always show, at the top of their box, so you can see what you can walk toward. */
-.hotspot span {
+.label span {
   position: absolute; left: 50%; top: 4px;
   transform: translateX(-50%);
   padding: 1px 8px; border-radius: 6px;
@@ -69,8 +56,8 @@ html, body {
   font-size: 13px; white-space: nowrap;
   pointer-events: none;
 }
-.hotspot:hover span, .hotspot:focus-visible span { background: rgba(10, 12, 18, 0.85); }
-.busy .hotspot { pointer-events: none; }
+.label:hover span, .label:focus-visible span { background: var(--glass-strong); }
+.busy .label { pointer-events: none; opacity: 0.6; }
 
 #spinner {
   position: absolute; left: 50%; top: 50%;
@@ -78,37 +65,48 @@ html, body {
   border: 3px solid var(--line); border-top-color: var(--ink);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+  pointer-events: none;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 #intro {
-  position: fixed; left: 50%; top: 42%;
+  position: fixed; left: 50%; top: 38%;
   transform: translate(-50%, -50%);
   width: min(560px, calc(100vw - 32px));
   text-align: center;
+  pointer-events: none;
 }
 #intro h1 { font-weight: 300; font-size: 44px; letter-spacing: 0.08em; margin: 0 0 8px; }
 #intro p { color: var(--ink-dim); margin: 0; }
 
-#mindmap {
-  position: fixed; right: 16px; bottom: 16px;
-  width: 200px; height: 160px;
-  background: var(--glass);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  backdrop-filter: blur(6px);
-}
-
-#jump {
+/* Bottom centre: mood chips over the text bar. */
+#dock {
   position: fixed; left: 50%; bottom: 20px;
   transform: translateX(-50%);
-  width: min(560px, calc(100vw - 32px - 216px));
+  width: min(560px, calc(100vw - 32px));
+  display: flex; flex-direction: column; gap: 8px;
 }
-@media (max-width: 640px) {
-  #jump { width: calc(100vw - 32px); bottom: 192px; }
-  #mindmap { width: 160px; height: 128px; }
+
+#moods { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+.chip {
+  padding: 3px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--glass);
+  color: var(--ink-dim);
+  font: inherit; font-size: 13px;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-#jump input {
+.chip:hover { color: var(--ink); border-color: rgba(255, 255, 255, 0.45); }
+.chip[aria-pressed="true"] {
+  color: var(--bg);
+  background: var(--gold);
+  border-color: var(--gold);
+}
+
+#theme input {
   width: 100%;
   padding: 12px 18px;
   border-radius: 24px;
@@ -119,11 +117,12 @@ html, body {
   outline: none;
   backdrop-filter: blur(6px);
 }
-#jump input:focus { border-color: rgba(255, 255, 255, 0.45); }
-#jump input:disabled { opacity: 0.6; }
+#theme input:focus { border-color: rgba(255, 255, 255, 0.45); }
+#theme input:disabled { opacity: 0.6; }
 
+/* Just above the chips and text bar. */
 #keys {
-  position: fixed; left: 50%; bottom: 72px;
+  position: fixed; left: 50%; bottom: 122px;
   transform: translateX(-50%);
   color: var(--ink-dim); font-size: 12px; white-space: nowrap;
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
@@ -133,7 +132,35 @@ html, body {
   font: inherit; padding: 0 5px; border-radius: 4px;
   border: 1px solid var(--line); background: var(--glass);
 }
-@media (max-width: 640px) { #keys { bottom: 244px; } }
+
+/* Walk / turn back buttons for touch screens, bottom right. */
+#pad { display: none; }
+#pad button {
+  width: 56px; height: 56px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--glass);
+  color: var(--ink);
+  font-size: 24px; line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  touch-action: manipulation;
+}
+#pad button:active { background: var(--glass-strong); border-color: rgba(255, 255, 255, 0.45); }
+.busy #pad button { opacity: 0.5; }
+
+@media (max-width: 640px), (pointer: coarse) {
+  #pad:not([hidden]) {
+    position: fixed; right: 16px; bottom: 20px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  #keys { display: none; }
+}
+@media (max-width: 640px) {
+  /* Once dreaming, leave the right-hand column to the buttons. */
+  .dreaming #dock { left: 16px; transform: none; width: calc(100vw - 32px - 72px); }
+  #intro h1 { font-size: 34px; }
+}
 
 #toast {
   position: fixed; left: 50%; top: 20px;
@@ -141,4 +168,6 @@ html, body {
   padding: 8px 16px; border-radius: 8px;
   background: var(--glass); border: 1px solid var(--line);
   max-width: calc(100vw - 32px);
+  backdrop-filter: blur(6px);
+  z-index: 2;
 }

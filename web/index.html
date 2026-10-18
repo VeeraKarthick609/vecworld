@@ -3,34 +3,45 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>vecworld</title>
+  <title>Dream Walk</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div id="backdrop"></div>
-
-  <main id="stage">
-    <img id="scene-a" class="scene" alt="">
-    <img id="scene-b" class="scene" alt="">
-    <div id="hotspots"></div>
+  <main id="stage" aria-label="the dream; drag to look around">
+    <canvas id="view"></canvas>
+    <div id="labels"></div>
     <div id="spinner" hidden></div>
   </main>
 
   <div id="intro">
-    <h1>vecworld</h1>
-    <p>Walk through the inside of a language model.<br>Type a word to land where the model keeps it, then click what you see, or walk with W A S D.</p>
+    <h1>Dream Walk</h1>
+    <p>Type a place to dream of and pick a mood.<br>Then look around, walk on, and step toward what you find.</p>
   </div>
 
-  <canvas id="mindmap" width="400" height="320" hidden></canvas>
+  <div id="keys" hidden>drag or <kbd>A</kbd> <kbd>D</kbd> to look · <kbd>W</kbd> walk · <kbd>S</kbd> turn back · click a discovery to approach</div>
 
-  <div id="keys" hidden><kbd>W</kbd> walk on · <kbd>A</kbd> <kbd>D</kbd> left / right · <kbd>S</kbd> back · or click</div>
+  <div id="dock">
+    <!-- Must match vecworld.config.MOODS (checked by tests/test_ui.py). -->
+    <div id="moods" role="group" aria-label="moods">
+      <button type="button" class="chip" data-mood="foggy" aria-pressed="false">foggy</button>
+      <button type="button" class="chip" data-mood="night" aria-pressed="false">night</button>
+      <button type="button" class="chip" data-mood="rain" aria-pressed="false">rain</button>
+      <button type="button" class="chip" data-mood="snow" aria-pressed="false">snow</button>
+      <button type="button" class="chip" data-mood="eerie" aria-pressed="false">eerie</button>
+      <button type="button" class="chip" data-mood="warm" aria-pressed="false">warm</button>
+    </div>
+    <form id="theme">
+      <input id="theme-text" autocomplete="off" maxlength="120" placeholder="dream of a place…" aria-label="theme" autofocus>
+    </form>
+  </div>
 
-  <form id="jump">
-    <input id="jump-text" autocomplete="off" maxlength="200" placeholder="type a word to enter the model's mind…" autofocus>
-  </form>
+  <div id="pad" hidden>
+    <button type="button" id="go-walk" aria-label="walk on">↑</button>
+    <button type="button" id="go-back" aria-label="turn back">↓</button>
+  </div>
 
-  <div id="toast" hidden></div>
+  <div id="toast" role="status" hidden></div>
 
   <script src="app.js"></script>
 </body>
