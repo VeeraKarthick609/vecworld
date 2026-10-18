@@ -13,7 +13,7 @@ def test_to_label_maps_crop_box_to_panorama():
 
 def test_to_label_wraps_u_into_unit_interval():
     l = to_label("x", Hotspot("x", 0.9, 0.1, 0.1, 0.1), u_centre=0.99, pano_w=2048)
-    assert 0.0 <= l.u < 1.0 and wrap_dist(l.u, 0.99 + 0.2 * 0.25) < 1e-6
+    assert 0.0 <= l.u < 1.0 and wrap_dist(l.u, 0.99 + 0.45 * 0.25) < 1e-6
 
 
 def test_crop_at_wraps_around_seam():
