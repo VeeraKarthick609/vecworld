@@ -117,3 +117,17 @@ class FakePainter:
         self.calls.append(("step", {"prev": prev, "base": base, "focus": focus, "focus_at": focus_at, "seed": seed}))
         self._maybe_fail()
         return self._img("teal")
+
+
+class FakeDreamer:
+    """Canned discoveries; records every call."""
+
+    IDEAS = ["an old lantern on a post", "a ruined stone chapel", "a misty pond",
+             "a lone wooden bench", "a mossy stone well", "a crooked fence"]
+
+    def __init__(self):
+        self.calls: list[tuple[str, list[str], int]] = []
+
+    def ideas(self, theme, moods, n):
+        self.calls.append((theme, list(moods), n))
+        return [self.IDEAS[i % len(self.IDEAS)] for i in range(n)]
