@@ -1,4 +1,6 @@
+import gc
 import threading
+import weakref
 
 from vecworld.dream.gpu import GpuQueue
 
@@ -93,3 +95,56 @@ def test_externally_cancelled_future_never_runs():
     release.set()
     assert ok.result(timeout=5) == "ok"
     assert order == ["busy", "ok"]
+
+
+def test_replaced_prefetch_keeps_turn_position():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    a1 = q.submit(_rec(order, "a1"), "a", prefetch=True)
+    b1 = q.submit(_rec(order, "b1"), "b", prefetch=True)
+    a2 = q.submit(_rec(order, "a2"), "a", prefetch=True)
+    assert a1.cancelled()
+    release.set()
+    for f in (b1, a2):
+        f.result(timeout=5)
+    assert order == ["busy", "a2", "b1"]
+
+
+def test_cancel_owner_of_running_job():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)  # owner "x" is running
+    q.cancel_owner("x")
+    later = q.submit(_rec(order, "later"), "x")
+    release.set()
+    assert busy.result(timeout=5) is None
+    assert later.result(timeout=5) == "later"
+    assert order == ["busy", "later"]
+
+
+class _Payload:
+    pass
+
+
+def _submit_failing(q):
+    payload = _Payload()
+    ref = weakref.ref(payload)
+
+    def boom():
+        payload  # close over it
+        raise RuntimeError("oom")
+
+    fut = q.submit(boom, "a")
+    assert isinstance(fut.exception(timeout=5), RuntimeError)
+    return ref
+
+
+def test_failed_job_is_released_while_worker_idle():
+    q = GpuQueue()
+    ref = _submit_failing(q)  # future dropped on return
+    # worker is idle now; nothing else is submitted, so only the loop frame could hold it
+    for _ in range(100):
+        gc.collect()
+        if ref() is None:
+            break
+        threading.Event().wait(0.01)
+    assert ref() is None

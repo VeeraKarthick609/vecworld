@@ -23,10 +23,13 @@ class GpuQueue:
         fut: Future = Future()
         with self._cond:
             q = self._queues[_PREFETCH if prefetch else _DEMAND]
+            dq = q.setdefault(owner, deque())
             if prefetch:
-                for old, _ in q.pop(owner, ()):
+                # replace in place so the owner keeps its turn in the rotation
+                for old, _ in dq:
                     old.cancel()
-            q.setdefault(owner, deque()).append((fut, fn))
+                dq.clear()
+            dq.append((fut, fn))
             self._cond.notify()
         return fut
 
@@ -57,9 +60,10 @@ class GpuQueue:
                     self._cond.wait()
                     item = self._next()
             fut, fn = item
-            if not fut.set_running_or_notify_cancel():
-                continue
-            try:
-                fut.set_result(fn())
-            except BaseException as e:  # noqa: BLE001 - job errors go to the future
-                fut.set_exception(e)
+            if fut.set_running_or_notify_cancel():
+                try:
+                    fut.set_result(fn())
+                except BaseException as e:  # noqa: BLE001 - job errors go to the future
+                    fut.set_exception(e)
+            # drop references so a finished/failed job's tensors can be freed
+            del item, fut, fn
