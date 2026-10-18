@@ -42,6 +42,18 @@ class MeaningSpace:
         out = (np.sin((1 - t) * theta) * p + np.sin(t * theta) * target) / s
         return (out / np.linalg.norm(out)).astype(np.float32)
 
+    def heading(self, p_from: np.ndarray, p_to: np.ndarray) -> np.ndarray | None:
+        """Unit tangent at p_to along the great circle from p_from, pointing onward (None if no direction)."""
+        t = float(np.dot(p_from, p_to)) * p_to - p_from
+        n = float(np.linalg.norm(t))
+        return None if n < 1e-6 else (t / n).astype(np.float32)
+
+    def walk(self, p: np.ndarray, h: np.ndarray, angle: float) -> tuple[np.ndarray, np.ndarray]:
+        """Move `angle` along the great circle through p with tangent h; returns the new point and tangent."""
+        c, s = np.cos(angle), np.sin(angle)
+        p2, h2 = c * p + s * h, -s * p + c * h
+        return (p2 / np.linalg.norm(p2)).astype(np.float32), (h2 / np.linalg.norm(h2)).astype(np.float32)
+
     def project(self, p: np.ndarray) -> tuple[float, float]:
         x, y = (p - self._mean) @ self._components.T / self._scale
         return float(x), float(y)

@@ -35,9 +35,24 @@ def test_full_flow(client):
     assert client.post(f"/api/session/{sid}/step", json={"concept": c}).status_code == 200
 
 
+def test_forward_and_back(client):
+    sid = new(client)
+    jumped = client.post(f"/api/session/{sid}/jump", json={"text": "ocean"}).json()
+    assert jumped["centre"] == "ocean" == jumped["hotspots"][0]["concept"]
+    fw = client.post(f"/api/session/{sid}/forward")
+    assert fw.status_code == 200 and fw.json()["centre"] != "ocean" and len(fw.json()["mindmap"]["trail"]) == 2
+    bk = client.post(f"/api/session/{sid}/back")
+    assert bk.status_code == 200 and bk.json()["scene_id"] == jumped["scene_id"]
+    assert bk.json()["mindmap"]["trail"] == jumped["mindmap"]["trail"]
+    r = client.post(f"/api/session/{sid}/back")
+    assert (r.status_code, r.json()["error"]) == (409, "no_history")
+
+
 @pytest.mark.parametrize("path,payload,status,code", [
     ("jump", {"text": " "}, 422, "bad_input"),
     ("step", {"concept": "ship"}, 409, "not_started"),
+    ("forward", None, 409, "not_started"),
+    ("back", None, 409, "not_started"),
 ])
 def test_errors(client, path, payload, status, code):
     r = client.post(f"/api/session/{new(client)}/{path}", json=payload)

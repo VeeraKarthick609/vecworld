@@ -22,6 +22,7 @@ class StepIn(BaseModel):
 def scene_out(sc: Scene) -> dict:
     return {
         "scene_id": sc.scene_id,
+        "centre": sc.centre,
         "image_url": f"/scenes/{sc.scene_id}.png",
         "hotspots": [{"concept": h.concept, "x": h.x, "y": h.y, "w": h.w, "h": h.h} for h in sc.hotspots],
         "mindmap": {
@@ -61,6 +62,14 @@ def create_app(service: GameService, web_dir: Path) -> FastAPI:
     @app.post("/api/session/{sid}/step")
     async def step(sid: str, body: StepIn):
         return scene_out(await run(service.step, sid, body.concept))
+
+    @app.post("/api/session/{sid}/forward")
+    async def forward(sid: str):
+        return scene_out(await run(service.forward, sid))
+
+    @app.post("/api/session/{sid}/back")
+    async def back(sid: str):
+        return scene_out(await run(service.back, sid))
 
     app.mount("/scenes", StaticFiles(directory=service.scene_dir), name="scenes")
     app.mount("/", StaticFiles(directory=web_dir, html=True), name="web")

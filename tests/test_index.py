@@ -35,3 +35,30 @@ def test_project_in_range():
     for w in s.words:
         x, y = s.project(s.vector(w))
         assert -1.0001 <= x <= 1.0001 and -1.0001 <= y <= 1.0001
+
+
+def test_walk_moves_exactly_along_one_great_circle():
+    s = make_space()
+    p = s.vector("ocean")
+    h = s.heading(s.vector("sea"), p)
+    p1, h1 = s.walk(p, h, 0.2)
+    p2, _ = s.walk(p1, h1, 0.2)
+    q, _ = s.walk(p, h, 0.4)
+    assert abs(np.linalg.norm(p1) - 1) < 1e-5 and abs(np.linalg.norm(h1) - 1) < 1e-5
+    assert abs(angle(p, p1) - 0.2) < 1e-4
+    assert angle(p2, q) < 1e-4
+    assert abs(float(np.dot(p1, h1))) < 1e-5          # heading stays tangent
+
+
+def test_heading_points_away_from_where_you_came_from():
+    s = make_space()
+    a, b = s.vector("ocean"), s.vector("ship")
+    h = s.heading(a, b)
+    assert abs(float(np.dot(h, b))) < 1e-5 and abs(np.linalg.norm(h) - 1) < 1e-5
+    further, _ = s.walk(b, h, 0.1)
+    assert angle(a, further) > angle(a, b) + 0.09
+
+
+def test_no_heading_between_identical_points():
+    s = make_space()
+    assert s.heading(s.vector("ocean"), s.vector("ocean")) is None

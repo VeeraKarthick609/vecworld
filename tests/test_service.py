@@ -3,7 +3,7 @@ import pytest
 
 from conftest import OomGenerator
 from vecworld.config import MAX_TEXT_CHARS, N_NEIGHBOURS
-from vecworld.game.service import BadInput, Busy, GpuUnavailable, NotStarted, UnknownConcept
+from vecworld.game.service import BadInput, Busy, GpuUnavailable, NoHistory, NotStarted, UnknownConcept
 
 
 def test_jump_lands_and_lists_clickables(svc):
@@ -195,3 +195,116 @@ def test_jump_resets_recent(svc):
     svc.step(s.id, "sea")
     sc = svc.jump(s.id, "sea")
     assert svc.get(s.id).recent == ["sea"] and "ocean" in offered(sc)
+
+
+# --- forward (W) and back (S) -------------------------------------------------
+
+from vecworld.config import MAX_STEP_ANGLE  # noqa: E402
+from vecworld.space.index import angle  # noqa: E402
+
+
+def test_forward_keeps_walking_the_way_you_were_heading(svc):
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    start = svc.get(s.id).position.copy()
+    svc.step(s.id, "ship")
+    mid = svc.get(s.id).position.copy()
+    sc = svc.forward(s.id)
+    end = svc.get(s.id).position
+    assert abs(angle(mid, end) - MAX_STEP_ANGLE) < 1e-4
+    assert angle(start, end) > angle(start, mid) + 0.3      # onward, not sideways or back
+    assert sc.centre == sc.hotspots[0].concept
+    assert sc.centre == svc.space.neighbours(end, k=1, exclude={"ocean", "ship"})[0][0]
+    assert svc.generator.calls[-1][0] == "evolve" and len(sc.trail) == 3
+
+
+def test_forward_right_after_a_jump_heads_for_the_nearest_unvisited_concept(svc):
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    before = svc.get(s.id).position.copy()
+    svc.forward(s.id)
+    after = svc.get(s.id).position
+    sea = svc.space.vector("sea")
+    assert angle(after, sea) < angle(before, sea)
+    assert angle(before, after) <= MAX_STEP_ANGLE + 1e-5
+    assert svc.get(s.id).heading is not None
+
+
+def test_forward_errors(svc):
+    with pytest.raises(NotStarted):
+        svc.forward(svc.new_session().id)
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    s.busy = True
+    with pytest.raises(Busy):
+        svc.forward(s.id)
+
+
+def test_forward_oom_keeps_state(svc):
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    svc.step(s.id, "ship")
+    before = (svc.get(s.id).position.copy(), svc.get(s.id).heading.copy(), list(svc.get(s.id).recent))
+    svc.generator = OomGenerator()
+    with pytest.raises(GpuUnavailable):
+        svc.forward(s.id)
+    now = svc.get(s.id)
+    assert np.allclose(now.position, before[0]) and np.allclose(now.heading, before[1]) and now.recent == before[2]
+    assert not now.busy
+
+
+def snapshot(sess):
+    return (sess.position.copy(), None if sess.heading is None else sess.heading.copy(), list(sess.recent),
+            list(sess.hotspots), list(sess.trail), sess.scene.scene_id, sess.scene.centre)
+
+
+def same(a, b):
+    return (np.allclose(a[0], b[0]) and ((a[1] is None and b[1] is None) or np.allclose(a[1], b[1]))
+            and a[2:] == b[2:])
+
+
+def test_back_restores_the_previous_scene_without_the_gpu(svc):
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    svc.step(s.id, "ship")
+    there = snapshot(svc.get(s.id))
+    svc.forward(s.id)
+    calls = len(svc.generator.calls)
+    sc = svc.back(s.id)
+    assert len(svc.generator.calls) == calls
+    assert same(snapshot(svc.get(s.id)), there) and sc.scene_id == there[5]
+
+
+def test_back_twice_returns_to_the_jump_then_runs_out(svc):
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    landed = snapshot(svc.get(s.id))
+    svc.step(s.id, "ship")
+    svc.back(s.id)
+    assert same(snapshot(svc.get(s.id)), landed) and svc.get(s.id).heading is None
+    with pytest.raises(NoHistory):
+        svc.back(s.id)
+    with pytest.raises(NotStarted):
+        svc.back(svc.new_session().id)
+
+
+def test_history_is_bounded(svc):
+    from vecworld.config import HISTORY
+
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    for _ in range(HISTORY + 5):
+        svc.forward(s.id)
+    for _ in range(HISTORY):
+        svc.back(s.id)
+    with pytest.raises(NoHistory):
+        svc.back(s.id)
+
+
+def test_after_back_the_next_step_grows_from_the_restored_scene(svc):
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")              # navy scene
+    svc.step(s.id, "ship")               # teal scene
+    svc.back(s.id)
+    svc.step(s.id, "sea")
+    assert svc.generator.sources[-1] == (0, 0, 128)

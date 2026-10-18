@@ -47,6 +47,7 @@ class FakeEmbedder:
 class FakeGenerator:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
+        self.sources: list[tuple[int, int, int]] = []   # a pixel of each img2img source image
 
     def fresh(self, prompt, seed):
         self.calls.append(("fresh", prompt))
@@ -54,6 +55,7 @@ class FakeGenerator:
 
     def evolve(self, prev, prompt, seed):
         self.calls.append(("evolve", prompt))
+        self.sources.append(prev.convert("RGB").getpixel((0, 0)))
         return Image.new("RGB", (64, 64), "teal")
 
 
