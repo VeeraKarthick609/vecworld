@@ -26,3 +26,21 @@ STYLE = "dreamlike painterly scene, soft volumetric light, oil painting, cohesiv
 
 DATA_DIR = Path("data")
 SCENE_DIR = Path("var/scenes")
+
+# Dream Walk: seamless cylindrical panorama
+PANO_W = 2048
+PANO_H = 512
+WIN = 64                   # latent window size
+STRIDE = 32
+VAE_TILE = 64
+VAE_MARGIN = 8
+DOLLY = 1.15
+BG_STRENGTH = 0.6
+FOCUS_HALF = 0.08
+FOCUS_FEATHER = 0.06
+KEEP_OFFSET = 0.17
+QUIET_EVERY = 3
+DRIFT_STEPS = 3
+PREFETCH_TOLERANCE = 45.0
+MOODS = ("foggy", "night", "rain", "snow", "eerie", "warm")
+MAX_THEME_CHARS = 120
