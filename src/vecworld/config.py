@@ -22,7 +22,7 @@ HISTORY = 10               # snapshots kept for going back (S / down arrow)
 RECENT = 4                 # the last few centres are left out of the neighbours, so walks don't loop
 SESSION_TTL = 3600     # seconds idle before a session (and its scene image) is dropped
 MAX_SESSIONS = 50
-STYLE = "dreamlike painterly scene, soft volumetric light, oil painting, cohesive palette"
+STYLE = "impressionist oil painting, visible brushstrokes, dreamlike, soft volumetric light"
 
 DATA_DIR = Path("data")
 SCENE_DIR = Path("var/scenes")
