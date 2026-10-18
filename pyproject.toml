@@ -8,8 +8,11 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.15.0",
+    "diffusers>=0.41.0",
     "nltk>=3.10.3",
     "numpy>=2.5.4",
+    "pillow>=13.0.0",
     "torch>=2.14.1",
     "transformers>=5.20.1",
     "wordfreq>=3.1.1",
