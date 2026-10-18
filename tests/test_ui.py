@@ -390,7 +390,8 @@ def test_failed_walk_keeps_view(server, browser):
     # Fail every step from now on, and turn well away from yaw 0 first, so a prefetch built
     # before the failure started can't serve this walk.
     painter.fail_steps = True
-    hold(browser, "d", 0.35)     # ~52°: past the 45° prefetch tolerance, the label ahead still in view
+    look(browser, 52)            # past the 45° prefetch tolerance, with the label ahead still in view
+    assert yaw_near(js(browser, "vecworld.yaw"), 52, tol=2)
     shown = visible_labels(browser)
     assert shown
     n = len(svc.calls)
@@ -402,8 +403,8 @@ def test_failed_walk_keeps_view(server, browser):
     assert visible_labels(browser) == shown
     # Still looking around after the failure.
     yaw = js(browser, "vecworld.yaw")
-    hold(browser, "a", 0.3)
-    assert js(browser, "vecworld.yaw") < yaw - 20
+    look(browser, -30)
+    assert yaw_near(js(browser, "vecworld.yaw"), yaw - 30, tol=2)
 
 
 def test_text_bar_drifts_theme_after_start(server, browser):

@@ -1,5 +1,4 @@
 .superpowers/
 __pycache__/
 .venv/
-data/*.npy
 var/
