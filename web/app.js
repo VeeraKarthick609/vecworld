@@ -7,6 +7,8 @@ let front = 0;            // index of the visible scene layer
 let sid = null;
 let busy = false;
 let lastHotspots = [];    // restored if a move fails
+let currentScene = null;  // the scene on screen; WASD only works once there is one
+window.vecworld = { get scene() { return currentScene; } };   // read-only, for tests and poking around
 
 async function api(path, body) {
   const r = await fetch(path, {
@@ -64,6 +66,8 @@ async function show(scene) {
 
   $("backdrop").style.backgroundImage = `url(${scene.image_url})`;
   $("intro").hidden = true;
+  $("keys").hidden = false;
+  currentScene = scene;
   renderHotspots(scene.hotspots);
   renderMap(scene.mindmap);
 }
@@ -158,16 +162,59 @@ $("jump").addEventListener("submit", (e) => {
   withSession(async () => {
     await show(await api(`/api/session/${sid}/jump`, { text }));
     input.value = "";
+    input.blur();           // so W/A/S/D walk straight away instead of typing
   });
 });
 
-// Holding animation while the next scene generates: zoom toward what was clicked.
+// Holding animation while the next scene generates: zoom toward where we're going.
+function zoomToward(cx, cy) {
+  const cur = layers[front];
+  cur.style.transformOrigin = `${cx * 100}% ${cy * 100}%`;
+  cur.style.transform = "scale(1.6)";
+  hotspotsEl.replaceChildren();
+}
+
 function step(h) {
   withSession(async () => {
-    const cur = layers[front];
-    cur.style.transformOrigin = `${(h.x + h.w / 2) * 100}% ${(h.y + h.h / 2) * 100}%`;
-    cur.style.transform = "scale(1.6)";
-    hotspotsEl.replaceChildren();
+    zoomToward(h.x + h.w / 2, h.y + h.h / 2);
     await show(await api(`/api/session/${sid}/step`, { concept: h.concept }));
   });
 }
+
+function forward() {
+  withSession(async () => {
+    zoomToward(0.5, 0.5);
+    await show(await api(`/api/session/${sid}/forward`));
+  });
+}
+
+function back() {
+  withSession(async () => { await show(await api(`/api/session/${sid}/back`)); });
+}
+
+// The non-centre object furthest toward one side of the frame, if any sits on that side.
+function sideHotspot(side) {
+  const cx = (h) => h.x + h.w / 2;
+  const onSide = lastHotspots.filter((h) => h.concept !== currentScene.centre &&
+                                            (side === "left" ? cx(h) < 0.5 : cx(h) > 0.5));
+  if (!onSide.length) return null;
+  return onSide.reduce((a, b) => ((side === "left" ? cx(b) < cx(a) : cx(b) > cx(a)) ? b : a));
+}
+
+const KEYS = {
+  w: "forward", arrowup: "forward", s: "back", arrowdown: "back",
+  a: "left", arrowleft: "left", d: "right", arrowright: "right",
+};
+
+document.addEventListener("keydown", (e) => {
+  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;     // one press, one step
+  if (e.target.closest && e.target.closest("input, textarea")) return;
+  const move = KEYS[e.key.toLowerCase()];
+  if (!move || !currentScene || busy) return;
+  e.preventDefault();
+  if (move === "forward") return forward();
+  if (move === "back") return back();
+  const h = sideHotspot(move);
+  if (h) step(h);
+  else toast(`Nothing on the ${move} here. W walks on, S goes back.`);
+});

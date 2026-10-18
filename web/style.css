@@ -51,6 +51,7 @@ html, body {
   position: absolute;
   border-radius: 10px;
   cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.22);
   outline: 2px dashed transparent;
   outline-offset: 2px;
   transition: outline-color 0.15s, background 0.15s;
@@ -59,16 +60,16 @@ html, body {
   outline-color: rgba(255, 255, 255, 0.8);
   background: rgba(255, 255, 255, 0.06);
 }
+/* Labels always show, at the top of their box, so you can see what you can walk toward. */
 .hotspot span {
-  position: absolute; left: 50%; top: 50%;
-  transform: translate(-50%, -50%);
-  padding: 2px 8px; border-radius: 6px;
+  position: absolute; left: 50%; top: 4px;
+  transform: translateX(-50%);
+  padding: 1px 8px; border-radius: 6px;
   background: var(--glass);
   font-size: 13px; white-space: nowrap;
-  opacity: 0; transition: opacity 0.15s;
   pointer-events: none;
 }
-.hotspot:hover span, .hotspot:focus-visible span { opacity: 1; }
+.hotspot:hover span, .hotspot:focus-visible span { background: rgba(10, 12, 18, 0.85); }
 .busy .hotspot { pointer-events: none; }
 
 #spinner {
@@ -120,6 +121,19 @@ html, body {
 }
 #jump input:focus { border-color: rgba(255, 255, 255, 0.45); }
 #jump input:disabled { opacity: 0.6; }
+
+#keys {
+  position: fixed; left: 50%; bottom: 72px;
+  transform: translateX(-50%);
+  color: var(--ink-dim); font-size: 12px; white-space: nowrap;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  pointer-events: none;
+}
+#keys kbd {
+  font: inherit; padding: 0 5px; border-radius: 4px;
+  border: 1px solid var(--line); background: var(--glass);
+}
+@media (max-width: 640px) { #keys { bottom: 244px; } }
 
 #toast {
   position: fixed; left: 50%; top: 20px;
