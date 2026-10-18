@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
-from vecworld.config import DOLLY
+from vecworld.config import DOLLY, MAX_LABEL_AREA, MAX_LABEL_H
 from vecworld.dream.pano import dolly_u, wrap_cols
 from vecworld.scenes.hotspots import Hotspot, locate
 
@@ -55,6 +55,7 @@ class LabelFinder:
         out = []
         for text, u in wanted:
             (box,) = locate([text], self._heatmaps(crop_at(img, u), [text]))
-            if box is not None:
+            # A box over most of the view is CLIPSeg lighting up the scenery, not finding the discovery.
+            if box is not None and box.w * box.h <= MAX_LABEL_AREA and box.h <= MAX_LABEL_H:
                 out.append(to_label(text, box, u, img.width))
         return out

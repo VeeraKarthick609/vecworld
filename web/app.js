@@ -182,10 +182,17 @@ function placeLabels() {
     const d = ((l.u - centre + 0.5) % 1 + 1) % 1 - 0.5;
     if (Math.abs(d) - l.w / 2 >= f / 2) { el.style.display = "none"; continue; }
     el.style.display = "";
-    el.style.left = `${(0.5 + (d - l.w / 2) / f) * cw}px`;
-    el.style.width = `${l.w / f * cw}px`;
-    el.style.top = `${(l.y - top) / vis * ch}px`;
+    const left = (0.5 + (d - l.w / 2) / f) * cw, width = l.w / f * cw;
+    const boxTop = (l.y - top) / vis * ch;
+    el.style.left = `${left}px`;
+    el.style.width = `${width}px`;
+    el.style.top = `${boxTop}px`;
     el.style.height = `${l.h / vis * ch}px`;
+    // The name sits over the part of the box that is on screen, and never off its edges.
+    const span = el.firstChild, half = span.offsetWidth / 2;
+    const seen = (Math.max(0, left) + Math.min(cw, left + width)) / 2;
+    span.style.left = `${Math.min(Math.max(seen, half + 8), cw - half - 8) - left}px`;
+    span.style.top = `${Math.max(4, -boxTop + 8)}px`;
   }
 }
 

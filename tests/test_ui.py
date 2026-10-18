@@ -36,6 +36,7 @@ class UiLabels:
 
     def __init__(self):
         self._n = 0
+        self.extra: list[tuple[str, float, float, float, float]] = []   # (text, u, y, w, h) added every step
 
     def _id(self):
         self._n += 1
@@ -43,6 +44,7 @@ class UiLabels:
 
     def find(self, img, wanted):
         out = [Label(self._id(), text, u, 0.4, 0.06, 0.2) for text, u in wanted if text != SEAM_TEXT]
+        out += [Label(self._id(), *x) for x in self.extra if x[0] not in {t for t, _ in wanted}]
         return out + [Label(self._id(), SEAM_TEXT, 0.99, 0.4, 0.04, 0.2)]
 
 
@@ -106,6 +108,7 @@ def healthy(server):
     _, _, painter = server
     painter.fail_steps, painter.delay, painter.fail_next = False, 0.0, False
     yield
+    server[1].labels.extra = []
 
 
 @pytest.fixture
@@ -341,6 +344,18 @@ def test_label_click_approaches(server, browser):
     moved(browser, before)
     assert ("approach", ahead["id"]) in svc.calls[n:]
     assert yaw_near(js(browser, "vecworld.yaw"), 0)
+
+
+def test_tall_label_name_stays_on_screen(server, browser):
+    url, svc, _ = server
+    svc.labels.extra = [("a huge old oak", 0.65, 0.0, 0.25, 1.0)]   # full height, mostly off to the right
+    land(browser, url)
+    walked(browser, svc)
+    wait(browser, "[...document.querySelectorAll('.label span')].some(s => s.textContent === 'a huge old oak')")
+    r = js(browser, """(() => { const s = [...document.querySelectorAll('.label span')]
+        .find(s => s.textContent === 'a huge old oak'); return s.getBoundingClientRect().toJSON(); })()""")
+    w, h = js(browser, "[innerWidth, innerHeight]")
+    assert 0 <= r["left"] and r["right"] <= w and 0 <= r["top"] and r["bottom"] <= h, r
 
 
 def test_label_draws_across_seam(server, browser):

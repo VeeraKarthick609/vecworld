@@ -34,6 +34,18 @@ def test_unlocated_discovery_gets_no_label():
     assert LabelFinder(lambda img, t: np.zeros((len(t), 352, 352))).find(Image.new("RGB", (2048, 512)), [("x", 0.5)]) == []
 
 
+def test_whole_view_boxes_get_no_label():
+    def heat(region):
+        def f(img, texts):
+            m = np.zeros((len(texts), 352, 352)); m[:, region[0], region[1]] = 1; return m
+        return f
+    blank = Image.new("RGB", (2048, 512))
+    assert LabelFinder(heat((slice(None), slice(None)))).find(blank, [("forest", 0.5)]) == []          # all of it
+    assert LabelFinder(heat((slice(0, 330), slice(150, 190)))).find(blank, [("tree", 0.5)]) == []      # h 0.94
+    assert LabelFinder(heat((slice(40, 300), slice(40, 300)))).find(blank, [("glade", 0.5)]) == []     # area 0.55
+    assert len(LabelFinder(heat((slice(40, 280), slice(100, 250)))).find(blank, [("hut", 0.5)])) == 1  # 0.68 x 0.43
+
+
 def test_find_keeps_input_order_and_skips_misses():
     def heat(img, texts):
         m = np.zeros((len(texts), 352, 352))

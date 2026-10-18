@@ -31,12 +31,12 @@ html, body {
 
 #labels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
 
-/* A discovery: its box on the panorama, with the name always showing at the top. */
+/* A discovery: its box on the panorama (outlined on hover or focus), with the name always showing at the top. */
 .label {
   position: absolute;
   padding: 0; margin: 0;
   background: none; color: inherit; font: inherit;
-  border: 1px solid rgba(255, 255, 255, 0.22);
+  border: 1px solid transparent;
   border-radius: 10px;
   outline: 2px dashed transparent;
   outline-offset: 2px;
@@ -45,11 +45,12 @@ html, body {
   transition: outline-color 0.15s, background 0.15s;
 }
 .label:hover, .label:focus-visible {
+  border-color: rgba(255, 255, 255, 0.22);
   outline-color: rgba(255, 255, 255, 0.8);
   background: rgba(255, 255, 255, 0.06);
 }
 .label span {
-  position: absolute; left: 50%; top: 4px;
+  position: absolute; left: 50%; top: 4px;   /* left and top are set by placeLabels() */
   transform: translateX(-50%);
   padding: 1px 8px; border-radius: 6px;
   background: var(--glass);

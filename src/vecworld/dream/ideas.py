@@ -32,28 +32,55 @@ _PHRASE = re.compile(r"^[^\W_]+(?:[ '\-][^\W_]+)*$")  # letters+digits: the brie
 _NON_VISUAL_STEMS = ("whisper", "laugh", "echo", "sound", "silen", "scent", "smell", "feeling",
                      "memor", "voice", "music")
 _NON_VISUAL_WORDS = {"wind", "winds", "windy"}
+# Weather and light are painted by the mood, and CLIPSeg can't box them: not discoveries.
+# Matched on the head noun (last word), so "a misty pond" and "glowing mushrooms" stay.
+_WEATHER_STEMS = ("star", "snowflake", "moonlight", "frost", "glow", "fog", "mist")
+_CHATTER = re.compile(r"^(?:here are|here is|sure|certainly|okay|ok)\b")
+MAX_PHRASE_CHARS = 48
 GEN_THREADS = 8  # of 16 logical cores; leave the rest for CLIPSeg on the step path
 
 
 def is_visual(phrase: str) -> bool:
-    return not any(w in _NON_VISUAL_WORDS or w.startswith(_NON_VISUAL_STEMS) for w in phrase.split())
+    words = phrase.split()
+    return not (any(w in _NON_VISUAL_WORDS or w.startswith(_NON_VISUAL_STEMS) for w in words)
+                or words[-1].startswith(_WEATHER_STEMS))
 
 
 _EDGE = " \t\"'“”‘’`.,;:!?*_()"
 
 
 def parse_ideas(text: str, limit: int = 8) -> list[str]:
+    """Short visible-object phrases from the model's list. Chatter lines ("Here are...", "Objects:") are
+    dropped; a one- or two-line answer is a comma list, otherwise each line's text after a comma is a
+    description of it ("a stone well, covered in moss") and is dropped too."""
     out: list[str] = []
-    for line in text.splitlines():
-        for part in line.split(","):
+    lines = [l for l in (_BULLET.sub("", l).strip() for l in text.splitlines()) if l]
+    lines = [l for l in lines if not (l.endswith(":") or _CHATTER.match(l.lower()))]
+    split = len([l for l in text.splitlines() if l.strip()]) < 3
+    for line in lines:
+        for part in line.split(",") if split else line.split(",")[:1]:
             p = _BULLET.sub("", part).strip(_EDGE).lower()
             p = " ".join(p.split())
-            if not (2 <= len(p.split()) <= 8) or not _PHRASE.match(p) or p in out or not is_visual(p):
+            if (not (2 <= len(p.split()) <= 8) or len(p) > MAX_PHRASE_CHARS or not _PHRASE.match(p) or p in out
+                    or not is_visual(p)):
                 continue
             out.append(p)
             if len(out) >= limit:
                 return out
     return out
+
+
+def ideas_request(theme: str, moods: list[str], n: int) -> list[dict]:
+    """The chat messages asking the model for n discoveries."""
+    mood = f" ({', '.join(moods)})" if moods else ""
+    return [
+        {"role": "system", "content": "You invent evocative scenery for a painted dreamscape."},
+        {"role": "user", "content": (
+            f"List {n} short noun phrases (2 to 6 words each) naming concrete, visible objects or "
+            f'landmarks one might come upon while wandering in "{theme}"{mood}. Only things you '
+            "could photograph: no sounds, smells, feelings or weather. "
+            "One per line, no numbering, no explanations.")},
+    ]
 
 
 class Dreamer(Protocol):
@@ -74,15 +101,7 @@ class QwenDreamer:
         self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32).to("cpu").eval()
 
     def ideas(self, theme: str, moods: list[str], n: int) -> list[str]:
-        mood = ", ".join(moods) if moods else "quiet"
-        messages = [
-            {"role": "system", "content": "You invent evocative scenery for a painted dreamscape."},
-            {"role": "user", "content": (
-                f"List {n} short noun phrases (2 to 6 words each) naming concrete, visible objects or "
-                f'landmarks one might come upon while wandering in "{theme}" ({mood}). Only things you '
-                "could photograph: no sounds, smells, feelings or weather. "
-                "One per line, no numbering, no explanations.")},
-        ]
+        messages = ideas_request(theme, moods, n)
         prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tok(prompt, return_tensors="pt")
         with self._lock:
