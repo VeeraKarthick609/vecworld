@@ -2,7 +2,7 @@ from typing import Protocol
 
 from PIL import Image
 
-from vecworld.config import STEP_STRENGTH
+from vecworld.config import STEP_STEPS, STEP_STRENGTH
 
 SIZE = 512
 
@@ -41,5 +41,5 @@ class TurboGenerator:
     def evolve(self, prev: Image.Image, prompt: str, seed: int) -> Image.Image:
         return self.img2img(
             prompt, image=prev.resize((SIZE, SIZE)), strength=STEP_STRENGTH,
-            num_inference_steps=2, guidance_scale=0.0, generator=self._gen(seed),
+            num_inference_steps=STEP_STEPS, guidance_scale=0.0, generator=self._gen(seed),
         ).images[0]

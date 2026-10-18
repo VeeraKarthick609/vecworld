@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from vecworld.config import MAX_STEP_ANGLE, MAX_TEXT_CHARS, N_NEIGHBOURS
+from vecworld.config import MAX_STEP_ANGLE, MAX_TEXT_CHARS, N_NEIGHBOURS, ZOOM_FRAC
 from vecworld.game.session import Scene, Session
 from vecworld.scenes.generator import SceneGenerator
 from vecworld.scenes.hotspots import Hotspot, HotspotFinder
@@ -99,7 +99,7 @@ class GameService:
             position = self.space.step_toward(s.position, self.space.vector(concept), MAX_STEP_ANGLE)
             # The clicked concept stays pinned at the centre even if the cap stopped us short of it.
             others = [w for w, _ in self.space.neighbours(position, k=N_NEIGHBOURS, exclude={concept})]
-            prev = zoom_crop(s.image, clicked.x + clicked.w / 2, clicked.y + clicked.h / 2)
+            prev = zoom_crop(s.image, clicked.x + clicked.w / 2, clicked.y + clicked.h / 2, ZOOM_FRAC)
             img, hotspots = self._render(lambda: self.generator.evolve(prev, scene_prompt(concept, others), s.seed),
                                          [concept] + others)
             return self._commit(s, position, img, hotspots)
