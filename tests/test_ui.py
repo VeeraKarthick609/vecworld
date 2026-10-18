@@ -188,6 +188,23 @@ def hold(d, key, seconds):
     ActionChains(d).key_down(key).pause(seconds).key_up(key).perform()
 
 
+def look(d, degrees):
+    """Turn by exactly `degrees` with a mouse drag (dragging left turns right)."""
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    w, h = js(d, "[innerWidth, innerHeight]")
+    fov = min(90, 360 * 0.25 * w / h)          # the fake panoramas are 4:1
+    dx = round(degrees * w / fov)
+    stage = d.find_element("id", "stage")
+    start = max(-w // 2 + 20, min(w // 2 - 20, dx // 2))
+    ActionChains(d).move_to_element_with_offset(stage, start, 0).click_and_hold() \
+        .move_by_offset(-dx, 0).release().perform()
+
+
+def session_of(svc):
+    return max(svc._sessions.values(), key=lambda s: s.last_used)
+
+
 def moved(d, old_view_id):
     wait(d, f"{IDLE} && vecworld.view.view_id !== '{old_view_id}'")
 
@@ -278,7 +295,8 @@ def test_w_walks_and_s_turns_around(server, browser):
     walks = [a for name, a in svc.calls[n:] if name == "walk"]
     assert len(walks) == 1 and yaw_near(walks[0], yaw)
     assert js(browser, "vecworld.view.steps") == 1
-    assert yaw_near(js(browser, "vecworld.yaw"), 0)
+    # Still facing the way you walked, whether or not a prefetch toward yaw 0 served it.
+    assert yaw_near(js(browser, "vecworld.yaw"), yaw - js(browser, "vecworld.view.walked_yaw"))
 
     hold(browser, Keys.ARROW_RIGHT, 0.3)
     yaw = js(browser, "vecworld.yaw")
@@ -289,8 +307,24 @@ def test_w_walks_and_s_turns_around(server, browser):
     moved(browser, second)
     backs = [a for name, a in svc.calls[n:] if name == "back"]
     assert len(backs) == 1 and yaw_near(backs[0], yaw)
-    # The server centres the new panorama on what was behind you, so you now face it at yaw 0.
-    assert yaw_near(js(browser, "vecworld.yaw"), 0)
+    # The server centres the new panorama on what was behind you (or near it), and you now face it.
+    walked = js(browser, "vecworld.view.walked_yaw")
+    assert yaw_near(js(browser, "vecworld.yaw"), yaw + 180 - walked)
+    assert js(browser, "Math.abs(vecworld.yaw)") <= 45
+
+
+def test_walk_on_a_prefetch_keeps_facing_the_same_way(server, browser):
+    url, svc, _ = server
+    land(browser, url)
+    wait_for(lambda: (pf := session_of(svc).prefetch) is not None and pf[2].done())
+    look(browser, 30)
+    yaw = js(browser, "vecworld.yaw")
+    assert yaw_near(yaw, 30, tol=2), yaw
+    first = view_id(browser)
+    press(browser, "w")
+    moved(browser, first)
+    assert yaw_near(js(browser, "vecworld.view.walked_yaw"), 0)    # the prefetch toward 0 was used
+    assert yaw_near(js(browser, "vecworld.yaw"), yaw)               # and you still face 30° off it
 
 
 def test_label_click_approaches(server, browser):

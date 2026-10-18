@@ -220,6 +220,43 @@ def test_approach_label_walks_to_it_with_keep(svc_factory):
     assert ("a bench", pytest.approx(0.5)) in svc.labels.calls[-1]
 
 
+def test_kept_object_is_walked_past_after_two_steps(svc):
+    s = started(svc)
+    svc.walk(s.id, 0)                           # finds the discovery ahead
+    focus = []
+    for _ in range(3):                          # the fake finds it again every step
+        assert any(abs(l.u - 0.5) < 0.01 for l in s.labels)
+        svc.walk(s.id, 0)
+        focus.append(steps_of(svc.painter)[-1]["focus_at"])
+    assert focus[0] in KEEPS and focus[1] in KEEPS and focus[2] == 0.5
+    assert s.kept_run == 0
+    svc.walk(s.id, 0)                           # after a step that didn't keep, it can keep again
+    assert steps_of(svc.painter)[-1]["focus_at"] in KEEPS
+
+
+@pytest.mark.parametrize("w,h", [(0.2, 0.2), (0.05, 0.7)])
+def test_scenery_sized_label_is_not_kept(svc, w, h):
+    s = started(svc)
+    s.labels = [Label("x", "a huge tree", 0.5, 0.1, w, h)]
+    svc.walk(s.id, 0)
+    assert steps_of(svc.painter)[-1]["focus_at"] == 0.5
+    s.labels = [Label("y", "a huge tree", 0.7, 0.1, w, h)]
+    svc.approach(s.id, "y")                     # a normal step toward it
+    kw = steps_of(svc.painter)[-1]
+    assert kw["focus_at"] == 0.5 and kw["focus"] is not None
+
+
+def test_approach_after_two_keeps_takes_a_normal_step(svc):
+    s = started(svc)
+    svc.walk(s.id, 0)
+    svc.walk(s.id, 0)
+    svc.walk(s.id, 0)
+    assert s.kept_run == 2
+    (label,) = [l for l in s.labels if abs(l.u - 0.5) < 0.01][:1]
+    svc.approach(s.id, label.id)
+    assert steps_of(svc.painter)[-1]["focus_at"] == 0.5
+
+
 def test_approach_unknown_label(svc):
     s = started(svc)
     with pytest.raises(UnknownLabel):
@@ -324,6 +361,23 @@ def test_walk_uses_matching_prefetch_without_new_paint(svc):
     assert s.pano is built[0]
     assert len(steps_of(svc.painter)) == 1
     assert v.steps == 1 and s.prefetch is None
+
+
+def test_walk_reports_the_yaw_it_walked(svc):
+    s = started(svc)
+    assert svc.walk(s.id, 40).walked_yaw == pytest.approx(40)
+    assert svc.back(s.id, 30).walked_yaw == pytest.approx(-150)   # 30 + 180, wrapped
+
+
+def test_walk_on_a_prefetch_reports_the_prefetch_yaw(svc):
+    s = started(svc)
+    svc.prefetch(s.id, 0)
+    s.prefetch[2].result(timeout=5)
+    v = svc.walk(s.id, 30)                      # within tolerance: the spot built toward 0 is used
+    assert v.walked_yaw == pytest.approx(0)
+    svc.prefetch(s.id, -150)
+    s.prefetch[2].result(timeout=5)
+    assert svc.back(s.id, 0).walked_yaw == pytest.approx(-150)   # back at 0 walks toward 180 ~ -150
 
 
 def test_prefetch_does_not_touch_session_until_used(svc):

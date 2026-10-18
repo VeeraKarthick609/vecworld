@@ -42,6 +42,7 @@ def view_out(v: View) -> dict:
         "theme": v.theme,
         "moods": list(v.moods),
         "steps": v.steps,
+        "walked_yaw": v.walked_yaw,
     }
 
 

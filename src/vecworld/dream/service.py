@@ -12,8 +12,9 @@ from pathlib import Path
 
 from PIL import Image
 
-from vecworld.config import (DRIFT_STEPS, FOCUS_HALF, KEEP_OFFSET, MAX_SESSIONS, MAX_THEME_CHARS, MOODS,
-                             PALETTE_STRENGTH, PREFETCH_TOLERANCE, QUIET_EVERY, SESSION_TTL, STYLE)
+from vecworld.config import (DRIFT_STEPS, FOCUS_HALF, KEEP_MAX_H, KEEP_MAX_W, KEEP_OFFSET, MAX_KEEPS,
+                             MAX_SESSIONS, MAX_THEME_CHARS, MOODS, PALETTE_STRENGTH, PREFETCH_TOLERANCE,
+                             QUIET_EVERY, SESSION_TTL, STYLE)
 from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownLabel, UnknownSession
 from vecworld.dream.gpu import GpuQueue
 from vecworld.dream.ideas import FALLBACK_IDEAS, Dreamer
@@ -43,6 +44,7 @@ class _Snap:
     ref: Stats
     reset_ref: bool     # this spot becomes the palette reference
     seed: int
+    kept_run: int
 
 
 def _thread(fn) -> None:
@@ -51,6 +53,10 @@ def _thread(fn) -> None:
 
 def _yaw_diff(a: float, b: float) -> float:
     return abs((a - b + 180) % 360 - 180)
+
+
+def _wrap_yaw(a: float) -> float:
+    return (a + 180) % 360 - 180
 
 
 class DreamService:
@@ -107,7 +113,7 @@ class DreamService:
                 self._drop_prefetch(s)
                 s.version += 1
                 s.theme, s.moods, s.pano, s.ref = theme, moods, img, ref
-                s.labels, s.steps, s.drift, s.ref_pending = [], 0, None, False
+                s.labels, s.steps, s.drift, s.ref_pending, s.kept_run = [], 0, None, False, 0
                 s.ideas, s.ideas_theme = deque(), theme
                 view = self._view(s, view_id, path)
         self._maybe_refill(s)
@@ -127,6 +133,7 @@ class DreamService:
         return self._walk(sid, (label.u - 0.5) * 360, True)
 
     def _walk(self, sid: str, yaw: float, keep: bool | None) -> View:
+        """keep=True (approach): a prefetch is only used if it kept the label whenever the build would."""
         yaw = self._yaw(yaw)
         s = self._started(sid)
         with self._claim(s):
@@ -134,7 +141,7 @@ class DreamService:
             if built is None:
                 with self._lock:
                     snap = self._snap(s)
-                built = self._run(s, lambda: self._build(snap, yaw, keep))
+                built = self._run(s, lambda: self._build(snap, yaw))
             return self._commit(s, *built)
 
     # --- theme, moods, prefetch ------------------------------------------------------
@@ -178,7 +185,7 @@ class DreamService:
                     and not pf[2].cancelled()):
                 return
             snap = self._snap(s)
-            fut = self.queue.submit(lambda: self._build(snap, yaw, None), owner=s.id, prefetch=True)
+            fut = self.queue.submit(lambda: self._build(snap, yaw), owner=s.id, prefetch=True)
             s.prefetch = (yaw, s.version, fut)
 
     def _take_prefetch(self, s: DreamSession, yaw: float, keep: bool | None):
@@ -193,7 +200,9 @@ class DreamService:
             # Approaching a label needs a build that keeps it. A prefetch still queued sits behind every
             # player's on-demand jobs, so cancel it and build this move at demand priority instead.
             if (pf[1] != s.version or _yaw_diff(pf[0], yaw) > PREFETCH_TOLERANCE
-                    or (keep and not self._near_label(s.labels, yaw_to_u(pf[0]))) or pf[2].cancel()):
+                    or (keep and self._keeps(s.labels, s.kept_run, yaw_to_u(yaw))
+                        and not self._keeps(s.labels, s.kept_run, yaw_to_u(pf[0])))
+                    or pf[2].cancel()):
                 self._drop_prefetch(s)
                 return None
         try:
@@ -225,14 +234,15 @@ class DreamService:
         drift_done = s.drift is not None and s.drift[1] + 1 >= DRIFT_STEPS
         return _Snap(pano=s.pano, labels=tuple(s.labels), steps=s.steps, idea=s.ideas[0] if s.ideas else None,
                      theme=s.theme, moods=tuple(s.moods), drift=s.drift, version=s.version, ref=s.ref,
-                     reset_ref=s.ref_pending or drift_done, seed=s.seed)
+                     reset_ref=s.ref_pending or drift_done, seed=s.seed, kept_run=s.kept_run)
 
-    def _build(self, snap: _Snap, yaw: float, keep: bool | None) -> tuple[Image.Image, list[Label], dict]:
+    def _build(self, snap: _Snap, yaw: float) -> tuple[Image.Image, list[Label], dict]:
         """Paint the spot one step toward yaw. Pure: reads only the snapshot, so nothing changes until _commit."""
         u = yaw_to_u(yaw)
         prev = dolly(roll_to(snap.pano, u))
-        kept = self._near_label(snap.labels, u) if keep is None else keep
-        # Keep what you walk toward (it is img2img'd closer) and put the next discovery beside it.
+        # Keep what you walk toward (it is img2img'd closer) and put the next discovery beside it, but only
+        # while it is still an object, and only MAX_KEEPS steps running, so you walk past it.
+        kept = self._keeps(snap.labels, snap.kept_run, u)
         focus_at = 0.5 + (KEEP_OFFSET if snap.steps % 2 == 0 else -KEEP_OFFSET) if kept else 0.5
         quiet = (snap.steps + 1) % QUIET_EVERY == 0
         discovery = None if quiet else (snap.idea or FALLBACK_IDEAS[snap.steps % len(FALLBACK_IDEAS)])
@@ -246,7 +256,7 @@ class DreamService:
         wanted = carry(list(snap.labels), u) + ([(discovery, focus_at)] if discovery else [])
         labels = self.labels.find(img, wanted)
         meta = {"steps": snap.steps, "version": snap.version, "idea": snap.idea if discovery else None,
-                "reset_ref": snap.reset_ref, "kept": kept}
+                "reset_ref": snap.reset_ref, "kept": kept, "yaw": _wrap_yaw(yaw)}
         return img, labels, meta
 
     def _commit(self, s: DreamSession, img: Image.Image, labels: list[Label], meta: dict) -> View:
@@ -255,6 +265,7 @@ class DreamService:
         with self._lock:
             self._drop_prefetch(s)     # built from the spot we just left
             s.pano, s.labels, s.steps = img, labels, s.steps + 1
+            s.kept_run = s.kept_run + 1 if meta["kept"] else 0
             if meta["idea"] is not None and s.ideas and s.ideas[0] == meta["idea"]:
                 s.ideas.popleft()
             # A theme or mood change during this build applies from the next step instead.
@@ -264,7 +275,7 @@ class DreamService:
                     s.drift = None if done >= DRIFT_STEPS else (s.drift[0], done)
                 if ref is not None:
                     s.ref, s.ref_pending = ref, False
-            view = self._view(s, view_id, path)
+            view = self._view(s, view_id, path, meta["yaw"])
         self._maybe_refill(s)
         return view
 
@@ -328,8 +339,11 @@ class DreamService:
         return [(text(drift[0]), 1 - k / DRIFT_STEPS), (text(theme), k / DRIFT_STEPS)]
 
     @staticmethod
-    def _near_label(labels, u: float) -> bool:
-        return any(wrap_dist(l.u, u) <= FOCUS_HALF for l in labels)
+    def _keeps(labels, kept_run: int, u: float) -> bool:
+        """Whether a step toward u keeps the discovery there: one is ahead, it is still object-sized, and it
+        hasn't been kept MAX_KEEPS steps running."""
+        return kept_run < MAX_KEEPS and any(
+            wrap_dist(l.u, u) <= FOCUS_HALF and l.w <= KEEP_MAX_W and l.h <= KEEP_MAX_H for l in labels)
 
     def _save(self, img: Image.Image) -> tuple[Path, str]:
         view_id = secrets.token_urlsafe(8)
@@ -338,8 +352,8 @@ class DreamService:
         return path, view_id
 
     @staticmethod
-    def _view(s: DreamSession, view_id: str, path: Path) -> View:
-        return View(view_id, path, list(s.labels), s.theme, list(s.moods), s.steps)
+    def _view(s: DreamSession, view_id: str, path: Path, walked_yaw: float = 0.0) -> View:
+        return View(view_id, path, list(s.labels), s.theme, list(s.moods), s.steps, walked_yaw)
 
     @staticmethod
     def _theme(theme: str) -> str:

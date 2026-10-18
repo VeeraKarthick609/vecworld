@@ -1,7 +1,7 @@
 "use strict";
 
 // Dream Walk viewer: a 360° cylindrical panorama you look around in (client-side) and walk through
-// (the server paints the next spot, centred on the direction you moved).
+// (the server paints the next spot, centred on the direction it walked: view.walked_yaw, in the old spot's frame).
 
 const FOV = 90;              // horizontal degrees shown, narrowed on tall screens so the image keeps its aspect
 const TURN_SPEED = 150;      // degrees per second while A/D or ←/→ is held
@@ -24,7 +24,7 @@ let labelEls = [];           // [element, label] pairs on screen
 let image = null;            // its loaded panorama
 let yaw = 0;                 // degrees, 0 = the centre of the panorama, positive = right
 let busy = false;            // a start or move is in flight (request, image load or transition)
-let anim = null;             // {from, fromYaw, to, dir, t0, ms, done}
+let anim = null;             // {from, fromYaw, turnTo, to, toYaw, dir, t0, ms, done}
 let lastPrefetch = null;     // yaw of the last prefetch for this spot and theme/moods
 let settleTimer = 0;
 
@@ -130,13 +130,15 @@ function frame(t) {
     const k = Math.min(1, (t - anim.t0) / anim.ms);
     const fade = anim.from ? Math.max(0, (k - 0.35) / 0.65) : k;
     if (anim.dir > 0) {
-      // Walking on: dolly into the old spot while the new one, already a little closer, settles in.
-      if (anim.from) drawPano(anim.from, anim.fromYaw, 1 + (DOLLY - 1) * k);
-      drawPano(anim.to, 0, 1 + (DOLLY - 1) * 0.3 * (1 - k), fade);
+      // Walking on: dolly into the old spot (turning toward a clicked discovery on the way) while the new
+      // one, already a little closer, settles in facing the same way.
+      const turnK = Math.min(1, k / 0.6), ease = turnK * turnK * (3 - 2 * turnK);
+      if (anim.from) drawPano(anim.from, anim.fromYaw + wrapYaw(anim.turnTo - anim.fromYaw) * ease, 1 + (DOLLY - 1) * k);
+      drawPano(anim.to, anim.toYaw, 1 + (DOLLY - 1) * 0.3 * (1 - k), fade);
     } else {
       // Turning back: the old spot falls away as the new one pulls back from close up.
       if (anim.from) drawPano(anim.from, anim.fromYaw, 1, 1 - fade);
-      drawPano(anim.to, 0, 1 + (DOLLY - 1) * (1 - k), fade);
+      drawPano(anim.to, anim.toYaw, 1 + (DOLLY - 1) * (1 - k), fade);
     }
     if (k >= 1) { const done = anim.done; anim = null; done(); }
   } else if (image) {
@@ -158,7 +160,9 @@ function renderLabels() {
     const text = document.createElement("span");
     text.textContent = l.text;
     el.append(text);
-    el.addEventListener("click", () => { if (dragged <= DRAG_CLICK) move("approach", { label: l.id }); });
+    el.addEventListener("click", () => {
+      if (dragged <= DRAG_CLICK) move("approach", { label: l.id }, wrapYaw((l.u - 0.5) * 360));
+    });
     return [el, l];
   });
   labelsEl.replaceChildren(...labelEls.map(([el]) => el));
@@ -187,32 +191,36 @@ function placeLabels() {
 
 // --- moving -------------------------------------------------------------------
 
-function transition(img, dir, ms) {
+function transition(img, dir, ms, turnTo, toYaw) {
   return new Promise((done) => {
     // Labels for the new spot go up in the frame the transition ends, never over the old one.
-    anim = { from: image, fromYaw: yaw, to: img, dir, t0: performance.now(), ms, done: () => { renderLabels(); done(); } };
+    anim = { from: image, fromYaw: yaw, turnTo, to: img, toYaw, dir, t0: performance.now(), ms,
+             done: () => { renderLabels(); done(); } };
     $("spinner").hidden = true;
   });
 }
 
-async function arrive(v, dir) {
+// facing: the yaw (in the old spot's frame) you face once you arrive. The new spot's centre is where the
+// server walked (a prefetch may have walked up to 45° off it), so you keep facing what you faced.
+async function arrive(v, dir, facing = 0) {
   const img = await loadImage(v.image_url);
-  const t = transition(img, dir, view ? MOVE_MS : START_MS);
+  const to = view ? wrapYaw(facing - v.walked_yaw) : 0;
+  const t = transition(img, dir, view ? MOVE_MS : START_MS, dir > 0 ? facing : yaw, to);
   view = deepFreeze(v);
   labels = view.labels;
   image = img;
-  yaw = 0;                    // the server centred the new spot on the direction you moved
+  yaw = to;
   await t;
   lastPrefetch = null;
   settled();
 }
 
-async function move(what, body) {
+async function move(what, body, facing) {
   if (busy || !view) return;
   setBusy(true);
   try {
     const v = await call(what, body);
-    await arrive(v, what === "back" ? -1 : 1);
+    await arrive(v, what === "back" ? -1 : 1, facing);
   } catch (e) {
     toast(e.message);         // nothing changed: the previous view and labels are still on screen
   } finally {
@@ -220,8 +228,8 @@ async function move(what, body) {
   }
 }
 
-const walk = () => move("walk", { yaw });
-const back = () => move("back", { yaw });
+const walk = () => move("walk", { yaw }, yaw);
+const back = () => move("back", { yaw }, wrapYaw(yaw + 180));
 
 // --- prefetch -----------------------------------------------------------------
 

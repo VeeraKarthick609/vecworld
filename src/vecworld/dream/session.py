@@ -17,6 +17,7 @@ class View:
     theme: str
     moods: list[str]
     steps: int
+    walked_yaw: float = 0.0     # yaw, in the previous spot's frame, that this spot's centre faces
 
 
 @dataclass
@@ -38,3 +39,4 @@ class DreamSession:
     ref_pending: bool = False             # the next spot becomes the palette reference (mood change)
     ideas_theme: str = ""                 # the theme the queued ideas were dreamt for
     refilling: str | None = None          # the theme an ideas refill is running for
+    kept_run: int = 0                     # consecutive steps that kept what was ahead
