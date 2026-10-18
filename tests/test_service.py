@@ -14,6 +14,34 @@ def test_jump_lands_and_lists_clickables(svc):
     assert sc.image_path.exists() and len(sc.trail) == 1
 
 
+class HidingFinder:
+    """Locates every concept except the hidden ones."""
+
+    def __init__(self, hidden):
+        self.hidden = set(hidden)
+        self.asked: list[list[str]] = []
+
+    def find(self, img, concepts):
+        from vecworld.scenes.hotspots import Hotspot
+
+        self.asked.append(list(concepts))
+        n = len(concepts)
+        return [None if c in self.hidden else Hotspot(c, i / n, 0.4, 1 / n, 0.2) for i, c in enumerate(concepts)]
+
+
+def test_only_located_neighbours_are_offered(svc):
+    from vecworld.config import CENTRE_BOX, N_CANDIDATES
+
+    svc.finder = HidingFinder({"ocean", "sea"})
+    s = svc.new_session()
+    sc = svc.jump(s.id, "ocean")
+    offered = [h.concept for h in sc.hotspots]
+    assert offered[0] == "ocean" and "sea" not in offered and "ship" in offered
+    c = sc.hotspots[0]
+    assert (c.x, c.y, c.w, c.h) == CENTRE_BOX          # unlocated centre still pinned, in the middle
+    assert len(svc.finder.asked[-1]) == 1 + min(N_CANDIDATES, len(svc.space.words) - 1)
+
+
 def test_step_pins_clicked_concept_even_when_capped(svc):
     s = svc.new_session()
     svc.jump(s.id, "ocean")

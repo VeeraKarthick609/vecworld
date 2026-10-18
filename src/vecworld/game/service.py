@@ -7,10 +7,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from vecworld.config import MAX_SESSIONS, MAX_STEP_ANGLE, MAX_TEXT_CHARS, N_NEIGHBOURS, SESSION_TTL, ZOOM_FRAC
+from vecworld.config import (MAX_SESSIONS, MAX_STEP_ANGLE, MAX_TEXT_CHARS, N_CANDIDATES, N_NEIGHBOURS,
+                             N_PROMPT_NEIGHBOURS, SESSION_TTL, ZOOM_FRAC)
 from vecworld.game.session import Scene, Session
 from vecworld.scenes.generator import SceneGenerator
-from vecworld.scenes.hotspots import Hotspot, HotspotFinder
+from vecworld.scenes.hotspots import Hotspot, HotspotFinder, choose
 from vecworld.scenes.prompt import scene_prompt, zoom_crop
 from vecworld.space.embedder import Embedder
 from vecworld.space.index import MeaningSpace
@@ -91,10 +92,11 @@ class GameService:
             raise BadInput("Type a word or phrase to jump to.")
         with self._claim(s):
             position = centre(self.embedder.embed([text[:MAX_TEXT_CHARS]]), self.vocab_mean)[0]
-            (centre_word, _), *rest = self.space.neighbours(position, k=1 + N_NEIGHBOURS)
+            (centre_word, _), *rest = self.space.neighbours(position, k=1 + N_CANDIDATES)
             others = [w for w, _ in rest]
-            img, hotspots = self._render(lambda: self.generator.fresh(scene_prompt(centre_word, others), s.seed),
-                                         [centre_word] + others)
+            img, hotspots = self._render(
+                lambda: self.generator.fresh(scene_prompt(centre_word, others[:N_PROMPT_NEIGHBOURS]), s.seed),
+                centre_word, others)
             return self._commit(s, position, img, hotspots)
 
     def step(self, sid: str, concept: str) -> Scene:
@@ -107,10 +109,11 @@ class GameService:
         with self._claim(s):
             position = self.space.step_toward(s.position, self.space.vector(concept), MAX_STEP_ANGLE)
             # The clicked concept stays pinned at the centre even if the cap stopped us short of it.
-            others = [w for w, _ in self.space.neighbours(position, k=N_NEIGHBOURS, exclude={concept})]
+            others = [w for w, _ in self.space.neighbours(position, k=N_CANDIDATES, exclude={concept})]
             prev = zoom_crop(s.image, clicked.x + clicked.w / 2, clicked.y + clicked.h / 2, ZOOM_FRAC)
-            img, hotspots = self._render(lambda: self.generator.evolve(prev, scene_prompt(concept, others), s.seed),
-                                         [concept] + others)
+            img, hotspots = self._render(
+                lambda: self.generator.evolve(prev, scene_prompt(concept, others[:N_PROMPT_NEIGHBOURS]), s.seed),
+                concept, others)
             return self._commit(s, position, img, hotspots)
 
     def _claim(self, s: Session):
@@ -129,7 +132,8 @@ class GameService:
 
         return _Claim()
 
-    def _render(self, make_image, concepts: list[str]) -> tuple[Image.Image, list[Hotspot]]:
+    def _render(self, make_image, centre_word: str, candidates: list[str]) -> tuple[Image.Image, list[Hotspot]]:
+        """Generate, then offer the pinned centre plus only the candidates CLIPSeg finds in the picture."""
         import torch
 
         with self._gpu:
@@ -138,7 +142,8 @@ class GameService:
             except torch.cuda.OutOfMemoryError as e:
                 torch.cuda.empty_cache()
                 raise GpuUnavailable("The GPU is out of memory, try again in a moment.") from e
-        return img, self.finder.find(img, concepts)
+        found = self.finder.find(img, [centre_word] + candidates)
+        return img, choose(centre_word, found, N_NEIGHBOURS)
 
     def _commit(self, s: Session, position: np.ndarray, img: Image.Image, hotspots: list[Hotspot]) -> Scene:
         scene_id = secrets.token_urlsafe(8)
