@@ -24,11 +24,11 @@ class UiPainter(FakePainter):
     fail_steps = False
     delay = 0.0
 
-    def step(self, prev, base, focus, focus_at, seed):
+    def step(self, prev, base, focus, focus_at, seed, **kw):
         time.sleep(self.delay)
         if self.fail_steps:
             self.fail_next = True
-        return super().step(prev, base, focus, focus_at, seed)
+        return super().step(prev, base, focus, focus_at, seed, **kw)
 
 
 class UiLabels:

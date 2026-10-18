@@ -29,10 +29,10 @@ class GatedPainter(FakePainter):
         super().__init__()
         self.entered, self.gate = threading.Event(), threading.Event()
 
-    def step(self, prev, base, focus, focus_at, seed):
+    def step(self, prev, base, focus, focus_at, seed, **kw):
         self.entered.set()
         assert self.gate.wait(10)
-        return super().step(prev, base, focus, focus_at, seed)
+        return super().step(prev, base, focus, focus_at, seed, **kw)
 
 
 def make_client(tmp_path, painter=None):

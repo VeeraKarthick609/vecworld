@@ -6,9 +6,9 @@ STEP_STEPS = 4
 # Each step is pulled this far back toward the reference panorama's LAB palette (reset by theme/mood).
 # 0 bands the sky yellow/blue over a few steps, 1.0 washes everything grey; 0.5 holds it and stays lively.
 PALETTE_STRENGTH = 0.5
-SESSION_TTL = 3600     # seconds idle before a session (and its scene image) is dropped
+SESSION_TTL = 3600     # seconds idle before a session is dropped; its view images are deleted with it
 MAX_SESSIONS = 50
-STYLE = "impressionist oil painting, visible brushstrokes, dreamlike, soft volumetric light"
+STYLE = "impressionist oil painting, visible brushstrokes, dreamlike atmosphere"
 
 SCENE_DIR = Path("var/scenes")
 
@@ -28,8 +28,17 @@ KEEP_OFFSET = 0.17
 KEEP_MAX_W = 0.1           # a label wider (fraction of the panorama) or taller than this is scenery, not an object
 KEEP_MAX_H = 0.6
 MAX_KEEPS = 2              # consecutive steps that keep what you walk toward, then it is walked past
+MOOD_BG_STRENGTH = 0.8     # background img2img strength of the first step after a mood change
 QUIET_EVERY = 3
 DRIFT_STEPS = 3
 PREFETCH_TOLERANCE = 45.0
-MOODS = ("foggy", "night", "rain", "snow", "eerie", "warm")
+MOODS = ("foggy", "night", "rain", "snow", "eerie", "warm")   # the chips; their prompt words below
+MOOD_WORDS = {
+    "night": "at night, dark night sky, cold moonlight, deep shadows",
+    "foggy": "thick fog, mist",
+    "rain": "heavy rain, wet, overcast",
+    "snow": "falling snow, snow-covered ground",
+    "eerie": "dark, eerie, ominous, gloomy",
+    "warm": "warm golden light",
+}
 MAX_THEME_CHARS = 120

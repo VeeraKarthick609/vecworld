@@ -5,8 +5,8 @@ import pytest
 from conftest import FakeDreamer, FakePainter
 from PIL import Image
 
-from vecworld.config import (DRIFT_STEPS, KEEP_OFFSET, MOODS, MAX_THEME_CHARS, PANO_H, PANO_W, SESSION_TTL,
-                             STYLE)
+from vecworld.config import (DRIFT_STEPS, KEEP_OFFSET, MOOD_BG_STRENGTH, MOOD_WORDS, MOODS, MAX_THEME_CHARS,
+                             PANO_H, PANO_W, SESSION_TTL, STYLE)
 from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownLabel, UnknownSession
 from vecworld.dream.ideas import FALLBACK_IDEAS
 from vecworld.dream.labels import Label
@@ -15,6 +15,7 @@ from vecworld.dream.service import DreamService, View
 from vecworld.scenes.palette import palette_stats
 
 KEEPS = (pytest.approx(0.5 - KEEP_OFFSET), pytest.approx(0.5 + KEEP_OFFSET))
+FOG = MOOD_WORDS["foggy"]
 
 
 class FakeLabels:
@@ -46,8 +47,8 @@ class TagPainter(FakePainter):
         a[..., 1] = 255 - a[..., 0]
         return Image.fromarray(a)
 
-    def step(self, prev, base, focus, focus_at, seed):
-        super().step(prev, base, focus, focus_at, seed)
+    def step(self, prev, base, focus, focus_at, seed, **kw):
+        super().step(prev, base, focus, focus_at, seed, **kw)
         n = len(steps_of(self))
         return Image.new("RGB", (PANO_W // 16, PANO_H // 16), (n * 40,) * 3)
 
@@ -59,10 +60,10 @@ class GatedPainter(FakePainter):
         super().__init__()
         self.entered, self.gate = threading.Event(), threading.Event()
 
-    def step(self, prev, base, focus, focus_at, seed):
+    def step(self, prev, base, focus, focus_at, seed, **kw):
         self.entered.set()
         assert self.gate.wait(5)
-        return super().step(prev, base, focus, focus_at, seed)
+        return super().step(prev, base, focus, focus_at, seed, **kw)
 
 
 def run_now(fn):
@@ -111,7 +112,7 @@ def test_start_makes_panorama_and_refills_ideas(svc):
     v = svc.start(s.id, "  a quiet forest ", ["foggy"])
     assert isinstance(v, View)
     assert svc.painter.calls[0][0] == "panorama"
-    assert svc.painter.calls[0][1]["base"] == [(f"a quiet forest, foggy, {STYLE}", 1.0)]
+    assert svc.painter.calls[0][1]["base"] == [(f"a quiet forest, {FOG}, {STYLE}", 1.0)]
     assert svc.dreamer.calls == [("a quiet forest", ["foggy"], 8)]
     assert list(s.ideas) == FakeDreamer().ideas("", [], 8)
     assert v.labels == [] and v.steps == 0 and v.theme == "a quiet forest" and v.moods == ["foggy"]
@@ -165,9 +166,9 @@ def test_walk_rolls_to_yaw_and_regenerates_ahead(svc_factory):
     (kw,) = steps_of(svc.painter)
     assert np.array_equal(arr(kw["prev"]), arr(dolly(roll_to(pano, yaw_to_u(40)))))
     assert kw["focus_at"] == 0.5
-    base_text = f"a quiet forest, foggy, {STYLE}"
-    assert kw["base"] == [(base_text, 1.0)]
-    assert kw["focus"] == [(f"{base_text}, {FakeDreamer.IDEAS[0]} ahead in the distance", 1.0)]
+    assert kw["base"] == [(f"a quiet forest, {FOG}, {STYLE}", 1.0)]
+    # the discovery comes before the moods and the style, so it isn't the weakest part of the prompt
+    assert kw["focus"] == [(f"a quiet forest, {FakeDreamer.IDEAS[0]} ahead in the distance, {FOG}, {STYLE}", 1.0)]
     assert svc.labels.calls[-1] == [(FakeDreamer.IDEAS[0], 0.5)]
     assert [l.text for l in v.labels] == [FakeDreamer.IDEAS[0]]
     assert v.steps == 1 and s.steps == 1 and v.image_path.exists()
@@ -447,7 +448,7 @@ def test_mood_change_discards_prefetch(svc):
     svc.walk(s.id, 0)
     calls = steps_of(svc.painter)
     assert len(calls) == 2
-    assert "night" in calls[1]["base"][0][0] and "foggy" not in calls[1]["base"][0][0]
+    assert "moonlight" in calls[1]["base"][0][0] and "fog" not in calls[1]["base"][0][0]
 
 
 def test_prefetch_while_moving_is_skipped(svc_factory):
@@ -468,7 +469,7 @@ def test_theme_drift_weights(svc):
     s = started(svc, theme="a quiet forest", moods=["foggy"])
     start_ref = s.ref
     svc.set_theme(s.id, "frozen lake")
-    old, new = f"a quiet forest, foggy, {STYLE}", f"frozen lake, foggy, {STYLE}"
+    old, new = f"a quiet forest, {FOG}, {STYLE}", f"frozen lake, {FOG}, {STYLE}"
     for k in range(1, DRIFT_STEPS + 1):
         assert s.ref is start_ref
         svc.walk(s.id, 90)
@@ -479,6 +480,23 @@ def test_theme_drift_weights(svc):
     assert s.ref is not start_ref                # the colour reference resets once the theme takes over
     svc.walk(s.id, 90)
     assert steps_of(svc.painter)[-1]["base"] == [(new, 1.0)]
+
+
+def test_mood_chips_expand_to_prompt_words():
+    (text, w), = DreamService._base("haunted forest", ["night", "eerie"], None)
+    assert w == 1.0 and text == f"haunted forest, {MOOD_WORDS['night']}, {MOOD_WORDS['eerie']}, {STYLE}"
+    assert "moonlight" in text
+
+
+def test_first_step_after_a_mood_change_repaints_more(svc):
+    s = started(svc)
+    svc.walk(s.id, 90)
+    assert steps_of(svc.painter)[-1]["bg_strength"] is None
+    svc.set_moods(s.id, ["night"])
+    svc.walk(s.id, 90)
+    assert steps_of(svc.painter)[-1]["bg_strength"] == MOOD_BG_STRENGTH
+    svc.walk(s.id, 90)
+    assert steps_of(svc.painter)[-1]["bg_strength"] is None
 
 
 def test_set_theme_bumps_version_and_drops_prefetch(svc):

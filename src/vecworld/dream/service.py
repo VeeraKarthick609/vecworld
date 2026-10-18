@@ -13,8 +13,8 @@ from pathlib import Path
 from PIL import Image
 
 from vecworld.config import (DRIFT_STEPS, FOCUS_HALF, KEEP_MAX_H, KEEP_MAX_W, KEEP_OFFSET, MAX_KEEPS,
-                             MAX_SESSIONS, MAX_THEME_CHARS, MOODS, PALETTE_STRENGTH, PREFETCH_TOLERANCE,
-                             QUIET_EVERY, SESSION_TTL, STYLE)
+                             MAX_SESSIONS, MAX_THEME_CHARS, MOOD_BG_STRENGTH, MOOD_WORDS, MOODS,
+                             PALETTE_STRENGTH, PREFETCH_TOLERANCE, QUIET_EVERY, SESSION_TTL, STYLE)
 from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownLabel, UnknownSession
 from vecworld.dream.gpu import GpuQueue
 from vecworld.dream.ideas import FALLBACK_IDEAS, Dreamer
@@ -45,6 +45,7 @@ class _Snap:
     reset_ref: bool     # this spot becomes the palette reference
     seed: int
     kept_run: int
+    mood_change: bool   # first spot after a mood change: repaint the background harder
 
 
 def _thread(fn) -> None:
@@ -234,7 +235,8 @@ class DreamService:
         drift_done = s.drift is not None and s.drift[1] + 1 >= DRIFT_STEPS
         return _Snap(pano=s.pano, labels=tuple(s.labels), steps=s.steps, idea=s.ideas[0] if s.ideas else None,
                      theme=s.theme, moods=tuple(s.moods), drift=s.drift, version=s.version, ref=s.ref,
-                     reset_ref=s.ref_pending or drift_done, seed=s.seed, kept_run=s.kept_run)
+                     reset_ref=s.ref_pending or drift_done, seed=s.seed, kept_run=s.kept_run,
+                     mood_change=s.ref_pending)
 
     def _build(self, snap: _Snap, yaw: float) -> tuple[Image.Image, list[Label], dict]:
         """Paint the spot one step toward yaw. Pure: reads only the snapshot, so nothing changes until _commit."""
@@ -247,9 +249,11 @@ class DreamService:
         quiet = (snap.steps + 1) % QUIET_EVERY == 0
         discovery = None if quiet else (snap.idea or FALLBACK_IDEAS[snap.steps % len(FALLBACK_IDEAS)])
         base = self._base(snap.theme, list(snap.moods), snap.drift)
-        focus = [(f"{t}, {discovery} ahead in the distance", w) for t, w in base] if discovery else None
+        focus = self._base(snap.theme, list(snap.moods), snap.drift, discovery) if discovery else None
         seed = (snap.seed + snap.steps + 1) % 2**31
-        img = self._paint(lambda: self.painter.step(prev, base, focus, focus_at, seed))
+        # So night or snow show at once instead of being img2img'd from the old light.
+        kw = {"bg_strength": MOOD_BG_STRENGTH} if snap.mood_change else {}
+        img = self._paint(lambda: self.painter.step(prev, base, focus, focus_at, seed, **kw))
         if not snap.reset_ref:
             # A spot that becomes the new reference keeps its own colours; the rest are pulled back.
             img = match_palette(img, snap.ref, PALETTE_STRENGTH)
@@ -329,9 +333,11 @@ class DreamService:
             raise GpuUnavailable("The GPU is out of memory, try again in a moment.") from e
 
     @staticmethod
-    def _base(theme: str, moods: list[str], drift: tuple[str, int] | None) -> Prompt:
+    def _base(theme: str, moods: list[str], drift: tuple[str, int] | None, discovery: str | None = None) -> Prompt:
+        """The prompt: theme, then the discovery (if any), then each mood chip's words, then the style."""
         def text(t):
-            return ", ".join([t, *moods, STYLE])
+            ahead = [f"{discovery} ahead in the distance"] if discovery else []
+            return ", ".join([t, *ahead, *(MOOD_WORDS[m] for m in moods), STYLE])
 
         if drift is None:
             return [(text(theme), 1.0)]
