@@ -44,6 +44,26 @@ def test_find_keeps_input_order_and_skips_misses():
     assert [l.text for l in ls] == ["a", "b"]
 
 
-def test_carry_moves_labels_away_from_centre_and_drops_offscreen():
-    ls = [Label("a", "lantern", 0.55, .4, .05, .1), Label("b", "pond", 0.9, .4, .05, .1)]
-    assert [(t, round(u, 4)) for t, u in carry(ls, walk_u=0.5)] == [("lantern", round(0.5 + 0.05 * 1.15, 4))]
+def test_carry_follows_the_dolly_warp_and_drops_offscreen():
+    import math
+
+    ls = [Label("a", "lantern", 0.55, .4, .05, .1), Label("b", "pond", 0.9, .4, .05, .1),
+          Label("c", "gate", 0.15, .4, .05, .1)]
+    (text, u), = carry(ls, walk_u=0.5)
+    assert text == "lantern"
+    a = 1 - 1 / 1.15                       # the dolly samples u from u - a/2pi sin(2pi(u - 0.5))
+    assert abs(u - a / (2 * math.pi) * math.sin(2 * math.pi * (u - 0.5)) - 0.55) < 1e-6
+    assert 0.55 < u < 0.5 + 0.05 * 1.15 + 1e-9
+
+
+def test_carry_matches_where_dolly_puts_a_mark():
+    import numpy as np
+    from PIL import Image
+
+    from vecworld.dream.pano import dolly
+    img = Image.new("RGB", (2048, 64), "black")
+    img.paste((255, 255, 255), (1330, 0, 1334, 64))     # u ~ 0.65
+    out = np.asarray(dolly(img))[32, :, 0].astype(float)
+    seen = (out * np.arange(2048)).sum() / out.sum() / 2048
+    (_, u), = carry([Label("a", "mark", 1332 / 2048, .4, .01, .1)], walk_u=0.5)
+    assert abs(u - seen) < 1 / 2048, (u, seen)

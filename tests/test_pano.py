@@ -38,5 +38,44 @@ def test_dolly_keeps_size_and_enlarges_centre():
     assert out.size == (200, 100) and out.getpixel((100, 50)) == (255, 0, 0) and out.getpixel((92, 50)) == (255, 0, 0) and out.getpixel((80, 50)) == (0, 0, 0)
 
 
+def periodic(w=512, h=64, seed=0):
+    """A smooth image that wraps around horizontally (no seam of its own)."""
+    rng = np.random.default_rng(seed)
+    x = np.arange(w) / w
+    a = np.zeros((h, w, 3))
+    for k in (1, 3, 7, 13):
+        a += rng.uniform(10, 25) * np.sin(2 * np.pi * (k * x[None, :, None] + rng.uniform(0, 1, (h, 1, 3))))
+    return Image.fromarray(np.clip(128 + a, 0, 255).astype(np.uint8))
+
+
+def test_dolly_leaves_no_seam_behind_you():
+    out = np.asarray(dolly(periodic(), 1.15), float)
+    seam = np.abs(out[:, 0] - out[:, -1]).mean()
+    inner = np.mean([np.abs(out[:, x] - out[:, x - 1]).mean() for x in (64, 128, 384, 448)])
+    assert seam < 1.5 * inner + 1, (seam, inner)
+
+
+def test_dolly_magnifies_ahead_and_shrinks_behind():
+    img = Image.new("RGB", (400, 40), "black")
+    img.paste((255, 0, 0), (190, 0, 210, 40))           # 20 px ahead
+    img.paste((0, 255, 0), (0, 0, 10, 40)); img.paste((0, 255, 0), (390, 0, 400, 40))   # 20 px behind
+    out = np.asarray(dolly(img, 1.15))
+    red = (out[20, :, 0] > 128).sum()
+    green = (out[20, :, 1] > 128).sum()
+    assert 21 <= red <= 25 and 15 <= green <= 19, (red, green)
+
+
+def test_dolly_keeps_shapes_behind_you():
+    """Repeated steps must not stretch what is behind you into vertical bars."""
+    img = Image.new("RGB", (512, 128), "black")
+    img.paste((255, 255, 255), (0, 54, 10, 74)); img.paste((255, 255, 255), (502, 54, 512, 74))   # 20 x 20 behind
+    for _ in range(8):
+        img = dolly(img, 1.15)
+    m = np.asarray(img)[..., 0] > 128
+    cols, rows = np.nonzero(m.any(0))[0], np.nonzero(m.any(1))[0]
+    w = min(len(cols), 512 - len(cols)) if len(cols) > 256 else len(cols)
+    assert 0.7 < len(rows) / w < 1.4, (len(rows), w)
+
+
 def test_wrap_dist():
     assert abs(wrap_dist(0.98, 0.02) - 0.04) < 1e-9

@@ -1,22 +1,25 @@
 """Wrap-around MultiDiffusion on SD-Turbo: seamless 360° panoramas and region-focused walk steps."""
 import os
+from collections import OrderedDict
 from typing import Protocol
 
 import numpy as np
 from PIL import Image
 
-from vecworld.config import BG_STRENGTH, PANO_H, PANO_W, STEP_STEPS, VAE_MARGIN, VAE_TILE, WIN
-from vecworld.dream.pano import focus_mask, windows, wrap_cols
+from vecworld.config import (BG_STRENGTH, PANO_H, PANO_W, STEP_STEPS, VAE_MARGIN, VAE_STRIDE, VAE_TILE,
+                             WIN)
+from vecworld.dream.pano import focus_mask, ramp, tile_origins, windows, wrap_cols
 
 Prompt = list[tuple[str, float]]   # (text, weight); weights sum to 1
 BATCH = 4                          # UNet windows per forward pass
+EMB_CACHE = 64                     # text embeddings kept on the GPU (least recently used dropped)
 
 
 class Painter(Protocol):
     def panorama(self, base: Prompt, seed: int) -> Image.Image: ...
 
     def step(self, prev: Image.Image, base: Prompt, focus: Prompt | None, focus_at: float | None,
-             seed: int) -> Image.Image: ...
+             seed: int, bg_strength: float | None = None) -> Image.Image: ...
 
 
 class TurboPainter(Painter):
@@ -41,39 +44,62 @@ class TurboPainter(Painter):
         self._pipe.set_progress_bar_config(disable=True)
         self.unet, self.vae, self.sched = self._pipe.unet, self._pipe.vae, self._pipe.scheduler
         self._sf = self.vae.config.scaling_factor
-        self._embs: dict = {}
+        self._dev, self._dtype = "cuda", torch.float16
+        self._embs: OrderedDict = OrderedDict()
         self._lat_shape = (1, 4, PANO_H // 8, PANO_W // 8)
 
     # --- text ----------------------------------------------------------------
 
     def _text(self, text: str):
-        if text not in self._embs:
+        if text in self._embs:
+            self._embs.move_to_end(text)
+        else:
             self._embs[text] = self._pipe.encode_prompt(text, "cuda", 1, False)[0]
+            while len(self._embs) > EMB_CACHE:
+                self._embs.popitem(last=False)
         return self._embs[text]
 
     def _embed(self, prompt: Prompt):
         return sum(w * self._text(t) for t, w in prompt)
 
     # --- VAE, tiled along the wrapping width -------------------------------------
+    # Each tile is coded with VAE_MARGIN of wrap-around context, cropped, and crossfaded with its
+    # neighbours over their overlap: per-tile GroupNorm gives each tile its own colour offset, which hard
+    # crops showed as vertical lines. The grid moves with the seed so no boundary stays put.
 
-    def _decode(self, lat) -> Image.Image:
-        w, outs = lat.shape[-1], []
-        for x0 in range(0, w, VAE_TILE):
-            cols = wrap_cols(x0 - VAE_MARGIN, VAE_TILE + 2 * VAE_MARGIN, w)
-            px = self.vae.decode(lat[..., cols] / self._sf).sample
-            outs.append(px[..., VAE_MARGIN * 8:(VAE_MARGIN + VAE_TILE) * 8])
-        img = self._torch.cat(outs, -1)[0].float().clamp(-1, 1)
+    def _decode(self, lat, shift: int = 0) -> Image.Image:
+        torch, w, m = self._torch, lat.shape[-1], VAE_MARGIN
+        acc = wsum = None
+        wt = torch.from_numpy(ramp(VAE_TILE * 8, (VAE_TILE - VAE_STRIDE) * 8)).to(lat.device)
+        for x0 in tile_origins(w, shift):
+            px = self.vae.decode(lat[..., wrap_cols(x0 - m, VAE_TILE + 2 * m, w)] / self._sf).sample
+            px = px[..., m * 8:(m + VAE_TILE) * 8].float()
+            if acc is None:
+                acc = torch.zeros((*px.shape[:-1], w * 8), device=px.device)
+                wsum = torch.zeros(w * 8, device=px.device)
+            cols = torch.tensor(wrap_cols(x0 * 8, VAE_TILE * 8, w * 8), device=px.device)
+            acc.index_add_(-1, cols, px * wt)
+            wsum.index_add_(0, cols, wt)
+        img = (acc / wsum)[0].clamp(-1, 1)
         return Image.fromarray(((img + 1) * 127.5).round().byte().permute(1, 2, 0).cpu().numpy())
 
-    def _encode(self, im: Image.Image):
-        torch = self._torch
+    def _encode(self, im: Image.Image, shift: int = 0):
+        torch, m = self._torch, VAE_MARGIN
         a = np.asarray(im.convert("RGB").resize((PANO_W, PANO_H)))
-        x = torch.from_numpy(a.copy()).permute(2, 0, 1)[None].cuda().half() / 127.5 - 1
-        w, outs, tile, margin = x.shape[-1], [], VAE_TILE * 8, VAE_MARGIN * 8
-        for x0 in range(0, w, tile):
-            cols = wrap_cols(x0 - margin, tile + 2 * margin, w)
-            outs.append(self.vae.encode(x[..., cols]).latent_dist.mean[..., VAE_MARGIN:VAE_MARGIN + VAE_TILE])
-        return torch.cat(outs, -1) * self._sf
+        x = torch.from_numpy(a.copy()).permute(2, 0, 1)[None].to(self._dev, self._dtype) / 127.5 - 1
+        w = x.shape[-1] // 8
+        acc = wsum = None
+        wt = torch.from_numpy(ramp(VAE_TILE, VAE_TILE - VAE_STRIDE)).to(x.device)
+        for x0 in tile_origins(w, shift):
+            lat = self.vae.encode(x[..., wrap_cols((x0 - m) * 8, (VAE_TILE + 2 * m) * 8, w * 8)]).latent_dist.mean
+            lat = lat[..., m:m + VAE_TILE].float()
+            if acc is None:
+                acc = torch.zeros((*lat.shape[:-1], w), device=x.device)
+                wsum = torch.zeros(w, device=x.device)
+            cols = torch.tensor(wrap_cols(x0, VAE_TILE, w), device=x.device)
+            acc.index_add_(-1, cols, lat * wt)
+            wsum.index_add_(0, cols, wt)
+        return (acc / wsum * self._sf).to(self._dtype)
 
     # --- MultiDiffusion -------------------------------------------------------------
 
@@ -114,11 +140,13 @@ class TurboPainter(Painter):
             self.sched.set_begin_index(0)
             n = len(windows(*self._lat_shape[-2:]))
             lat = self._noise(seed) * self.sched.init_noise_sigma
-            return self._decode(self._denoise(lat, self.sched.timesteps, [self._embed(base)] * n))
+            return self._decode(self._denoise(lat, self.sched.timesteps, [self._embed(base)] * n),
+                                shift=seed % VAE_TILE)
 
     def step(self, prev: Image.Image, base: Prompt, focus: Prompt | None, focus_at: float | None,
-             seed: int) -> Image.Image:
+             seed: int, bg_strength: float | None = None) -> Image.Image:
         torch = self._torch
+        bg_strength = BG_STRENGTH if bg_strength is None else bg_strength
         h, w = self._lat_shape[-2:]
         m = np.zeros(w, np.float32) if focus_at is None else focus_mask(w, focus_at)
         with torch.inference_mode():
@@ -130,13 +158,14 @@ class TurboPainter(Painter):
             # The background denoises timesteps[k_bg:], as diffusers img2img does at BG_STRENGTH.
             # (Re-imposing only before k_bg left it 3 of 4 steps, i.e. ~0.75 strength, which repainted
             # the whole panorama.)
-            k_bg = STEP_STEPS - int(STEP_STEPS * BG_STRENGTH)
+            k_bg = STEP_STEPS - int(STEP_STEPS * bg_strength)
             # With nothing to regenerate, every step before k_bg is overwritten by the re-imposed
             # background, so start there: plain img2img, fewer UNet passes.
             start = k_bg if not m.any() else 0
             self.sched.set_begin_index(start)
-            noise, orig = self._noise(seed), self._encode(prev)
+            shift = seed % VAE_TILE
+            noise, orig = self._noise(seed), self._encode(prev, shift)
             mask = torch.from_numpy(m).to("cuda", torch.float16)[None, None, None, :]
             lat = self.sched.add_noise(orig, noise, ts[start:start + 1])
             out = self._denoise(lat, ts[start:], embs, keep=(orig, noise, mask, k_bg - start))
-            return self._decode(out)
+            return self._decode(out, shift)

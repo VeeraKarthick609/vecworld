@@ -17,8 +17,9 @@ PANO_W = 2048
 PANO_H = 512
 WIN = 64                   # latent window size
 STRIDE = 32
-VAE_TILE = 64
-VAE_MARGIN = 8
+VAE_TILE = 64              # latents per VAE tile; tiles overlap and crossfade (per-tile GroupNorm shifts colour)
+VAE_STRIDE = 48            # at most this far apart, so neighbours overlap >= 16 latents
+VAE_MARGIN = 0             # extra context coded each side, then cropped (the crossfade already fades tile edges out)
 DOLLY = 1.15
 BG_STRENGTH = 0.6
 FOCUS_HALF = 0.08

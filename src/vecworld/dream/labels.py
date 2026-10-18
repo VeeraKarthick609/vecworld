@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 
 from vecworld.config import DOLLY
-from vecworld.dream.pano import wrap_cols
+from vecworld.dream.pano import dolly_u, wrap_cols
 from vecworld.scenes.hotspots import Hotspot, locate
 
 BAND = (0.15, 0.85)
@@ -35,11 +35,10 @@ def to_label(text: str, box: Hotspot, u_centre: float, pano_w: int, crop_w: int 
 
 
 def carry(labels: list[Label], walk_u: float, z: float = DOLLY) -> list[tuple[str, float]]:
-    """Where each label's text lands after a step toward walk_u; those outside the visible band are dropped."""
+    """Where each label's text lands after a step toward walk_u (the dolly's warp); those outside the band are dropped."""
     out = []
     for l in labels:
-        offset = (l.u - walk_u + 0.5) % 1.0 - 0.5
-        u = 0.5 + offset * z
+        u = float(dolly_u((l.u - walk_u + 0.5) % 1.0, z))
         if BAND[0] <= u <= BAND[1]:
             out.append((l.text, u))
     return out
