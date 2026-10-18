@@ -67,3 +67,11 @@ def test_internal_keyerror_is_not_reported_as_unknown_session(svc, tmp_path):
 
     svc.space.neighbours = boom
     assert client.post(f"/api/session/{sid}/jump", json={"text": "ocean"}).status_code == 500
+
+
+def test_index_served(svc):
+    from vecworld.__main__ import WEB_DIR
+
+    r = TestClient(create_app(svc, WEB_DIR)).get("/")
+    assert r.status_code == 200 and "<canvas" in r.text
+    assert TestClient(create_app(svc, WEB_DIR)).get("/app.js").status_code == 200
