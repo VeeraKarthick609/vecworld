@@ -3,34 +3,45 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from vecworld.game.service import GameError, GameService
-from vecworld.game.session import Scene
-
-
-class JumpIn(BaseModel):
-    text: str
+from vecworld.dream.errors import GameError
+from vecworld.dream.service import DreamService
+from vecworld.dream.session import View
 
 
-class StepIn(BaseModel):
-    concept: str
+class StartIn(BaseModel):
+    theme: str = Field(max_length=1000)
+    moods: list[str] = []
 
 
-def scene_out(sc: Scene) -> dict:
+class YawIn(BaseModel):
+    yaw: float = Field(allow_inf_nan=False)
+
+
+class ApproachIn(BaseModel):
+    label: str
+
+
+class ThemeIn(BaseModel):
+    theme: str = Field(max_length=1000)
+
+
+class MoodsIn(BaseModel):
+    moods: list[str]
+
+
+def view_out(v: View) -> dict:
     return {
-        "scene_id": sc.scene_id,
-        "centre": sc.centre,
-        "image_url": f"/scenes/{sc.scene_id}.png",
-        "hotspots": [{"concept": h.concept, "x": h.x, "y": h.y, "w": h.w, "h": h.h} for h in sc.hotspots],
-        "mindmap": {
-            "me": list(sc.me),
-            "trail": [list(p) for p in sc.trail],
-            "neighbours": [{"concept": w, "x": x, "y": y} for w, x, y in sc.neighbours],
-            "reach_radius": sc.reach_radius,
-        },
+        "view_id": v.view_id,
+        "image_url": f"/scenes/{v.view_id}.png",
+        "labels": [{"id": l.id, "text": l.text, "u": l.u, "y": l.y, "w": l.w, "h": l.h} for l in v.labels],
+        "theme": v.theme,
+        "moods": list(v.moods),
+        "steps": v.steps,
     }
 
 
@@ -38,7 +49,7 @@ def error(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse({"error": code, "message": message}, status_code=status)
 
 
-def create_app(service: GameService, web_dir: Path) -> FastAPI:
+def create_app(service: DreamService, web_dir: Path) -> FastAPI:
     app = FastAPI(title="vecworld")
     # GPU work is serialised inside the service; a few threads let a second request
     # for a busy session get its 409 instead of waiting in line.
@@ -51,25 +62,48 @@ def create_app(service: GameService, web_dir: Path) -> FastAPI:
     async def game_error(_: Request, e: GameError):
         return error(e.status, e.code, str(e))
 
+    @app.exception_handler(RequestValidationError)
+    async def bad_body(_: Request, e: RequestValidationError):
+        # Report where and what, never the offending value.
+        msg = "; ".join(f"{'.'.join(str(p) for p in err['loc'][1:]) or 'body'}: {err['msg']}" for err in e.errors())
+        return error(422, "bad_input", msg or "Invalid request.")
+
     @app.post("/api/session")
     async def new_session():
         return {"session_id": service.new_session().id}
 
-    @app.post("/api/session/{sid}/jump")
-    async def jump(sid: str, body: JumpIn):
-        return scene_out(await run(service.jump, sid, body.text))
+    @app.post("/api/session/{sid}/start")
+    async def start(sid: str, body: StartIn):
+        return view_out(await run(service.start, sid, body.theme, body.moods))
 
-    @app.post("/api/session/{sid}/step")
-    async def step(sid: str, body: StepIn):
-        return scene_out(await run(service.step, sid, body.concept))
-
-    @app.post("/api/session/{sid}/forward")
-    async def forward(sid: str):
-        return scene_out(await run(service.forward, sid))
+    @app.post("/api/session/{sid}/walk")
+    async def walk(sid: str, body: YawIn):
+        return view_out(await run(service.walk, sid, body.yaw))
 
     @app.post("/api/session/{sid}/back")
-    async def back(sid: str):
-        return scene_out(await run(service.back, sid))
+    async def back(sid: str, body: YawIn):
+        return view_out(await run(service.back, sid, body.yaw))
+
+    @app.post("/api/session/{sid}/approach")
+    async def approach(sid: str, body: ApproachIn):
+        return view_out(await run(service.approach, sid, body.label))
+
+    @app.post("/api/session/{sid}/theme")
+    async def theme(sid: str, body: ThemeIn):
+        await run(service.set_theme, sid, body.theme)
+        return {"ok": True}
+
+    @app.post("/api/session/{sid}/moods")
+    async def moods(sid: str, body: MoodsIn):
+        await run(service.set_moods, sid, body.moods)
+        return {"ok": True}
+
+    @app.post("/api/session/{sid}/prefetch", status_code=202)
+    async def prefetch(sid: str, body: YawIn):
+        # Only queues a low-priority job and returns; never waits on the GPU, so it runs inline
+        # rather than behind possibly blocked pool threads.
+        service.prefetch(sid, body.yaw)
+        return {"ok": True}
 
     app.mount("/scenes", StaticFiles(directory=service.scene_dir), name="scenes")
     app.mount("/", StaticFiles(directory=web_dir, html=True), name="web")
