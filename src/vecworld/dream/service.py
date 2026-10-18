@@ -182,13 +182,20 @@ class DreamService:
             s.prefetch = (yaw, s.version, fut)
 
     def _take_prefetch(self, s: DreamSession, yaw: float, keep: bool | None):
-        """The prefetched spot if it fits this move (waiting for it if still running), else None."""
+        """The prefetched spot if it fits this move (waiting for it only if already running), else None.
+
+        A prefetch that won't be used is dropped now, so it can't hold the GPU after the on-demand build.
+        """
         with self._lock:
             pf = s.prefetch
-            if pf is None or pf[1] != s.version or _yaw_diff(pf[0], yaw) > PREFETCH_TOLERANCE:
+            if pf is None:
                 return None
-            if keep and not self._near_label(s.labels, yaw_to_u(pf[0])):
-                return None            # approaching a label needs a build that keeps it
+            # Approaching a label needs a build that keeps it. A prefetch still queued sits behind every
+            # player's on-demand jobs, so cancel it and build this move at demand priority instead.
+            if (pf[1] != s.version or _yaw_diff(pf[0], yaw) > PREFETCH_TOLERANCE
+                    or (keep and not self._near_label(s.labels, yaw_to_u(pf[0]))) or pf[2].cancel()):
+                self._drop_prefetch(s)
+                return None
         try:
             built = pf[2].result()
         except Exception as e:  # noqa: BLE001 - cancelled, out of memory or broken: build on demand instead
@@ -199,6 +206,9 @@ class DreamService:
                     s.prefetch = None
             return None
         if built[2]["steps"] != s.steps:
+            with self._lock:
+                if s.prefetch is pf:
+                    s.prefetch = None
             return None
         return built
 

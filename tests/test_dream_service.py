@@ -319,7 +319,9 @@ def test_theme_change_replaces_ideas(svc_factory):
 def test_walk_uses_matching_prefetch_without_new_paint(svc):
     s = started(svc)
     svc.prefetch(s.id, 10)
+    built = s.prefetch[2].result(timeout=5)
     v = svc.walk(s.id, 30)
+    assert s.pano is built[0]
     assert len(steps_of(svc.painter)) == 1
     assert v.steps == 1 and s.prefetch is None
 
@@ -550,3 +552,75 @@ def test_lru_eviction_caps_sessions(svc_factory, monkeypatch):
     with pytest.raises(UnknownSession):
         svc.get(a.id)
     assert svc.get(b.id) is b
+
+
+def watch_demand(svc, sid):
+    """An event set once session `sid` submits an on-demand job to the GPU queue."""
+    submitted, submit = threading.Event(), svc.queue.submit
+
+    def spy(fn, owner, prefetch=False):
+        fut = submit(fn, owner, prefetch=prefetch)
+        if owner == sid and not prefetch:
+            submitted.set()
+        return fut
+
+    svc.queue.submit = spy
+    return submitted
+
+
+def test_walk_on_a_queued_prefetch_builds_at_demand_priority(svc_factory):
+    order = []
+
+    class Recording(FakePainter):
+        def step(self, *a, **kw):
+            order.append("step")
+            return super().step(*a, **kw)
+
+    svc = svc_factory(painter=Recording())
+    s = started(svc)
+    release = block_worker(svc)
+    late = svc.queue.submit(lambda: order.append("late"), owner="late", prefetch=True)
+    svc.prefetch(s.id, 0)
+    pf = s.prefetch[2]
+    svc.queue.submit(lambda: order.append("other"), owner="other")
+    submitted = watch_demand(svc, s.id)
+    t = threading.Thread(target=svc.walk, args=(s.id, 0))
+    t.start()
+    ok = submitted.wait(5)
+    release.set()
+    t.join(5)
+    late.result(timeout=5)
+    assert ok, "the walk waited on a queued prefetch instead of building on demand"
+    assert pf.cancelled()
+    assert order == ["other", "step", "late"]
+    assert s.steps == 1
+
+
+def test_missed_prefetch_is_dropped_before_it_runs(svc):
+    s = started(svc)
+    release = block_worker(svc)
+    svc.prefetch(s.id, 10)
+    pf = s.prefetch[2]
+    submitted = watch_demand(svc, s.id)
+    t = threading.Thread(target=svc.walk, args=(s.id, 100))
+    t.start()
+    assert submitted.wait(5)
+    release.set()
+    t.join(5)
+    assert s.steps == 1 and pf.cancelled()
+    assert len(steps_of(svc.painter)) == 1
+
+
+def test_approach_without_nearby_label_drops_prefetch(svc):
+    s = started(svc)
+    s.labels = [Label("x", "a bench", 0.7, 0.5, 0.05, 0.2)]
+    release = block_worker(svc)
+    svc.prefetch(s.id, 40)                      # within tolerance of the label's 72°, but not kept
+    pf = s.prefetch[2]
+    submitted = watch_demand(svc, s.id)
+    t = threading.Thread(target=svc.approach, args=(s.id, "x"))
+    t.start()
+    assert submitted.wait(5)
+    release.set()
+    t.join(5)
+    assert s.steps == 1 and pf.cancelled() and len(steps_of(svc.painter)) == 1
