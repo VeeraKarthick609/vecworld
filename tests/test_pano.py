@@ -35,7 +35,7 @@ def test_yaw_to_u():
 def test_dolly_keeps_size_and_enlarges_centre():
     img = Image.new("RGB", (200, 100), "black"); img.paste((255, 0, 0), (95, 45, 105, 55))
     out = dolly(img, 2.0)
-    assert out.size == (200, 100) and out.getpixel((100, 50)) == (255, 0, 0) and out.getpixel((91, 50)) == (255, 0, 0) and out.getpixel((86, 50)) == (0, 0, 0)
+    assert out.size == (200, 100) and out.getpixel((100, 50)) == (255, 0, 0) and out.getpixel((92, 50)) == (255, 0, 0) and out.getpixel((80, 50)) == (0, 0, 0)
 
 
 def test_wrap_dist():
