@@ -32,9 +32,10 @@ _PHRASE = re.compile(r"^[^\W_]+(?:[ '\-][^\W_]+)*$")  # letters+digits: the brie
 _NON_VISUAL_STEMS = ("whisper", "laugh", "echo", "sound", "silen", "scent", "smell", "feeling",
                      "memor", "voice", "music")
 _NON_VISUAL_WORDS = {"wind", "winds", "windy"}
-# Weather and light are painted by the mood, and CLIPSeg can't box them: not discoveries.
-# Matched on the head noun (last word), so "a misty pond" and "glowing mushrooms" stay.
+# Weather and light are painted by the mood, and CLIPSeg can't box them: not discoveries. Rejected
+# as the head noun (last word) or as a word of their own, so "a misty pond" and "glowing mushrooms" stay.
 _WEATHER_STEMS = ("star", "snowflake", "moonlight", "frost", "glow", "fog", "mist")
+_WEATHER_WORDS = {w + s for w in _WEATHER_STEMS for s in ("", "s")}
 _CHATTER = re.compile(r"^(?:here are|here is|sure|certainly|okay|ok)\b")
 MAX_PHRASE_CHARS = 48
 GEN_THREADS = 8  # of 16 logical cores; leave the rest for CLIPSeg on the step path
@@ -43,7 +44,7 @@ GEN_THREADS = 8  # of 16 logical cores; leave the rest for CLIPSeg on the step p
 def is_visual(phrase: str) -> bool:
     words = phrase.split()
     return not (any(w in _NON_VISUAL_WORDS or w.startswith(_NON_VISUAL_STEMS) for w in words)
-                or words[-1].startswith(_WEATHER_STEMS))
+                or words[-1].startswith(_WEATHER_STEMS) or not _WEATHER_WORDS.isdisjoint(words))
 
 
 _EDGE = " \t\"'“”‘’`.,;:!?*_()"

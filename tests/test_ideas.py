@@ -12,9 +12,10 @@ def test_parse_ideas_drops_chatter_and_fragments():
            "1. A rusted iron gate, half open\n2. An old stone well, covered in moss, by the path\n"
            "3. a moss-covered gravestone\n4. a weathered wooden signpost pointing nowhere in particular at all\n"
            "5. twinkling stars\n6. a single snowflake\n7. pale moonlight\n8. thick fog\n9. an eerie glow\n"
-           "10. a misty pond\n11. glowing mushrooms")
+           "10. a misty pond\n11. glowing mushrooms\n12. dense fog obscuring distant peaks\n"
+           "13. spectral glow from ancient stone circle\n14. a frosted window")
     assert parse_ideas(raw, 20) == ["a rusted iron gate", "an old stone well", "a moss-covered gravestone",
-                                    "a misty pond", "glowing mushrooms"]
+                                    "a misty pond", "glowing mushrooms", "a frosted window"]
 
 
 def test_parse_ideas_splits_a_one_line_list_on_commas():
