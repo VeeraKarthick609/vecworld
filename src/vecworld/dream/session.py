@@ -40,3 +40,4 @@ class DreamSession:
     ideas_theme: str = ""                 # the theme the queued ideas were dreamt for
     refilling: str | None = None          # the theme an ideas refill is running for
     kept_run: int = 0                     # consecutive steps that kept what was ahead
+    files: list[Path] = field(default_factory=list)   # its view images still on disk, oldest first

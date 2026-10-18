@@ -339,6 +339,21 @@ def test_refill_runs_off_the_calling_thread(svc_factory):
     assert seen[0] is not threading.current_thread() and seen[0].daemon
 
 
+def test_only_one_refill_runs_at_a_time(svc_factory):
+    pending = []
+    svc = svc_factory(spawn=pending.append)
+    s = started(svc)
+    pending.pop()()
+    svc.set_theme(s.id, "frozen lake")
+    svc.set_theme(s.id, "a desert")
+    assert len(pending) == 1                    # the second waits for the first
+    pending.pop()()
+    assert svc.dreamer.calls[-1][0] == "frozen lake"
+    assert len(pending) == 1                    # which then catches up with the theme now set
+    pending.pop()()
+    assert svc.dreamer.calls[-1][0] == "a desert" and s.ideas_theme == "a desert" and not pending
+
+
 def test_theme_change_replaces_ideas(svc_factory):
     pending = []
     svc = svc_factory(spawn=pending.append)
@@ -437,6 +452,21 @@ def test_failed_prefetch_is_dropped_and_walk_builds(svc, monkeypatch):
         s.prefetch[2].result(timeout=5)
     v = svc.walk(s.id, 0)
     assert v.steps == 1 and len(steps_of(svc.painter)) == 2
+
+
+def test_failed_prefetch_is_retried(svc, monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    s = started(svc)
+    svc.painter.fail_next = True
+    svc.prefetch(s.id, 0)
+    first = s.prefetch[2]
+    with pytest.raises(GpuUnavailable):
+        first.result(timeout=5)
+    svc.prefetch(s.id, 0)                       # same direction, but the last try failed: try again
+    assert s.prefetch[2] is not first
+    assert s.prefetch[2].result(timeout=5)[2]["steps"] == 0
 
 
 def test_mood_change_discards_prefetch(svc):
@@ -553,6 +583,39 @@ def test_oom_keeps_previous_view(svc, monkeypatch):
     assert s.pano is pano and s.labels == labels and s.steps == 1 and list(s.ideas) == ideas and s.ref is ref
     assert s.busy is False
     assert svc.walk(s.id, 0).steps == 2
+
+
+def test_oom_error_holds_no_traceback(svc, monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    s = started(svc)
+    svc.painter.fail_next = True
+    with pytest.raises(GpuUnavailable) as e:
+        svc.walk(s.id, 0)
+    # A chained OutOfMemoryError would keep its frames, and their CUDA tensors, alive.
+    assert e.value.__context__ is None and e.value.__cause__ is None
+
+
+def test_views_are_jpegs_and_old_ones_are_deleted(svc):
+    s = started(svc)
+    v0 = svc.walk(s.id, 90)
+    assert v0.image_path.suffix == ".jpg" and Image.open(v0.image_path).format == "JPEG"
+    v1 = svc.walk(s.id, 90)
+    v2 = svc.walk(s.id, 90)
+    assert sorted(svc.scene_dir.iterdir()) == sorted([v1.image_path, v2.image_path])   # current and previous
+
+
+def test_evicted_session_files_are_deleted(svc_factory, monkeypatch):
+    import vecworld.dream.service as service
+
+    monkeypatch.setattr(service, "MAX_SESSIONS", 1)
+    svc = svc_factory()
+    a = started(svc)
+    va = svc.walk(a.id, 90)
+    b = started(svc)                            # evicts a
+    assert not va.image_path.exists()
+    assert len(list(svc.scene_dir.iterdir())) == 1 and b.id in svc._sessions
 
 
 def test_oom_on_start(svc, monkeypatch):

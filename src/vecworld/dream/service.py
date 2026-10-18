@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 
 REFILL_N = 8        # ideas asked for per refill
 REFILL_BELOW = 3    # refill when fewer than this remain
+KEEP_FILES = 2      # view images kept per session: the one on screen and the one it replaced
+JPEG_QUALITY = 90   # ~3 ms and ~250 KB a view, against ~300 ms and ~1.5 MB as PNG
 
 
 @dataclass(frozen=True)
@@ -82,15 +84,14 @@ class DreamService:
         with self._lock:
             # Each session holds a full panorama, so drop idle ones and cap the rest.
             gone = [k for k, v in self._sessions.items() if now - v.last_used > SESSION_TTL and not v.busy]
-            for sid in gone:
-                del self._sessions[sid]
-            while len(self._sessions) >= MAX_SESSIONS:
-                sid = min(self._sessions, key=lambda k: self._sessions[k].last_used)
-                del self._sessions[sid]
-                gone.append(sid)
+            while len(self._sessions) - len(gone) >= MAX_SESSIONS:
+                gone.append(min((k for k in self._sessions if k not in gone),
+                                key=lambda k: self._sessions[k].last_used))
+            dropped = [self._sessions.pop(sid) for sid in gone]
             self._sessions[s.id] = s
-        for sid in gone:
-            self.queue.cancel_owner(sid)
+        for old in dropped:
+            self.queue.cancel_owner(old.id)
+            self._forget_files(old, keep=0)
         return s
 
     def get(self, sid: str) -> DreamSession:
@@ -111,12 +112,14 @@ class DreamService:
             ref = palette_stats(img)
             path, view_id = self._save(img)
             with self._lock:
+                s.files.append(path)
                 self._drop_prefetch(s)
                 s.version += 1
                 s.theme, s.moods, s.pano, s.ref = theme, moods, img, ref
                 s.labels, s.steps, s.drift, s.ref_pending, s.kept_run = [], 0, None, False, 0
                 s.ideas, s.ideas_theme = deque(), theme
                 view = self._view(s, view_id, path)
+        self._forget_files(s)
         self._maybe_refill(s)
         return view
 
@@ -183,8 +186,8 @@ class DreamService:
                 return                 # the move in flight will make anything built now stale
             pf = s.prefetch
             if (pf is not None and pf[1] == s.version and _yaw_diff(pf[0], yaw) <= PREFETCH_TOLERANCE
-                    and not pf[2].cancelled()):
-                return
+                    and not pf[2].cancelled() and not (pf[2].done() and pf[2].exception() is not None)):
+                return                 # already building or built toward here (a failed one is retried)
             snap = self._snap(s)
             fut = self.queue.submit(lambda: self._build(snap, yaw), owner=s.id, prefetch=True)
             s.prefetch = (yaw, s.version, fut)
@@ -267,6 +270,7 @@ class DreamService:
         path, view_id = self._save(img)
         ref = palette_stats(img) if meta["reset_ref"] else None
         with self._lock:
+            s.files.append(path)
             self._drop_prefetch(s)     # built from the spot we just left
             s.pano, s.labels, s.steps = img, labels, s.steps + 1
             s.kept_run = s.kept_run + 1 if meta["kept"] else 0
@@ -280,6 +284,7 @@ class DreamService:
                 if ref is not None:
                     s.ref, s.ref_pending = ref, False
             view = self._view(s, view_id, path, meta["yaw"])
+        self._forget_files(s)
         self._maybe_refill(s)
         return view
 
@@ -288,7 +293,8 @@ class DreamService:
     def _maybe_refill(self, s: DreamSession) -> None:
         with self._lock:
             stale = s.ideas_theme != s.theme
-            if (len(s.ideas) >= REFILL_BELOW and not stale) or s.refilling == s.theme:
+            # One refill at a time: one for a theme just left is caught up with when it finishes.
+            if (len(s.ideas) >= REFILL_BELOW and not stale) or s.refilling is not None:
                 return
             s.refilling = theme = s.theme
             moods = list(s.moods)
@@ -302,14 +308,13 @@ class DreamService:
             if not new:
                 new = random.sample(FALLBACK_IDEAS, min(REFILL_N, len(FALLBACK_IDEAS)))
             with self._lock:
-                if s.refilling == theme:
-                    s.refilling = None
-                if s.theme != theme:
-                    return
-                if s.ideas_theme != theme:
-                    s.ideas, s.ideas_theme = deque(new), theme
-                else:
-                    s.ideas.extend(new)
+                s.refilling = None
+                if s.theme == theme:
+                    if s.ideas_theme != theme:
+                        s.ideas, s.ideas_theme = deque(new), theme
+                    else:
+                        s.ideas.extend(new)
+            self._maybe_refill(s)      # the theme changed while this ran, or the queue is low again
 
         self._spawn(refill)
 
@@ -326,11 +331,16 @@ class DreamService:
     def _paint(fn) -> Image.Image:
         import torch
 
+        oom = False
         try:
             return fn()
-        except torch.cuda.OutOfMemoryError as e:
+        except torch.cuda.OutOfMemoryError:
+            oom = True
+        # Raised outside the except block, so the error doesn't chain the OOM's traceback, whose frames
+        # hold the build's CUDA tensors, into the future that keeps it.
+        if oom:
             torch.cuda.empty_cache()
-            raise GpuUnavailable("The GPU is out of memory, try again in a moment.") from e
+            raise GpuUnavailable("The GPU is out of memory, try again in a moment.")
 
     @staticmethod
     def _base(theme: str, moods: list[str], drift: tuple[str, int] | None, discovery: str | None = None) -> Prompt:
@@ -353,9 +363,17 @@ class DreamService:
 
     def _save(self, img: Image.Image) -> tuple[Path, str]:
         view_id = secrets.token_urlsafe(8)
-        path = self.scene_dir / f"{view_id}.png"
-        img.save(path)
+        path = self.scene_dir / f"{view_id}.jpg"
+        img.save(path, quality=JPEG_QUALITY)
         return path, view_id
+
+    def _forget_files(self, s: DreamSession, keep: int = KEEP_FILES) -> None:
+        """Delete the session's view images but the newest `keep`."""
+        with self._lock:
+            old = s.files[:max(0, len(s.files) - keep)]
+            del s.files[:len(old)]
+        for p in old:
+            p.unlink(missing_ok=True)
 
     @staticmethod
     def _view(s: DreamSession, view_id: str, path: Path, walked_yaw: float = 0.0) -> View:

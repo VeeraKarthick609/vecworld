@@ -37,7 +37,7 @@ class MoodsIn(BaseModel):
 def view_out(v: View) -> dict:
     return {
         "view_id": v.view_id,
-        "image_url": f"/scenes/{v.view_id}.png",
+        "image_url": f"/scenes/{v.image_path.name}",
         "labels": [{"id": l.id, "text": l.text, "u": l.u, "y": l.y, "w": l.w, "h": l.h} for l in v.labels],
         "theme": v.theme,
         "moods": list(v.moods),

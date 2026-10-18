@@ -63,8 +63,9 @@ def started(client, theme="a quiet forest", moods=()):
 def test_full_flow(client):
     sid, v = started(client, moods=["night"])
     assert v["steps"] == 0 and v["theme"] == "a quiet forest" and v["moods"] == ["night"]
-    assert v["image_url"] == f"/scenes/{v['view_id']}.png"
-    assert client.get(v["image_url"]).status_code == 200
+    assert v["image_url"] == f"/scenes/{v['view_id']}.jpg"
+    r = client.get(v["image_url"])
+    assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
 
     w = client.post(f"/api/session/{sid}/walk", json={"yaw": 10}).json()
     assert w["steps"] == 1 and w["view_id"] != v["view_id"]
