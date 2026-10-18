@@ -2,17 +2,24 @@ import time
 
 import pytest
 
-from vecworld.scenes.prompt import scene_prompt
+from vecworld.config import STYLE
 
 
 @pytest.mark.gpu
 def test_clipseg_finds_concepts_in_generated_scene():
     import torch
+    from diffusers import AutoPipelineForText2Image
 
-    from vecworld.scenes.generator import TurboGenerator
     from vecworld.scenes.hotspots import ClipSegFinder
 
-    img = TurboGenerator().fresh(scene_prompt("ship", ["sun"], True), seed=3)
+    pipe = AutoPipelineForText2Image.from_pretrained(
+        "stabilityai/sd-turbo", torch_dtype=torch.float16, variant="fp16").to("cuda")
+    pipe.set_progress_bar_config(disable=True)
+    img = pipe(f"a ship on the waves under a warm sun, {STYLE}", num_inference_steps=1, guidance_scale=0.0,
+               generator=torch.Generator("cuda").manual_seed(3)).images[0]
+    del pipe
+    torch.cuda.empty_cache()
+
     finder = ClipSegFinder()
     concepts = ["ship", "sun", "waves", "cloud", "tiger", "piano", "castle"]
     finder.find(img, ["warm", "up"])

@@ -1,7 +1,7 @@
 [project]
 name = "vecworld"
 version = "0.1.0"
-description = "Walk through an LLM's meaning-space"
+description = "Dream Walk: wander a painted 360° dreamscape"
 readme = "README.md"
 authors = [
     { name = "Veera", email = "veerakarthick609@gmail.com" }
@@ -12,13 +12,11 @@ dependencies = [
     "diffusers>=0.41.0",
     "fastapi>=0.146.0",
     "httpx>=0.28.1",
-    "nltk>=3.10.3",
     "numpy>=2.5.4",
     "pillow>=13.0.0",
     "torch>=2.14.1",
     "transformers>=5.20.1",
     "uvicorn>=0.54.0",
-    "wordfreq>=3.1.1",
 ]
 
 [build-system]

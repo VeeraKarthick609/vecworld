@@ -1,10 +1,9 @@
 from dataclasses import dataclass
-from typing import Protocol
 
 import numpy as np
 from PIL import Image
 
-from vecworld.config import CENTRE_BOX, HOTSPOT_MIN, MAX_HOTSPOT_AREA, MAX_HOTSPOT_IOU
+from vecworld.config import HOTSPOT_MIN
 
 
 @dataclass(frozen=True)
@@ -49,37 +48,6 @@ def locate(concepts: list[str], maps: np.ndarray) -> list[Hotspot | None]:
             float((xs.max() - xs.min() + 1) / W), float((ys.max() - ys.min() + 1) / H),
         ))
     return out
-
-
-def _iou(a: Hotspot, b: Hotspot) -> float:
-    ix = max(0.0, min(a.x + a.w, b.x + b.w) - max(a.x, b.x))
-    iy = max(0.0, min(a.y + a.h, b.y + b.h) - max(a.y, b.y))
-    inter = ix * iy
-    return inter / (a.w * a.h + b.w * b.h - inter)
-
-
-def choose(centre: str, found: list[Hotspot | None], k: int) -> list[Hotspot]:
-    """The pinned centre (always), then up to k neighbours that are really, distinctly in the picture.
-
-    found[0] is the centre's located box (or None); the rest are candidate neighbours in meaning order.
-    """
-    c = found[0]
-    if c is None or c.w * c.h > MAX_HOTSPOT_AREA:
-        c = Hotspot(centre, *CENTRE_BOX)
-    out = [c]
-    for h in found[1:]:
-        if len(out) == k + 1:
-            break
-        if h is None or h.w * h.h > MAX_HOTSPOT_AREA:
-            continue
-        if any(_iou(h, o) > MAX_HOTSPOT_IOU for o in out):
-            continue
-        out.append(h)
-    return out
-
-
-class HotspotFinder(Protocol):
-    def find(self, img: Image.Image, concepts: list[str]) -> list[Hotspot | None]: ...
 
 
 class ClipSegFinder:

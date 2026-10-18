@@ -43,13 +43,13 @@ Spike code was throwaway (`/tmp/vwspike/pano3.py` on the laptop, with a viewer a
 - **A step:**
   1. Rotate the panorama so the walking direction is at the centre.
   2. Dolly in by cropping the centre 1/1.15 and resizing back.
-  3. Encode it, then run 4 denoising steps with **differential diffusion**. The region ahead (a feathered latent mask, full strength within ±0.08 of the width around centre and fading out over the next 0.06) is regenerated from pure noise. Everywhere else, the original noised latent is re-imposed until step `4 − int(4 × 0.6)`, so the background only changes like img2img at strength 0.6.
+  3. Encode it, then run 4 denoising steps with **differential diffusion**. The region ahead (a feathered latent mask, full strength within ±0.08 of the width around centre and fading out over the next 0.06) is regenerated from pure noise. Everywhere else, the original noised latent is re-imposed until step `4 − int(4 × 0.6)`, so the background only changes like img2img at strength 0.6. *(Built: the noised original is re-imposed through k ≤ k_bg, k_bg = 4 − int(4 × 0.6), so the background is exactly img2img at strength 0.6. Re-imposing only before k_bg left it ~0.75 strength, which repainted the whole panorama. With no region ahead, the step simply starts at k_bg.)*
   4. Decode.
   5. Apply a 50% Lab colour transfer toward the first panorama of the current theme.
 - **Prompt style:** "impressionist oil painting, visible brushstrokes, dreamlike, soft volumetric light". The mood is part of the base prompt (the round-3 haunted base was "a dark eerie haunted forest at night, a winding path, twisted dead trees, thick fog, cold moonlight").
 - **Measured:** panorama 2.0 s, step 4.7 s, peak 3.26 GB allocated on the RTX 3050 Ti. Turning in the viewer ran at full frame rate.
 - **Known artefacts:** occasional garbled "watermark" text, and a soft look because it's 512 px tall with 90° on screen, about 2.5× upscaled.
-- **Model:** SD-Turbo for now. A quantized SDXL-Turbo (int8, with text encoders possibly offloaded to the CPU) is being compared for sharpness and variety. Whether to switch is decided on that measurement (§9).
+- **Model: stay on SD-Turbo.** Quantized SDXL-Turbo (int8 UNet via optimum-quanto, CPU text encoders, fp32 VAE) measured: panorama 8.11 s, step 21.3–22.9 s, peak 3520 MiB with allocator OOM warnings. It fails the §9 rule (step < ~8 s, < ~3.6 GB); it looked moodier and more coherent. Revisit only with a faster SDXL route.
 
 ## 6. How it works (to keep or carry over)
 
@@ -86,5 +86,5 @@ The module layout inside the repo, exact window and batch sizes, the queue imple
 
 ## 9. Open (decided by measurement, not by the user)
 
-- **SD-Turbo or quantized SDXL-Turbo:** pick SDXL-Turbo only if it stays under about 3.6 GB peak and a step takes under about 8 s, *and* it's visibly sharper or more varied in a side-by-side walk. Otherwise stay on SD-Turbo.
+- **SD-Turbo or quantized SDXL-Turbo:** pick SDXL-Turbo only if it stays under about 3.6 GB peak and a step takes under about 8 s, *and* it's visibly sharper or more varied in a side-by-side walk. Otherwise stay on SD-Turbo. **Decided: SD-Turbo** (SDXL-Turbo int8 step 21.3–22.9 s, peak 3520 MiB; see §5).
 - **Taller panorama (768 px) or an upscale pass:** only if it fits the same memory and latency limits.
