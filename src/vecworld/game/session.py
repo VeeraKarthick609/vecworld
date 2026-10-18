@@ -26,6 +26,7 @@ class Snapshot:
     position: np.ndarray
     heading: np.ndarray | None
     recent: list[str]
+    palette: tuple | None
 
 
 @dataclass
@@ -39,6 +40,7 @@ class Session:
     recent: list[str] = field(default_factory=list)   # last few centres, oldest first
     heading: np.ndarray | None = None                 # unit tangent of the last move at `position`
     scene: Scene | None = None
+    palette: tuple | None = None                      # LAB stats of this walk's jump scene
     history: list[Snapshot] = field(default_factory=list)
     busy: bool = False
     last_used: float = 0.0

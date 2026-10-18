@@ -7,11 +7,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from vecworld.config import (HISTORY, MAX_SESSIONS, MAX_STEP_ANGLE, MAX_TEXT_CHARS, N_CANDIDATES, N_NEIGHBOURS,
+from vecworld.config import (HISTORY, MAX_SESSIONS, PALETTE_STRENGTH, MAX_STEP_ANGLE, MAX_TEXT_CHARS, N_CANDIDATES, N_NEIGHBOURS,
                              N_PROMPT_NEIGHBOURS, RECENT, SESSION_TTL, ZOOM_FRAC)
 from vecworld.game.session import Scene, Session, Snapshot
 from vecworld.scenes.generator import SceneGenerator
 from vecworld.scenes.hotspots import Hotspot, HotspotFinder, choose
+from vecworld.scenes.palette import match_palette, palette_stats
 from vecworld.scenes.prompt import scene_prompt, zoom_crop
 from vecworld.space.embedder import Embedder
 from vecworld.space.index import MeaningSpace
@@ -102,7 +103,8 @@ class GameService:
             others = [w for w, _ in rest]
             img, hotspots = self._render(
                 lambda: self.generator.fresh(self._prompt(centre_word, others), s.seed), centre_word, others)
-            return self._commit(s, position, img, hotspots, recent=[centre_word], heading=None)
+            return self._commit(s, position, img, hotspots, recent=[centre_word], heading=None,
+                                palette=palette_stats(img))
 
     def step(self, sid: str, concept: str) -> Scene:
         s = self._started(sid)
@@ -139,6 +141,7 @@ class GameService:
             image = Image.open(snap.scene.image_path).convert("RGB")
             s.history.pop()
             s.scene, s.position, s.heading, s.recent = snap.scene, snap.position, snap.heading, list(snap.recent)
+            s.palette = snap.palette
             s.image, s.hotspots, s.trail = image, list(snap.scene.hotspots), list(snap.scene.trail)
             return snap.scene
 
@@ -155,10 +158,13 @@ class GameService:
         others = [w for w, _ in self.space.neighbours(position, k=N_CANDIDATES,
                                                       exclude={centre_word, *s.recent})]
         prev = zoom_crop(s.image, cx, cy, ZOOM_FRAC)
+        # Pull the colours back toward this walk's jump scene, or img2img drifts into saturated bands.
         img, hotspots = self._render(
-            lambda: self.generator.evolve(prev, self._prompt(centre_word, others), s.seed), centre_word, others)
+            lambda: match_palette(self.generator.evolve(prev, self._prompt(centre_word, others), s.seed),
+                                  s.palette, PALETTE_STRENGTH),
+            centre_word, others)
         return self._commit(s, position, img, hotspots, recent=(s.recent + [centre_word])[-RECENT:],
-                            heading=heading if heading is not None else s.heading)
+                            heading=heading if heading is not None else s.heading, palette=s.palette)
 
     def _prompt(self, centre_word: str, others: list[str]) -> str:
         return scene_prompt(centre_word, others[:N_PROMPT_NEIGHBOURS], self.concrete(centre_word))
@@ -193,13 +199,14 @@ class GameService:
         return img, choose(centre_word, found, N_NEIGHBOURS)
 
     def _commit(self, s: Session, position: np.ndarray, img: Image.Image, hotspots: list[Hotspot],
-                recent: list[str], heading: np.ndarray | None) -> Scene:
+                recent: list[str], heading: np.ndarray | None, palette: tuple) -> Scene:
         scene_id = secrets.token_urlsafe(8)
         path = self.scene_dir / f"{scene_id}.png"
         img.save(path)
         if s.scene is not None:
-            s.history = (s.history + [Snapshot(s.scene, s.position, s.heading, list(s.recent))])[-HISTORY:]
+            s.history = (s.history + [Snapshot(s.scene, s.position, s.heading, list(s.recent), s.palette)])[-HISTORY:]
         s.position, s.image, s.hotspots, s.recent, s.heading = position, img, hotspots, recent, heading
+        s.palette = palette
         me = self.space.project(position)
         s.trail.append(me)
 

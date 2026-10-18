@@ -10,6 +10,9 @@ N_PROMPT_NEIGHBOURS = 5    # neighbours named in the scene prompt
 STEP_STRENGTH = 0.5
 STEP_STEPS = 4
 ZOOM_FRAC = 0.85
+# Each step scene is pulled this far back toward the jump scene's LAB palette. Over 7 steps, 0 bands the
+# sky yellow/blue, 0.3 still bands, 1.0 washes everything grey; 0.5 holds the palette and stays lively.
+PALETTE_STRENGTH = 0.5
 HOTSPOT_MIN = 0.3          # peaks below this were wrong objects (gorilla 0.22 on an elephant)
 MAX_HOTSPOT_AREA = 0.5     # a box covering more of the frame is the whole scene, not an object
 MAX_HOTSPOT_IOU = 0.6      # a box this similar to one already offered would hide it

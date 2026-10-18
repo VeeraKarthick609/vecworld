@@ -308,3 +308,23 @@ def test_after_back_the_next_step_grows_from_the_restored_scene(svc):
     svc.back(s.id)
     svc.step(s.id, "sea")
     assert svc.generator.sources[-1] == (0, 0, 128)
+
+
+def test_step_scenes_are_pulled_back_toward_the_jump_palette(svc):
+    from PIL import Image
+
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")                      # navy (0, 0, 128)
+    sc = svc.step(s.id, "ship")                  # the generator paints teal (0, 128, 128)
+    r, g, b = Image.open(sc.image_path).convert("RGB").getpixel((0, 0))
+    assert g < 110                               # moved toward navy, not left teal
+    assert svc.get(s.id).image.getpixel((0, 0)) == (r, g, b)
+
+
+def test_back_across_a_jump_restores_that_walks_palette(svc):
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    ocean_palette = svc.get(s.id).palette
+    svc.jump(s.id, "desert")
+    svc.back(s.id)
+    assert np.allclose(svc.get(s.id).palette[0], ocean_palette[0])
