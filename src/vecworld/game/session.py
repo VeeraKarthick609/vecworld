@@ -15,6 +15,7 @@ class Session:
     image: Image.Image | None = None
     hotspots: list[Hotspot] = field(default_factory=list)
     trail: list[tuple[float, float]] = field(default_factory=list)
+    recent: list[str] = field(default_factory=list)   # last few centres, oldest first
     busy: bool = False
     last_used: float = 0.0
 

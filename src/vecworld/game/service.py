@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 from vecworld.config import (MAX_SESSIONS, MAX_STEP_ANGLE, MAX_TEXT_CHARS, N_CANDIDATES, N_NEIGHBOURS,
-                             N_PROMPT_NEIGHBOURS, SESSION_TTL, ZOOM_FRAC)
+                             N_PROMPT_NEIGHBOURS, RECENT, SESSION_TTL, ZOOM_FRAC)
 from vecworld.game.session import Scene, Session
 from vecworld.scenes.generator import SceneGenerator
 from vecworld.scenes.hotspots import Hotspot, HotspotFinder, choose
@@ -99,7 +99,7 @@ class GameService:
             img, hotspots = self._render(
                 lambda: self.generator.fresh(self._prompt(centre_word, others), s.seed),
                 centre_word, others)
-            return self._commit(s, position, img, hotspots)
+            return self._commit(s, position, img, hotspots, recent=[centre_word])
 
     def step(self, sid: str, concept: str) -> Scene:
         s = self.get(sid)
@@ -111,12 +111,14 @@ class GameService:
         with self._claim(s):
             position = self.space.step_toward(s.position, self.space.vector(concept), MAX_STEP_ANGLE)
             # The clicked concept stays pinned at the centre even if the cap stopped us short of it.
-            others = [w for w, _ in self.space.neighbours(position, k=N_CANDIDATES, exclude={concept})]
+            # Recently visited centres stay out of the neighbours, so a walk can't ping-pong in a cluster.
+            others = [w for w, _ in self.space.neighbours(position, k=N_CANDIDATES,
+                                                          exclude={concept, *s.recent})]
             prev = zoom_crop(s.image, clicked.x + clicked.w / 2, clicked.y + clicked.h / 2, ZOOM_FRAC)
             img, hotspots = self._render(
                 lambda: self.generator.evolve(prev, self._prompt(concept, others), s.seed),
                 concept, others)
-            return self._commit(s, position, img, hotspots)
+            return self._commit(s, position, img, hotspots, recent=(s.recent + [concept])[-RECENT:])
 
     def _prompt(self, centre_word: str, others: list[str]) -> str:
         return scene_prompt(centre_word, others[:N_PROMPT_NEIGHBOURS], self.concrete(centre_word))
@@ -150,11 +152,12 @@ class GameService:
         found = self.finder.find(img, [centre_word] + candidates)
         return img, choose(centre_word, found, N_NEIGHBOURS)
 
-    def _commit(self, s: Session, position: np.ndarray, img: Image.Image, hotspots: list[Hotspot]) -> Scene:
+    def _commit(self, s: Session, position: np.ndarray, img: Image.Image, hotspots: list[Hotspot],
+                recent: list[str]) -> Scene:
         scene_id = secrets.token_urlsafe(8)
         path = self.scene_dir / f"{scene_id}.png"
         img.save(path)
-        s.position, s.image, s.hotspots = position, img, hotspots
+        s.position, s.image, s.hotspots, s.recent = position, img, hotspots, recent
         me = self.space.project(position)
         s.trail.append(me)
 

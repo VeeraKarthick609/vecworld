@@ -162,3 +162,36 @@ def test_session_cap_evicts_least_recently_used(svc_factory):
     with pytest.raises(UnknownSession):
         svc.get(others[0].id)
     assert len(svc._sessions) == MAX_SESSIONS
+
+
+def offered(sc):
+    return [h.concept for h in sc.hotspots]
+
+
+def test_previous_centres_are_not_offered_again(svc):
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    sc = svc.step(s.id, "sea")
+    assert "ocean" not in offered(sc)          # build 1 ping-ponged ocean <-> sea here
+    sc = svc.step(s.id, "ship")
+    assert not {"ocean", "sea"} & set(offered(sc)[1:])
+    assert svc.get(s.id).recent == ["ocean", "sea", "ship"]
+
+
+def test_recent_is_bounded(svc):
+    from vecworld.config import RECENT
+
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    for _ in range(RECENT + 3):
+        nxt = (svc.get(s.id).hotspots[1:] or svc.get(s.id).hotspots)[0].concept
+        svc.step(s.id, nxt)
+    assert len(svc.get(s.id).recent) == RECENT
+
+
+def test_jump_resets_recent(svc):
+    s = svc.new_session()
+    svc.jump(s.id, "ocean")
+    svc.step(s.id, "sea")
+    sc = svc.jump(s.id, "sea")
+    assert svc.get(s.id).recent == ["sea"] and "ocean" in offered(sc)

@@ -15,6 +15,7 @@ MAX_HOTSPOT_AREA = 0.5     # a box covering more of the frame is the whole scene
 MAX_HOTSPOT_IOU = 0.6      # a box this similar to one already offered would hide it
 CENTRE_BOX = (0.35, 0.35, 0.3, 0.3)  # the pinned centre's box when CLIPSeg can't place it
 MAX_TEXT_CHARS = 200
+RECENT = 4                 # the last few centres are left out of the neighbours, so walks don't loop
 SESSION_TTL = 3600     # seconds idle before a session (and its scene image) is dropped
 MAX_SESSIONS = 50
 STYLE = "dreamlike painterly scene, soft volumetric light, oil painting, cohesive palette"
