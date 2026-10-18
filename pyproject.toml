@@ -1,0 +1,27 @@
+[project]
+name = "vecworld"
+version = "0.1.0"
+description = "Walk through an LLM's meaning-space"
+readme = "README.md"
+authors = [
+    { name = "Veera", email = "veerakarthick609@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.4",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+markers = ["gpu: needs real models/GPU"]
+addopts = "-m 'not gpu'"
+testpaths = ["tests"]
+pythonpath = ["tests"]
