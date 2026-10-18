@@ -10,3 +10,8 @@ def test_parse_ideas_cleans_and_bounds():
 def test_fallbacks_are_valid_phrases():
     assert len(FALLBACK_IDEAS) == 12
     assert parse_ideas("\n".join(FALLBACK_IDEAS), 12) == list(FALLBACK_IDEAS)
+
+
+def test_non_visual_phrases_are_rejected():
+    raw = "whispering wind through leaves\nhollow laughter echoing among trees\na faint distant music\nthe smell of rain\na winding stone path\na mossy stone well"
+    assert parse_ideas(raw) == ["a winding stone path", "a mossy stone well"]
