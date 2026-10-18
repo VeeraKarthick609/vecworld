@@ -6,6 +6,7 @@ const layers = [$("scene-a"), $("scene-b")];
 let front = 0;            // index of the visible scene layer
 let sid = null;
 let busy = false;
+let lastHotspots = [];    // restored if a move fails
 
 async function api(path, body) {
   const r = await fetch(path, {
@@ -68,7 +69,10 @@ async function show(scene) {
 }
 
 function renderHotspots(hotspots) {
-  hotspotsEl.replaceChildren(...hotspots.map((h) => {
+  lastHotspots = hotspots;
+  // Largest first, so a diffuse concept's big box never sits on top of a small one.
+  const byArea = [...hotspots].sort((a, b) => b.w * b.h - a.w * a.h);
+  hotspotsEl.replaceChildren(...byArea.map((h) => {
     const el = document.createElement("div");
     el.className = "hotspot";
     el.tabIndex = 0;
@@ -138,7 +142,10 @@ async function withSession(fn) {
     }
   } catch (e) {
     if (e.code !== "busy") toast(e.message);
+    // The server kept the previous scene, so put it back on screen, clickable.
     layers[front].style.transform = "";
+    if (layers[front].src) layers[front].classList.add("shown");
+    renderHotspots(lastHotspots);
   } finally {
     setBusy(false);
   }
@@ -149,7 +156,6 @@ $("jump").addEventListener("submit", (e) => {
   const text = input.value.trim();
   if (!text) return;
   withSession(async () => {
-    layers[front].classList.remove("shown");
     await show(await api(`/api/session/${sid}/jump`, { text }));
     input.value = "";
   });

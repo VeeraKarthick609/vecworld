@@ -80,3 +80,48 @@ def test_oom_keeps_previous_scene(svc):
         svc.jump(s.id, "desert")
     assert np.allclose(svc.get(s.id).position, before[0]) and svc.get(s.id).trail == before[1]
     assert svc.get(s.id).busy is False
+
+
+class Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_idle_sessions_expire(svc_factory):
+    from vecworld.config import SESSION_TTL
+    from vecworld.game.service import UnknownSession
+
+    clock = Clock()
+    svc = svc_factory(clock=clock)
+    idle, active = svc.new_session(), svc.new_session()
+    clock.t = SESSION_TTL - 10
+    svc.jump(active.id, "ocean")
+    clock.t = SESSION_TTL + 1
+    svc.new_session()
+    with pytest.raises(UnknownSession):
+        svc.get(idle.id)
+    assert svc.get(active.id).position is not None
+
+
+def test_session_cap_evicts_least_recently_used(svc_factory):
+    from vecworld.config import MAX_SESSIONS
+    from vecworld.game.service import UnknownSession
+
+    clock = Clock()
+    svc = svc_factory(clock=clock)
+    first = svc.new_session()
+    others = []
+    for i in range(MAX_SESSIONS - 1):
+        clock.t += 1
+        others.append(svc.new_session())
+    clock.t += 1
+    svc.jump(first.id, "ocean")          # first is now the most recently used
+    clock.t += 1
+    svc.new_session()
+    svc.get(first.id)
+    with pytest.raises(UnknownSession):
+        svc.get(others[0].id)
+    assert len(svc._sessions) == MAX_SESSIONS

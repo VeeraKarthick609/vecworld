@@ -16,6 +16,7 @@ class Session:
     hotspots: list[Hotspot] = field(default_factory=list)
     trail: list[tuple[float, float]] = field(default_factory=list)
     busy: bool = False
+    last_used: float = 0.0
 
 
 @dataclass

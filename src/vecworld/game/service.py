@@ -1,12 +1,13 @@
 import math
 import secrets
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from vecworld.config import MAX_STEP_ANGLE, MAX_TEXT_CHARS, N_NEIGHBOURS, ZOOM_FRAC
+from vecworld.config import MAX_SESSIONS, MAX_STEP_ANGLE, MAX_TEXT_CHARS, N_NEIGHBOURS, SESSION_TTL, ZOOM_FRAC
 from vecworld.game.session import Scene, Session
 from vecworld.scenes.generator import SceneGenerator
 from vecworld.scenes.hotspots import Hotspot, HotspotFinder
@@ -52,21 +53,29 @@ class UnknownSession(GameError, KeyError):
 
 class GameService:
     def __init__(self, space: MeaningSpace, vocab_mean: np.ndarray, embedder: Embedder,
-                 generator: SceneGenerator, finder: HotspotFinder, scene_dir: Path):
+                 generator: SceneGenerator, finder: HotspotFinder, scene_dir: Path, clock=time.monotonic):
         self.space = space
         self.vocab_mean = vocab_mean
         self.embedder = embedder
         self.generator = generator
         self.finder = finder
         self.scene_dir = Path(scene_dir)
+        self.clock = clock
         self.scene_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()   # guards busy flags
         self._gpu = threading.Lock()    # one generation at a time on the shared GPU
 
     def new_session(self) -> Session:
-        s = Session(id=secrets.token_urlsafe(8), seed=secrets.randbelow(2**31))
-        self._sessions[s.id] = s
+        now = self.clock()
+        s = Session(id=secrets.token_urlsafe(8), seed=secrets.randbelow(2**31), last_used=now)
+        with self._lock:
+            # Each session holds a full scene image, so drop idle ones and cap the rest.
+            for sid in [k for k, v in self._sessions.items() if now - v.last_used > SESSION_TTL and not v.busy]:
+                del self._sessions[sid]
+            while len(self._sessions) >= MAX_SESSIONS:
+                del self._sessions[min(self._sessions, key=lambda k: self._sessions[k].last_used)]
+            self._sessions[s.id] = s
         return s
 
     def get(self, sid: str) -> Session:
@@ -113,6 +122,7 @@ class GameService:
                     if s.busy:
                         raise Busy("Still loading the last move.")
                     s.busy = True
+                    s.last_used = service.clock()
 
             def __exit__(self, *exc):
                 s.busy = False

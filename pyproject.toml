@@ -28,10 +28,11 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "selenium>=4.51.0",
 ]
 
 [tool.pytest.ini_options]
-markers = ["gpu: needs real models/GPU"]
-addopts = "-m 'not gpu'"
+markers = ["gpu: needs real models/GPU", "ui: drives headless Firefox"]
+addopts = "-m 'not gpu and not ui'"
 testpaths = ["tests"]
 pythonpath = ["tests"]

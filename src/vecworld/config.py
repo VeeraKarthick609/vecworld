@@ -10,6 +10,8 @@ STEP_STEPS = 4
 ZOOM_FRAC = 0.85
 HOTSPOT_MIN = 0.2
 MAX_TEXT_CHARS = 200
+SESSION_TTL = 3600     # seconds idle before a session (and its scene image) is dropped
+MAX_SESSIONS = 50
 STYLE = "dreamlike painterly landscape, soft volumetric light, oil painting, cohesive palette"
 
 DATA_DIR = Path("data")

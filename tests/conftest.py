@@ -76,9 +76,9 @@ class FakeFinder:
 def svc_factory(tmp_path):
     from vecworld.game.service import GameService
 
-    def make(generator=None):
+    def make(generator=None, **kw):
         return GameService(make_space(), np.zeros(3, np.float32), FakeEmbedder(),
-                           generator or FakeGenerator(), FakeFinder(), tmp_path / "scenes")
+                           generator or FakeGenerator(), FakeFinder(), tmp_path / "scenes", **kw)
     return make
 
 
