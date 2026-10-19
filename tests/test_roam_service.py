@@ -889,3 +889,70 @@ def test_commit_after_eviction_mid_move_deletes_its_files(make, monkeypatch):
     t.join(5)
     assert len(errors) == 1 and isinstance(errors[0], UnknownSession)
     assert list(svc.scene_dir.iterdir()) == []
+
+
+# --- fix round 2: recheck after waiting, typed places stay ------------------------------------
+
+class GatedTagPainter(GatedPainter):
+    """Gated like GatedPainter; step n paints a solid (n * 20, 0, 0) like TagPainter."""
+
+    def step(self, prev, base, focus, focus_at, seed, bg_strength=None):
+        super().step(prev, base, focus, focus_at, seed, bg_strength=bg_strength)
+        return Image.new("RGB", prev.size, (len(steps_of(self)) * 20 % 256, 0, 0))
+
+
+def test_mood_change_while_waiting_on_a_running_predream_rebuilds(make):
+    svc = make(painter=GatedTagPainter())
+    s = svc.new_session()
+    svc.painter.armed = True
+    svc.start(s.id, "forest", [])
+    assert svc.painter.entered.wait(5)            # 0 running (old mood)
+    old = {key_heading(k): f for k, f in set_futures(s).items()}
+    thread_of, out = [None], []
+    set_called, demand = spy_queue(svc, thread_of)
+    t = threading.Thread(target=lambda: out.append(svc.next(s.id, 20)))
+    thread_of[0] = t
+    t.start()
+    assert set_called.wait(5)                     # waiting on the running 0 job
+    svc.set_moods(s.id, ["night"])
+    svc.painter.armed = False
+    svc.painter.gate.set()
+    t.join(5)
+    assert out[0].spot_id != spot_of(old[0]).id   # the old-mood spot is never shown
+    assert demand.is_set() and out[0].heading == pytest.approx(20)
+    call = steps_of(svc.painter)[s.spot.image.getpixel((0, 0))[0] // 20 - 1]
+    assert NIGHT in call["base"][0][0] and call["bg_strength"] == MOOD_BG_STRENGTH
+
+
+def test_typed_place_in_the_fallback_table_is_not_renamed(make):
+    jobs = []
+    svc = make(spawn=jobs.append, queue=ManualQueue())
+    s = started(svc, "forest")
+    assert "lake" in fallback_neighbours("forest")
+    svc.heading(s.id, 10)
+    svc.set_theme(s.id, "lake")                   # typed before the LLM answers, and it doesn't name a lake
+    jobs.pop()()
+    names = {n.name: n.bearing for n in s.journey.neighbours}
+    assert names.get("lake") == pytest.approx(10)
+    svc.next(s.id, 10)                            # the commit re-applies the LLM names
+    names = {n.name: n.bearing for n in s.journey.neighbours}
+    assert names.get("lake") == pytest.approx(10)
+
+
+def test_llm_place_displaced_by_a_typed_place_does_not_come_back(make):
+    class Two(FakeDreamer):
+        def places(self, place, journey, moods, n):
+            return super().places(place, journey, moods, n)[:2]   # fewer than the slots: fallbacks remain
+
+    jobs = []
+    svc = make(dreamer=Two(), spawn=jobs.append, queue=ManualQueue())
+    s = started(svc, "forest")
+    jobs.pop()()
+    first = next(n for n in s.journey.neighbours if n.name == FakeDreamer.PLACES[0])
+    assert any(n.name in fallback_neighbours("forest") for n in s.journey.neighbours)
+    svc.heading(s.id, first.bearing)
+    svc.set_theme(s.id, "volcano")                # displaces the LLM's first place
+    assert FakeDreamer.PLACES[0] not in [n.name for n in s.journey.neighbours]
+    svc.next(s.id, first.bearing)
+    assert FakeDreamer.PLACES[0] not in [n.name for n in s.journey.neighbours]
+    assert "volcano" in [n.name for n in s.journey.neighbours]

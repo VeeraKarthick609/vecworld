@@ -111,11 +111,14 @@ def _with_place(j: Journey, place: str, bearing: float) -> Journey:
     return _rebuilt(j, sorted(keep + [new], key=lambda n: n.bearing), {})
 
 
-def _renamed(j: Journey, place: str, found: list[tuple[str, tuple[str, ...]]]) -> Journey:
-    """The LLM's places take over the fallback neighbours' slots (bearings and drift kept). The came-from place,
-    typed places and names already present stay. Idempotent, so it can be re-applied to any journey of `place`."""
+Names = dict[str, tuple[str, tuple[str, ...]]]   # fallback slot name -> (LLM place, scenery)
+
+
+def _name_map(j: Journey, place: str, found: list[tuple[str, tuple[str, ...]]], typed: set[str]) -> Names:
+    """Which fallback-named slot of j each new LLM place takes, decided once, when the answer lands. The came-from
+    place, typed places, and slots the LLM itself named stay as they are."""
     if j.place != place:
-        return j
+        return {}
     fallback = {n.lower() for n in fallback_neighbours(place)}
     answered = {name.lower() for name, _ in found if name}
     present = {n.name.lower() for n in j.neighbours} | {place.lower(), (j.came_from or "").lower()}
@@ -125,10 +128,27 @@ def _renamed(j: Journey, place: str, found: list[tuple[str, tuple[str, ...]]]) -
             present.add(name.lower())
             fresh.append((name, tuple(scenery[:3]) + GENERIC_SCENERY[len(scenery[:3]):3]))
     it = iter(fresh)
+    out: Names = {}
+    for n in j.neighbours:
+        low = n.name.lower()
+        if (n.name != j.came_from and low in fallback and low not in answered and low not in typed
+                and (nxt := next(it, None)) is not None):
+            out[n.name] = nxt
+    return out
+
+
+def _renamed(j: Journey, place: str, names: Names, typed: set[str]) -> Journey:
+    """Rename the slots of j still carrying a mapped fallback name (bearings and drift kept). Idempotent, and
+    never brings back an LLM place a typed place displaced: that slot's fallback name is gone too."""
+    if j.place != place or not names:
+        return j
+    present = {n.name.lower() for n in j.neighbours}
     out, carry = [], {}
     for n in j.neighbours:
-        if (n.name != j.came_from and n.name.lower() in fallback and n.name.lower() not in answered
-                and (nxt := next(it, None)) is not None):
+        nxt = names.get(n.name)
+        if (nxt is not None and n.name != j.came_from and n.name.lower() not in typed
+                and nxt[0].lower() not in present):
+            present.add(nxt[0].lower())
             out.append(Neighbour(nxt[0], n.bearing, nxt[1]))
             carry[nxt[0]] = n.name
         else:
@@ -194,7 +214,7 @@ class RoamService:
                 s.prefetch, s.pending = {}, []
                 s.spot, s.spot_stats, s.ref, s.ref_pending = spot, stats, stats, False
                 s.journey, s.moods, s.steps, s.visited = journey, moods, 0, [place]
-                s.places_for, s.names, s.hint = None, None, 0.0
+                s.places_for, s.names, s.typed, s.hint = None, None, set(), 0.0
                 s.files.append(paths)
                 self._submit_set(s)
                 view = self._view(s, paths, None)
@@ -217,6 +237,12 @@ class RoamService:
             if running is not None:
                 # On the single worker a demand build would only start after this job anyway.
                 built = self._wait(s, running)
+                with self._lock:
+                    if self._sessions.get(s.id) is not s:
+                        raise UnknownSession(s.id)
+                    # A mood or theme change during the wait can't stop a running job: rebuild instead.
+                    if built is not None and (built.version != s.version or built.parent_id != s.spot.id):
+                        built = None
             if built is None:
                 with self._lock:
                     self.queue.submit_set([], s.id)   # the queued set would only delay the exact heading
@@ -244,6 +270,7 @@ class RoamService:
             if not s.busy and place.lower() == s.journey.place.lower():
                 return
             bearing = s.hint
+            s.typed.add(place.lower())
             self._edit(s, lambda j: _with_place(j, place, bearing))
 
     def set_moods(self, sid: str, moods: list[str]) -> None:
@@ -399,7 +426,7 @@ class RoamService:
             assert built.parent_id == s.spot.id, "a build from another spot reached commit"
             j = built.journey
             if s.names is not None:       # the LLM's places, if they landed after this build's snapshot
-                j = _renamed(j, *s.names)
+                j = _renamed(j, *s.names, s.typed)
             for fn in s.pending:          # theme or neighbour changes made during this move
                 j = fn(j)
             s.pending = []
@@ -450,8 +477,9 @@ class RoamService:
         """Apply the LLM's places without discarding the pre-dreamed set: every move re-applies them to the
         journey it built (see _commit). Only a player mid-drift toward a renamed neighbour, heading its way, has
         pre-dreams whose prompts name the wrong place, so only then is the set invalidated. Caller holds the lock."""
-        s.names = (place, found)
-        old, new = s.journey, _renamed(s.journey, place, found)
+        names = _name_map(s.journey, place, found, s.typed)
+        s.names = (place, names)
+        old, new = s.journey, _renamed(s.journey, place, names, s.typed)
         if new is old:
             return
         s.journey = new
