@@ -15,11 +15,16 @@ export const NEAR = 4, FAR = 50, VSPAN = Math.PI / 2;
 export const GX = 512, GY = 128;               // the depth mesh grid (spec: 512×128)
 export const LIMIT = 0.55 * NEAR;              // walkable radius around the current spot's origin (spike)
 export const FADE_MS = 600;                    // crossfade length at a switch
+export const EDGE_AT = 0.98;                   // at |p| ≥ EDGE_AT·LIMIT the player is at the edge of the current spot
 const HYSTERESIS = 0.08;                       // a spot must be this much nearer than the current one to switch to
+const AHEAD = 45;                              // degrees: a spot is "ahead" when its bearing is this close to travel
 const SCALE_EASE = 0.6;                        // per second: how fast the view scale returns to 1 after a re-root
 const RAD = Math.PI / 180;
 
 export function bearingVec(deg) { return { x: Math.sin(deg * RAD), z: -Math.cos(deg * RAD) }; }
+
+const angleBetween = (ax, az, bx, bz) =>
+  Math.acos(Math.max(-1, Math.min(1, (ax * bx + az * bz) / (Math.hypot(ax, az) * Math.hypot(bx, bz) || 1)))) / RAD;
 
 // The placement of a child spot in the parent's (current) frame: origin = the parent origin + distance along
 // exitHeading (distance and scale being parent-relative, they are multiplied by the parent's scale in this frame).
@@ -121,13 +126,23 @@ export class World {
     this.root = new THREE.Group(); scene.add(this.root);
     this.worker = new Worker(workerUrl);
     this.jobs = new Map(); this.nextJob = 0; this.workerBuilt = 0;
+    this.onError = err => console.error(err);   // worker failures no pending build can carry (the page wires it up)
     this.worker.onmessage = e => {
-      const job = this.jobs.get(e.data.id); this.jobs.delete(e.data.id);
+      const job = this.jobs.get(e.data?.id);
+      if (!job) { this.onError(new Error(`spot mesh worker replied for unknown job ${JSON.stringify(e.data?.id)}`)); return; }
+      this.jobs.delete(e.data.id);
       if (e.data.error) job.reject(new Error(e.data.error)); else { this.workerBuilt++; job.resolve(e.data); }
     };
-    this.worker.onerror = e => { for (const j of this.jobs.values()) j.reject(new Error(e.message)); this.jobs.clear(); };
+    const fail = msg => {
+      const err = new Error(msg);
+      if (this.jobs.size) { for (const j of this.jobs.values()) j.reject(err); this.jobs.clear(); } else this.onError(err);
+    };
+    this.worker.onerror = e => { e.preventDefault?.(); fail(`spot mesh worker: ${e.message || "failed to load"}`); };
+    this.worker.onmessageerror = () => fail("spot mesh worker: a reply could not be deserialised");
     this.spots = [];
     this.current = null;
+    this.edge = null;               // {bearing} while the player is at the edge with no spot ahead (fog goes here)
+    this._r = 0;                    // the player's distance from the current origin last frame
     this.fade = null;               // {from, to, elapsed, ms} (milliseconds)
     this.k = 1;                     // view scale (see the header)
     this.abs = { x: 0, z: 0, s: 1 };  // the current frame inside the first spot's frame (debug: absolute positions)
@@ -180,7 +195,9 @@ export class World {
   // Place `child` (optional) relative to the parent world entry; returns the placement (and the entry if added).
   placeChild(parent, exitHeading, distance, scale, child) {
     const p = childPlacement(parent, exitHeading, distance, scale);
-    return child ? this.addSpot(child, p.origin, p.heading, p.scale) : p;
+    if (!child) return p;
+    child.parent = parent;
+    return this.addSpot(child, p.origin, p.heading, p.scale);
   }
 
   _pose(e) {
@@ -189,17 +206,50 @@ export class World {
     e.group.scale.setScalar(e.scale);
   }
 
-  // Choose the spot for the player's position (frame units, a THREE.Vector2 of x, z; adjusted in place on a re-root):
-  // the nearest origin, with hysteresis. Crossing into another spot starts a crossfade and re-roots on it.
-  update(p) {
+  // The walkable clamp alone (idempotent; update() applies it first). Returns the player's distance from the origin.
+  constrain(p) {
+    const r = p.length();
+    if (r > LIMIT && r > this._r) p.multiplyScalar(Math.max(LIMIT, this._r) / r);
+    return p.length();
+  }
+
+  // Keep the player in the world and choose its spot. p: position (frame units, THREE.Vector2 of x, z), adjusted in
+  // place by the walkable clamp and on a re-root. dir: the unit direction of travel (x, z), or null when standing.
+  //  - Clamp: the player can't move outward past LIMIT (or past where it already is, just after a switch at the edge
+  //    into a spot whose origin is further than LIMIT away; walking inward is always allowed).
+  //  - Switch (crossfade + re-root) to another spot when moving toward it and either inside its walkable radius and
+  //    nearer to it than to the current origin (the bisector), or at the edge with it ahead: its bearing within AHEAD°
+  //    of travel, on the player's side. (Inside its radius: after an edge switch between far-apart spots the player is
+  //    nearer the old origin than the new one, and must not be switched straight back.)
+  //  - At the edge with no spot ahead, world.edge = {bearing} (where the game shows dream fog and waits).
+  // Returns the spot switched to, or null.
+  update(p, dir = null) {
     if (!this.current) return null;
+    const r = this.constrain(p);
+    const moving = dir && (dir.x || dir.y);
     const dist = e => Math.hypot(p.x - e.origin.x, p.y - e.origin.z);
-    let best = this.current, bd = dist(this.current) - HYSTERESIS;
-    for (const e of this.spots) if (e !== this.current && dist(e) < bd) { best = e; bd = dist(e); }
-    if (best === this.current) return null;
+    const toward = e => moving && dir.x * (e.origin.x - p.x) + dir.y * (e.origin.z - p.y) > 0;
+    let best = null, bd = dist(this.current) - HYSTERESIS;
+    for (const e of this.spots) {
+      if (e !== this.current && toward(e) && dist(e) <= LIMIT && dist(e) < bd) { best = e; bd = dist(e); }
+    }
+    const atEdge = r >= EDGE_AT * LIMIT;
+    if (!best && atEdge && moving) {
+      let ba = AHEAD;
+      for (const e of this.spots) {
+        if (e === this.current || e.origin.x * p.x + e.origin.z * p.y <= 0) continue;
+        const a = angleBetween(dir.x, dir.y, e.origin.x, e.origin.z);
+        if (a <= ba) { best = e; ba = a; }
+      }
+    }
+    const outward = moving && dir.x * p.x + dir.y * p.y > 0;
+    this.edge = !best && atEdge && outward ? { bearing: (Math.atan2(p.x, -p.y) / RAD + 360) % 360 } : null;
+    if (!best) { this._r = r; return null; }
     const from = this.current;
     this._reroot(best, p);
     this.crossfade(best, FADE_MS, from);
+    this._r = p.length();
+    this.prune();
     return best;
   }
 
@@ -210,7 +260,7 @@ export class World {
       e.origin = { x: (e.origin.x - o.x) / s, z: (e.origin.z - o.z) / s }; e.scale /= s; this._pose(e);
     }
     if (p) p.set((p.x - o.x) / s, (p.y - o.z) / s);
-    this.k *= s;
+    this.k *= s; this.root.scale.setScalar(this.k);   // nothing on screen moves at the re-root
     this.current = c;
   }
 
@@ -218,7 +268,8 @@ export class World {
   jumpTo(e, p) {
     this._reroot(e, p);
     if (p) p.set(0, 0);
-    this.fade = null;
+    this.fade = null; this._r = 0; this.edge = null;
+    this.prune();
   }
 
   // Fade the view from one spot to another (render() draws both during it); `to` becomes current at once.
@@ -238,11 +289,12 @@ export class World {
     if (this.fade && this.fading >= 1) this.fade = null;
   }
 
-  // Remove spots whose origin is further than maxDist (frame units) from the current one.
-  prune(maxDist) {
+  // Free every spot but the current one, the one being faded from (normally its parent, so walking back still
+  // works until the next switch) and the current one's placed children. Runs on every re-root.
+  prune() {
     for (const e of [...this.spots]) {
-      if (e === this.current || (this.fade && e === this.fade.from)) continue;
-      if (Math.hypot(e.origin.x, e.origin.z) > maxDist) this.remove(e);
+      if (e === this.current || (this.fade && e === this.fade.from) || e.parent === this.current) continue;
+      this.remove(e);
     }
   }
 
@@ -250,6 +302,7 @@ export class World {
     this.root.remove(e.group);
     e.group.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.map?.dispose(); o.material.dispose(); } });
     this.spots = this.spots.filter(s => s !== e);
+    if (this.override === e) this.override = null;
   }
 
   render(renderer, scene, camera) {

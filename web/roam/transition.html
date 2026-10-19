@@ -16,14 +16,16 @@
 </head><body>
 <div id="hud">loading…</div>
 <script type="module">
-// Dev page: the three fixture spots chained by their meta ({heading, scale, distance}, parent-relative), walked
-// across automatically (?auto=0 for manual WASD; ?haze=0.4 dissolves through haze). ?clear=rrggbb sets the clear colour (tests look for it as void).
+// Dev page: a chain of spots from the fixtures (meta {heading, scale, distance}, parent-relative), walked across
+// automatically. Each spot's child is built and placed when the player enters it, as the game will.
+// Query: ?auto=0 manual WASD · ?chain=N spots (past 3 the fixtures repeat 1, 2, 1, 2…) · ?distance=d / ?scale=s
+// override every child's meta · ?haze=x dissolves through haze · ?clear=rrggbb clear colour (tests look for it).
 import * as THREE from "three";
 import { World, LIMIT, bearingVec } from "./world.js";
-import { Hero, Keys, OrbitCam, bearingOf } from "./hero.js";
+import { Hero, Keys, OrbitCam } from "./hero.js";
 
 const q = new URLSearchParams(location.search);
-const AUTO = q.get("auto") !== "0", N = Number(q.get("spots") || 3), FIX = q.get("fixtures") || "fixtures";
+const AUTO = q.get("auto") !== "0", CHAIN = Number(q.get("chain") || 3), FIX = q.get("fixtures") || "fixtures";
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(2, devicePixelRatio)); renderer.setSize(innerWidth, innerHeight);
 document.body.prepend(renderer.domElement);
@@ -37,60 +39,101 @@ const sun = new THREE.DirectionalLight(0xffffff, 1.4); sun.position.set(-3, 8, 4
 
 const img = src => new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => bad(new Error("load " + src)); i.src = src; });
 const world = new World(scene);
-world.hazeAmt = Number(q.get("haze") || 0);       // the dream-haze dissolve fallback (0 = plain crossfade)
-const [hero, spots] = await Promise.all([
+world.onError = err => roamErrors.push(String(err.message || err));
+world.hazeAmt = Number(q.get("haze") || 0);
+const [hero, files] = await Promise.all([
   Hero.load(scene),
-  Promise.all([...Array(N).keys()].map(async i => {
+  Promise.all([0, 1, 2].map(async i => {
     const [pano, depth, meta] = await Promise.all([img(`${FIX}/spot_${i}.jpg`), img(`${FIX}/depth_${i}.png`),
       fetch(`${FIX}/meta_${i}.json`).then(r => r.json())]);
-    return world.buildSpot(pano, depth, { ...meta, index: i });
+    return { pano, depth, meta };
   })),
 ]);
-// Chain: spot 0 at the origin facing its heading; each next one placed from its parent by its own meta.
-world.addSpot(spots[0], { x: 0, z: 0 }, spots[0].meta.heading, 1);
-for (let i = 1; i < N; i++) world.placeChild(spots[i - 1], spots[i].meta.heading, spots[i].meta.distance, spots[i].meta.scale, spots[i]);
+const fileOf = i => i < 3 ? i : 1 + ((i - 1) % 2);
+function metaOf(i) {
+  const m = { ...files[fileOf(i)].meta };
+  if (i > 0 && q.has("distance")) m.distance = Number(q.get("distance"));
+  if (i > 0 && q.has("scale")) m.scale = Number(q.get("scale"));
+  return m;
+}
+const build = i => world.buildSpot(files[fileOf(i)].pano, files[fileOf(i)].depth, { ...metaOf(i), index: i });
+const childOf = e => world.spots.find(s => s.parent === e && s.index === e.index + 1);
+const placing = new Set();
+async function placeNext(e) {                 // build the spot after e and place it from e (if e is still around)
+  const i = e.index + 1;
+  if (i >= CHAIN || placing.has(e) || childOf(e)) return;
+  placing.add(e);
+  try {
+    const s = await build(i), m = metaOf(i);
+    if (world.spots.includes(e)) world.placeChild(e, m.heading, m.distance, m.scale, s); else world.remove(s);
+  } finally { placing.delete(e); }
+}
+
+const first = await build(0);
+world.addSpot(first, { x: 0, z: 0 }, first.meta.heading, 1);
+await placeNext(first);
 
 const keys = new Keys(), cam = new OrbitCam(renderer.domElement);
-cam.yaw = OrbitCam.yawFor(spots[0].meta.heading);
+cam.yaw = OrbitCam.yawFor(first.meta.heading);
 const p = hero.pos;
-let manual = false, paused = false, frames = 0, frameMs = 0, last = performance.now(), autoDone = false;
+let manual = false, paused = false, frames = 0, frameMs = 0, last = performance.now(), autoDone = !AUTO, maxBuilt = 0;
+const switches = [];
+addEventListener("keydown", () => { manual = true; });
 
-// Auto-walk: toward the next spot's origin; past the last one, on along its heading to near the edge.
+// Auto-walk: toward the next spot's origin once it is placed; before that, out along its exit heading (holding at
+// the edge until it arrives); past the last spot, on along its heading to near its edge.
 function autoInput() {
-  const i = world.current.index, next = spots[i + 1];
+  const cur = world.current, i = cur.index, next = childOf(cur);
   let tx, tz;
   if (next) { tx = next.origin.x; tz = next.origin.z; }
-  else { const v = bearingVec(world.current.heading); tx = v.x * 0.8 * LIMIT; tz = v.z * 0.8 * LIMIT; }
-  const dx = tx - p.x, dz = tz - p.y;
-  if (!next && Math.hypot(dx, dz) < 0.1) autoDone = true;
+  else {
+    const last = i + 1 >= CHAIN, v = bearingVec(last ? cur.heading : metaOf(i + 1).heading), f = last ? 0.8 : 1.5;
+    tx = v.x * f * LIMIT; tz = v.z * f * LIMIT;
+    if (last && Math.hypot(tx - p.x, tz - p.y) < 0.1) autoDone = true;
+  }
   if (autoDone) return { fwd: 0, side: 0, run: false };
-  const want = -Math.atan2(dx, -dz);                       // camera yaw looking toward the target
+  const want = -Math.atan2(tx - p.x, -(tz - p.y));            // the camera yaw looking toward the target
   let d = want - cam.yaw; d = Math.atan2(Math.sin(d), Math.cos(d)); cam.yaw += d * 0.15;
   return { fwd: 1, side: 0, run: false };
 }
 
 const hud = document.getElementById("hud");
-function draw() {
+function pose() {
   hero.place(world.k);
   cam.apply(camera, new THREE.Vector3(world.k * p.x, 0, world.k * p.y));
-  world.render(renderer, scene, camera);
+  scene.updateMatrixWorld(); camera.updateMatrixWorld();
 }
+function screenOf(obj) {                      // pixel position of an object's origin with the camera as posed
+  const v = obj.getWorldPosition(new THREE.Vector3()).project(camera);
+  return { x: (v.x + 1) / 2 * innerWidth, y: (1 - v.y) / 2 * innerHeight };
+}
+function draw() { pose(); world.render(renderer, scene, camera); }
+
 renderer.setAnimationLoop(t => {
   const dt = paused ? 0 : Math.min(0.05, (t - last) / 1000); last = t;
   const t0 = performance.now();
   if (!paused) {
-    hero.update(dt, AUTO && !manual ? autoInput() : keys.input, cam.yaw, world.k);
-    if (p.length() > LIMIT) p.setLength(LIMIT);           // the current spot is always at the frame origin
-    world.update(p);
+    hero.update(dt, autoDone || manual ? keys.input : autoInput(), cam.yaw, world.k);
+    world.constrain(p);
+    const from = world.current;
+    const at = p.length();
+    pose(); const before = screenOf(from.group);           // a fixed point of the scenery, before the switch…
+    const to = world.update(p, hero.dir.lengthSq() ? hero.dir : null);
+    if (to) {
+      pose(); const after = screenOf(from.group);          // …and after it, with the camera re-posed
+      switches.push({ from: from.index, to: to.index, at, dx: after.x - before.x, dy: after.y - before.y, k: world.k });
+      placeNext(to).catch(e => roamErrors.push(String(e.stack || e)));
+    }
     world.tick(dt);
   }
   draw();
+  maxBuilt = Math.max(maxBuilt, world.spots.length);
   frames++; frameMs += performance.now() - t0;
   if (dev.pauseWhen && dev.pauseWhen(roam)) { paused = true; dev.pauseWhen = null; }
   hud.textContent = `spot ${world.current.index} · pos ${p.x.toFixed(2)}, ${p.y.toFixed(2)} · heading ${hero.heading.toFixed(0)}°` +
-    (world.fade ? ` · fade ${world.fading.toFixed(2)}` : "") + ` · ${(frameMs / frames).toFixed(1)} ms/frame (CPU)`;
+    (world.fade ? ` · fade ${world.fading.toFixed(2)}` : "") + (world.edge ? " · edge" : "") +
+    ` · ${(frameMs / frames).toFixed(1)} ms/frame (CPU)`;
 });
-addEventListener("keydown", () => { manual = true; });
 
 // Read-only debug state.
 const roam = Object.freeze(Object.defineProperties({}, {
@@ -102,9 +145,13 @@ const roam = Object.freeze(Object.defineProperties({}, {
   walked: { get: () => hero.walked, enumerable: true },
   fading: { get: () => !!world.fade, enumerable: true },
   fade: { get: () => world.fade ? world.fading : null, enumerable: true },
+  edge: { get: () => world.edge && { ...world.edge }, enumerable: true },
   built: { get: () => world.spots.length, enumerable: true },
+  maxBuilt: { get: () => maxBuilt, enumerable: true },
   workerBuilt: { get: () => world.workerBuilt, enumerable: true },
   triangles: { get: () => world.spots.reduce((a, s) => a + s.triangles, 0), enumerable: true },
+  memory: { get: () => ({ ...renderer.info.memory }), enumerable: true },
+  switches: { get: () => switches.map(s => ({ ...s })), enumerable: true },
   k: { get: () => world.k, enumerable: true },
   frameMs: { get: () => frames ? frameMs / frames : null, enumerable: true },
 }));
@@ -117,9 +164,16 @@ const dev = window.roamDev = {
   pauseWhen: null,
   get paused() { return paused; }, set paused(v) { paused = v; last = performance.now(); },
   resetFrameTime() { frames = 0; frameMs = 0; },
-  goto(i) { world.jumpTo(spots[i], p); cam.yaw = OrbitCam.yawFor(spots[i].heading); autoDone = true; },
+  // Jump to chain spot i on its own (built afresh at the origin), stop the auto-walk, and place its child.
+  async goto(i) {
+    autoDone = true;
+    const s = await build(i);
+    world.addSpot(s, { x: 0, z: 0 }, s.meta.heading, 1);
+    world.jumpTo(s, p); cam.yaw = OrbitCam.yawFor(s.heading);
+    await placeNext(s);
+  },
   look(yawDeg, pitch) { if (yawDeg != null) cam.yaw = OrbitCam.yawFor(yawDeg); if (pitch != null) cam.setPitch(pitch); },
-  show(i) { world.override = i == null ? null : spots[i]; },   // render only spot i (null: normal)
+  show(i) { world.override = i == null ? null : world.spots.find(s => s.index === i) ?? null; },  // render only spot i
   // Render one frame now (optionally looking along yawDeg at pitch) and count the clear-colour pixels in it.
   voidPixels(yawDeg, pitch) {
     if (yawDeg != null) this.look(yawDeg, pitch);

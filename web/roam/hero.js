@@ -31,6 +31,7 @@ export class Hero {
     this.face = Math.PI;      // rotation.y; π faces −z (north)
     this.speed = 0;           // display units per second
     this.walked = 0;          // display distance walked in total
+    this.dir = new THREE.Vector2(0, 0);   // unit direction of travel this frame (x, z); zero when not moving
   }
 
   // Bearing the character faces, in degrees.
@@ -41,8 +42,11 @@ export class Hero {
     const moving = input.fwd !== 0 || input.side !== 0;
     const target = moving ? this.walkSpeed * (input.run ? RUN : 1) : 0;
     this.speed += (target - this.speed) * Math.min(1, dt * ACCEL);
+    this.dir.set(0, 0);
     if (moving) {
-      const a = camYaw + Math.atan2(input.side, input.fwd), dx = -Math.sin(a), dz = -Math.cos(a);
+      // camYaw looks along bearing −camYaw; side > 0 is screen-right, i.e. clockwise of forward (atan2(−side, fwd))
+      const a = camYaw + Math.atan2(-input.side, input.fwd), dx = -Math.sin(a), dz = -Math.cos(a);
+      this.dir.set(dx, dz);
       this.pos.x += dx * this.speed * dt / k; this.pos.y += dz * this.speed * dt / k;
       this.walked += this.speed * dt;
       let d = Math.atan2(dx, dz) - this.face; d = Math.atan2(Math.sin(d), Math.cos(d));
