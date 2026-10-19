@@ -7,6 +7,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 export const MODEL = new URL("../vendor/RobotExpressive.glb", import.meta.url).href;
 export const CLIPS = { idle: "Idle", walk: "Walking" };   // clip-name mapping, so another character can be swapped in
 export const HERO_SCALE = 0.11, STRIDE = 1.1, RUN = 1.8, TURN = 10, ACCEL = 5;
+const COAST_MIN = 0.02;   // a coast ends below this fraction of the walking speed
 export const CAM_DIST = 1.9, CAM_H = 0.55, LOOK_H = 0.35, PITCH_MIN = -0.1, PITCH_MAX = 0.45;
 
 // Bearing (degrees, 0 = −z, clockwise) of a direction (dx, dz), and back.
@@ -32,26 +33,44 @@ export class Hero {
     this.speed = 0;           // display units per second
     this.walked = 0;          // display distance walked in total
     this.dir = new THREE.Vector2(0, 0);   // unit direction of travel this frame (x, z); zero when not moving
+    this.last = new THREE.Vector2(0, 0);  // the last direction walked (a coast goes on along it)
   }
 
   // Bearing the character faces, in degrees.
   get heading() { return bearingOf(Math.sin(this.face), Math.cos(this.face)); }
 
-  // input: {fwd, side} in −1..1 and run; camYaw from the orbit camera. Moves pos (frame units).
-  update(dt, input, camYaw, k = 1) {
+  // input: {fwd, side} in −1..1 and run; camYaw from the orbit camera. Moves pos (frame units) and animates.
+  update(dt, input, camYaw, k = 1) { this.move(dt, input, camYaw, k); this.animate(dt); }
+
+  // Move pos (frame units). With no input the character coasts on along its last direction while its speed eases
+  // out, so a stop is a glide, never a halt in one frame.
+  move(dt, input, camYaw, k = 1) {
     const moving = input.fwd !== 0 || input.side !== 0;
     const target = moving ? this.walkSpeed * (input.run ? RUN : 1) : 0;
     this.speed += (target - this.speed) * Math.min(1, dt * ACCEL);
-    this.dir.set(0, 0);
     if (moving) {
       // camYaw looks along bearing −camYaw; side > 0 is screen-right, i.e. clockwise of forward (atan2(−side, fwd))
-      const a = camYaw + Math.atan2(-input.side, input.fwd), dx = -Math.sin(a), dz = -Math.cos(a);
-      this.dir.set(dx, dz);
-      this.pos.x += dx * this.speed * dt / k; this.pos.y += dz * this.speed * dt / k;
-      this.walked += this.speed * dt;
-      let d = Math.atan2(dx, dz) - this.face; d = Math.atan2(Math.sin(d), Math.cos(d));
+      const a = camYaw + Math.atan2(-input.side, input.fwd);
+      this.last.set(-Math.sin(a), -Math.cos(a));
+      let d = Math.atan2(this.last.x, this.last.y) - this.face; d = Math.atan2(Math.sin(d), Math.cos(d));
       this.face += d * Math.min(1, dt * TURN);
+    } else if (this.speed < COAST_MIN * this.walkSpeed) this.speed = 0;
+    this.dir.set(0, 0);
+    if (this.speed > 0 && this.last.lengthSq()) {
+      this.dir.copy(this.last);
+      this.pos.x += this.dir.x * this.speed * dt / k; this.pos.y += this.dir.y * this.speed * dt / k;
+      this.walked += this.speed * dt;
     }
+  }
+
+  // After the world clamped pos: the ground actually covered this frame (frame units) caps the speed, so the feet
+  // never cycle against a wall (the walk eases back in from there while the input holds).
+  collide(moved, dt, k = 1) {
+    if (dt > 0) this.speed = Math.min(this.speed, moved * k / dt);
+  }
+
+  // Blend idle and walk by speed (ground speed matched to the stride) and advance the clips.
+  animate(dt) {
     const w = Math.min(1, this.speed / this.walkSpeed);
     this.walk.setEffectiveWeight(w); this.idle.setEffectiveWeight(1 - w);
     this.walk.timeScale = Math.max(1, this.speed / this.walkSpeed);

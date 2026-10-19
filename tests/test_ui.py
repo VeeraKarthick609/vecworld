@@ -16,18 +16,22 @@ from vecworld.roam.service import RoamService
 pytestmark = pytest.mark.ui
 
 LIMIT = 0.55 * 4     # web/roam/world.js: the walkable radius
-EDGE = 0.98 * LIMIT  # ... and where its edge starts
 
 
 class UiPainter(FakePainter):
     """Solid panoramas. While .gate is clear, every step blocks (and sets .entered); .fail_steps makes every step a
-    GPU out-of-memory."""
+    GPU out-of-memory; .pano_delay slows the first panorama."""
 
     def __init__(self):
         super().__init__()
         self.fail_steps = False
+        self.pano_delay = 0.0
         self.gate, self.entered = threading.Event(), threading.Event()
         self.gate.set()
+
+    def panorama(self, *a, **kw):
+        time.sleep(self.pano_delay)
+        return super().panorama(*a, **kw)
 
     def step(self, *a, **kw):
         if not self.gate.is_set():
@@ -39,11 +43,14 @@ class UiPainter(FakePainter):
 
 
 class RecordingService(RoamService):
-    """Records every call the viewer makes as (name, argument, monotonic time)."""
+    """Records every call the viewer makes as (name, argument, monotonic time). With .hide_next_image, the next
+    /next's panorama file is moved aside before the viewer can load it (.hidden = (aside, original))."""
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.calls: list[tuple[str, object, float]] = []
+        self.hide_next_image = False
+        self.hidden = None
 
     def _rec(self, name, arg):
         self.calls.append((name, arg, time.monotonic()))
@@ -54,7 +61,13 @@ class RecordingService(RoamService):
 
     def next(self, sid, exit_heading):
         self._rec("next", exit_heading)
-        return super().next(sid, exit_heading)
+        v = super().next(sid, exit_heading)
+        if self.hide_next_image:
+            self.hide_next_image = False
+            aside = v.image_path.with_suffix(".aside")
+            v.image_path.rename(aside)
+            self.hidden = (aside, v.image_path)
+        return v
 
     def heading(self, sid, heading):
         self._rec("heading", heading)
@@ -98,7 +111,8 @@ def server(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def healthy(server):
     _, _, painter = server
-    painter.fail_steps, painter.fail_next = False, False
+    painter.fail_steps, painter.fail_next, painter.pano_delay = False, False, 0.0
+    server[1].hide_next_image = False
     painter.gate.set()
     painter.entered.clear()
     yield
@@ -240,6 +254,21 @@ def test_dragging_turns_the_camera(server, browser):
     assert js(browser, "window.roamErrors") == []
 
 
+def stalls(samples, walk_speed):
+    """Spans (ms) during which the walk clip played (weight > 0.3) while the character barely moved."""
+    out, since = [], None
+    for x in samples:
+        bad = x["walk"] > 0.3 and x["ground"] < 0.05 * walk_speed
+        if bad and since is None:
+            since = x["t"]
+        elif not bad and since is not None:
+            out.append(x["t"] - since)
+            since = None
+    if since is not None:
+        out.append(samples[-1]["t"] - since)
+    return out
+
+
 def test_edge_waits_in_fog_then_continues(server, browser):
     url, svc, painter = server
     painter.gate.clear()                 # every step blocks: the pre-dreams around the first spot never finish
@@ -249,15 +278,19 @@ def test_edge_waits_in_fog_then_continues(server, browser):
     n = len(svc.calls)
     key_down(browser, "w")
     try:
-        wait(browser, "roam.stepping && roam.fog")
+        wait(browser, "roam.stepping")
         wait_for(lambda: [h for h, _ in svc.since(n, "next")], timeout=5)
         assert ang(svc.since(n, "next")[0][0], 0) < 5
+        assert radius(browser) < 0.9 * LIMIT          # asked for ahead of the rim
         assert painter.entered.wait(10)
-        time.sleep(0.5)                  # held at the edge, eased to a stop, fog showing
-        assert EDGE - 0.02 <= radius(browser) <= LIMIT + 1e-6
-        wait(browser, "roamDev.hero.speed < 0.05", timeout=5)
+        # Coasts to a stop just inside the rim, in the fog, with the feet slowing as the ground speed does.
+        wait(browser, "roam.fog && roam.braking && roamDev.hero.speed < 0.02", timeout=10)
+        time.sleep(0.5)
+        assert 0.9 * LIMIT <= radius(browser) <= LIMIT + 1e-6
         assert js(browser, "roam.spotId") == first
         wait(browser, "Number(getComputedStyle(document.getElementById('fog')).opacity) > 0.5")
+        walk_speed = js(browser, "roamDev.hero.walkSpeed")
+        assert max(stalls(js(browser, "roam.samples"), walk_speed), default=0) <= 100
         painter.gate.set()
         wait(browser, f"roam.spotId !== {first!r} && !roam.fog")
         assert js(browser, "roam.built") == 2       # the child placed beside its parent
@@ -266,6 +299,7 @@ def test_edge_waits_in_fog_then_continues(server, browser):
     finally:
         key_up(browser, "w")
     wait(browser, "Number(getComputedStyle(document.getElementById('fog')).opacity) < 0.05")
+    assert max(stalls(js(browser, "roam.samples"), walk_speed), default=0) <= 100
     assert js(browser, "window.roamErrors") == []
 
 
@@ -280,16 +314,101 @@ def test_failed_next_keeps_current_spot(server, browser):
     try:
         wait(browser, TOAST)
         assert "out of memory" in browser.find_element("id", "toast").text
-        time.sleep(0.6)                  # still pushing at the edge: no retry storm
+        assert "try another direction" in browser.find_element("id", "toast").text
+        wait(browser, "roam.stuck && roamDev.hero.speed < 0.01", timeout=10)
+        time.sleep(0.6)                  # still holding W at the rim: no retry storm, no treadmill, no fog
         assert len(svc.since(n, "next")) == 1
+        assert js(browser, "roamDev.hero.walk.getEffectiveWeight()") < 0.1
+        assert js(browser, "roamDev.hero.speed") < 0.05
+        assert not js(browser, "roam.fog")
+        assert radius(browser) <= LIMIT + 1e-6
     finally:
         key_up(browser, "w")
     assert js(browser, "roam.spotId") == first and js(browser, "roam.built") == 1
-    wait(browser, "!roam.stepping && !roam.fog")
+    assert not js(browser, "roam.stepping")
     r = radius(browser)
-    hold(browser, "s", 0.5)              # still playable: walk back in
-    assert radius(browser) < r - 0.2
+    hold(browser, "s", 1.2)              # still playable: walk back in, which opens the way again
+    assert radius(browser) < r - 0.6
+    wait(browser, "!roam.stuck")
+    hold(browser, "w", 1.6)
+    wait_for(lambda: len(svc.since(n, "next")) == 2)
     assert js(browser, "window.roamErrors") == []
+
+
+def test_walking_back_then_out_steps_from_the_server_spot(server, browser):
+    """Back in the previous spot (past the bisector), an edge there re-roots on the server's spot first: the next
+    spot is asked for from it and placed beside it, not beside the spot the player wandered back into."""
+    url, svc, _ = server
+    start(browser, url)
+    first = js(browser, "roam.spotId")
+    browser.execute_script("roamDev.look(0, 0.18)")
+    key_down(browser, "w")
+    try:
+        wait(browser, f"roam.spotId !== {first!r}")
+    finally:
+        key_up(browser, "w")
+    second = js(browser, "roam.spotId")
+    browser.execute_script("roamDev.look(180, 0.18)")
+    key_down(browser, "w")
+    try:
+        wait(browser, "!roam.inServerSpot")              # walked back into the first spot
+    finally:
+        key_up(browser, "w")
+    browser.execute_script("roamDev.look(90, 0.18)")
+    n = len(svc.calls)
+    key_down(browser, "w")
+    try:
+        wait(browser, f"roam.spotId !== {second!r}")
+    finally:
+        key_up(browser, "w")
+    steps = js(browser, "roam.steps")
+    assert len(steps) == 2 and steps[1]["from"] == second and steps[1]["inServerSpot"], steps
+    assert js(browser, "roam.parentSpotId") == second
+    assert [round(h, 6) for h, _ in svc.since(n, "next")] == [round(steps[1]["exit"], 6)]
+    assert 45 < steps[1]["exit"] < 180, steps      # eastward, measured from the server's spot
+    assert js(browser, "window.roamErrors") == []
+
+
+def test_spot_that_failed_to_build_is_built_again_without_a_new_next(server, browser):
+    url, svc, _ = server
+    start(browser, url)
+    first = js(browser, "roam.spotId")
+    svc.hide_next_image = True           # /next succeeds, but its panorama won't load
+    browser.execute_script("roamDev.look(0, 0.18)")
+    n = len(svc.calls)
+    key_down(browser, "w")
+    try:
+        wait(browser, TOAST)
+        assert "didn't load" in browser.find_element("id", "toast").text
+    finally:
+        key_up(browser, "w")
+    assert js(browser, "roam.spotId") == first
+    aside, original = svc.hidden
+    aside.rename(original)
+    hold(browser, "s", 1.2)
+    wait(browser, "!roam.stuck")
+    key_down(browser, "w")
+    try:
+        wait(browser, f"roam.spotId !== {first!r}")
+    finally:
+        key_up(browser, "w")
+    assert len(svc.since(n, "next")) == 1              # the spot the server had moved to, built this time
+    assert js(browser, "roam.steps.map(s => s.rebuild)") == [False, True]
+    assert js(browser, "roam.spotId") == original.stem
+    assert js(browser, "window.roamErrors") == []
+
+
+def test_chip_toggled_during_start_is_sent_after_it(server, browser):
+    url, svc, painter = server
+    painter.pano_delay = 1.5
+    open_game(browser, url)
+    n = len(svc.calls)
+    submit(browser, "a quiet forest")
+    wait(browser, "document.getElementById('place').disabled")
+    browser.find_element("css selector", ".chip[data-mood='snow']").click()
+    wait(browser, "roam.started && roam.spotId !== null")
+    wait_for(lambda: len(svc.since(n)) == 2)
+    assert svc.since(n) == [("start", ("a quiet forest", [])), ("moods", ["snow"])]
 
 
 def test_signposts_and_compass_show_the_neighbours(server, browser):

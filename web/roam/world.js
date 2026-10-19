@@ -227,14 +227,25 @@ export class World {
     if (!this.current) return null;
     const r = this.constrain(p);
     const moving = dir && (dir.x || dir.y);
+    const atEdge = r >= EDGE_AT * LIMIT;
+    const best = moving ? this._ahead(p, dir, atEdge) : null;
+    const outward = moving && dir.x * p.x + dir.y * p.y > 0;
+    this.edge = !best && atEdge && outward ? { bearing: (Math.atan2(p.x, -p.y) / RAD + 360) % 360 } : null;
+    if (!best) { this._r = r; return null; }
+    this.enter(best, p);
+    return best;
+  }
+
+  // The spot to switch to for a player at p moving along dir (both x, z): see update(). With atEdge, a spot within
+  // AHEAD° of travel counts even outside its walkable radius.
+  _ahead(p, dir, atEdge) {
     const dist = e => Math.hypot(p.x - e.origin.x, p.y - e.origin.z);
-    const toward = e => moving && dir.x * (e.origin.x - p.x) + dir.y * (e.origin.z - p.y) > 0;
+    const toward = e => dir.x * (e.origin.x - p.x) + dir.y * (e.origin.z - p.y) > 0;
     let best = null, bd = dist(this.current) - HYSTERESIS;
     for (const e of this.spots) {
       if (e !== this.current && toward(e) && dist(e) <= LIMIT && dist(e) < bd) { best = e; bd = dist(e); }
     }
-    const atEdge = r >= EDGE_AT * LIMIT;
-    if (!best && atEdge && moving) {
+    if (!best && atEdge) {
       let ba = AHEAD;
       for (const e of this.spots) {
         if (e === this.current || e.origin.x * p.x + e.origin.z * p.y <= 0) continue;
@@ -242,11 +253,21 @@ export class World {
         if (a <= ba) { best = e; ba = a; }
       }
     }
-    const outward = moving && dir.x * p.x + dir.y * p.y > 0;
-    this.edge = !best && atEdge && outward ? { bearing: (Math.atan2(p.x, -p.y) / RAD + 360) % 360 } : null;
-    if (!best) { this._r = r; return null; }
-    this.enter(best, p);
     return best;
+  }
+
+  // Where walking on from p along unit dir leaves the current spot's walkable disc, when no placed spot lies that
+  // way: {gap, bearing}, the distance to the rim along dir and the bearing (from the origin) of the point it is
+  // crossed. Null when dir is zero, inward, or a spot lies ahead. The game asks for the next spot before the edge.
+  exitAhead(p, dir) {
+    if (!this.current || !dir || !(dir.x || dir.y)) return null;
+    const pd = p.x * dir.x + p.y * dir.y;
+    if (pd <= 0 && p.length() > 0.5 * LIMIT) return null;      // heading back in
+    if (this._ahead(p, dir, true)) return null;
+    const disc = pd * pd - p.lengthSq() + LIMIT * LIMIT;
+    const gap = disc > 0 ? Math.max(0, -pd + Math.sqrt(disc)) : 0;
+    const x = p.x + dir.x * gap, z = p.y + dir.y * gap;
+    return { gap, bearing: (Math.atan2(x, -z) / RAD + 360) % 360 };
   }
 
   // Switch to spot e now, wherever the player stands: re-root on it and crossfade from the current spot. update()
