@@ -9,40 +9,41 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from vecworld.dream.errors import GameError
-from vecworld.dream.service import DreamService
-from vecworld.dream.session import View
+from vecworld.roam.service import RoamService, SpotView
 
 
 class StartIn(BaseModel):
-    theme: str = Field(max_length=1000)
+    place: str = Field(max_length=1000)
     moods: list[str] = []
 
 
-class YawIn(BaseModel):
-    yaw: float = Field(allow_inf_nan=False)
+class NextIn(BaseModel):
+    exit_heading: float = Field(allow_inf_nan=False)
 
 
-class ApproachIn(BaseModel):
-    label: str
+class HeadingIn(BaseModel):
+    heading: float = Field(allow_inf_nan=False)
 
 
 class ThemeIn(BaseModel):
-    theme: str = Field(max_length=1000)
+    place: str = Field(max_length=1000)
 
 
 class MoodsIn(BaseModel):
     moods: list[str]
 
 
-def view_out(v: View) -> dict:
+def spot_out(v: SpotView) -> dict:
     return {
-        "view_id": v.view_id,
+        "spot_id": v.spot_id,
         "image_url": f"/scenes/{v.image_path.name}",
-        "labels": [{"id": l.id, "text": l.text, "u": l.u, "y": l.y, "w": l.w, "h": l.h} for l in v.labels],
-        "theme": v.theme,
-        "moods": list(v.moods),
-        "steps": v.steps,
-        "walked_yaw": v.walked_yaw,
+        "depth_url": f"/scenes/{v.depth_path.name}",
+        "heading": v.heading,
+        "scale": v.scale,
+        "distance": v.distance,
+        "place": v.place,
+        "neighbours": [{"name": n.name, "bearing": n.bearing} for n in v.neighbours],
+        "arrived": v.arrived,
     }
 
 
@@ -50,7 +51,7 @@ def error(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse({"error": code, "message": message}, status_code=status)
 
 
-def create_app(service: DreamService, web_dir: Path) -> FastAPI:
+def create_app(service: RoamService, web_dir: Path) -> FastAPI:
     app = FastAPI(title="vecworld")
     # GPU work is serialised inside the service; a few threads let a second request
     # for a busy session get its 409 instead of waiting in line.
@@ -75,35 +76,27 @@ def create_app(service: DreamService, web_dir: Path) -> FastAPI:
 
     @app.post("/api/session/{sid}/start")
     async def start(sid: str, body: StartIn):
-        return view_out(await run(service.start, sid, body.theme, body.moods))
+        return spot_out(await run(service.start, sid, body.place, body.moods))
 
-    @app.post("/api/session/{sid}/walk")
-    async def walk(sid: str, body: YawIn):
-        return view_out(await run(service.walk, sid, body.yaw))
+    @app.post("/api/session/{sid}/next")
+    async def next_spot(sid: str, body: NextIn):
+        return spot_out(await run(service.next, sid, body.exit_heading))
 
-    @app.post("/api/session/{sid}/back")
-    async def back(sid: str, body: YawIn):
-        return view_out(await run(service.back, sid, body.yaw))
-
-    @app.post("/api/session/{sid}/approach")
-    async def approach(sid: str, body: ApproachIn):
-        return view_out(await run(service.approach, sid, body.label))
+    @app.post("/api/session/{sid}/heading", status_code=202)
+    async def heading(sid: str, body: HeadingIn):
+        # Only re-targets queued work and returns; never waits on the GPU, so it runs inline
+        # rather than behind possibly blocked pool threads.
+        service.heading(sid, body.heading)
+        return {"ok": True}
 
     @app.post("/api/session/{sid}/theme")
     async def theme(sid: str, body: ThemeIn):
-        await run(service.set_theme, sid, body.theme)
+        await run(service.set_theme, sid, body.place)
         return {"ok": True}
 
     @app.post("/api/session/{sid}/moods")
     async def moods(sid: str, body: MoodsIn):
         await run(service.set_moods, sid, body.moods)
-        return {"ok": True}
-
-    @app.post("/api/session/{sid}/prefetch", status_code=202)
-    async def prefetch(sid: str, body: YawIn):
-        # Only queues a low-priority job and returns; never waits on the GPU, so it runs inline
-        # rather than behind possibly blocked pool threads.
-        service.prefetch(sid, body.yaw)
         return {"ok": True}
 
     app.mount("/scenes", StaticFiles(directory=service.scene_dir), name="scenes")

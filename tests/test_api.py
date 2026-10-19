@@ -2,45 +2,34 @@ import threading
 import time
 
 import pytest
-from conftest import FakeDreamer, FakePainter
+from conftest import FakeDepth, FakeDreamer, FakePainter
 from fastapi.testclient import TestClient
 
 from vecworld.api.app import create_app
-from vecworld.dream.labels import Label
-from vecworld.dream.service import DreamService
-
-
-class FakeLabels:
-    def __init__(self):
-        self._n = 0
-
-    def find(self, img, wanted):
-        out = []
-        for text, u in wanted:
-            self._n += 1
-            out.append(Label(f"L{self._n}", text, u, 0.5, 0.05, 0.2))
-        return out
+from vecworld.roam.service import RoamService
 
 
 class GatedPainter(FakePainter):
-    """step() blocks until `gate` is set, after signalling `entered`."""
+    """Once armed, step() signals `entered` and blocks until `gate` is set."""
 
     def __init__(self):
         super().__init__()
+        self.armed = False
         self.entered, self.gate = threading.Event(), threading.Event()
 
-    def step(self, prev, base, focus, focus_at, seed, **kw):
-        self.entered.set()
-        assert self.gate.wait(10)
-        return super().step(prev, base, focus, focus_at, seed, **kw)
+    def step(self, *a, **kw):
+        if self.armed:
+            self.entered.set()
+            assert self.gate.wait(10)
+        return super().step(*a, **kw)
 
 
 def make_client(tmp_path, painter=None):
     web = tmp_path / "web"
     web.mkdir(exist_ok=True)
     (web / "index.html").write_text("<html><canvas></canvas></html>")
-    svc = DreamService(painter or FakePainter(), FakeDreamer(), FakeLabels(), tmp_path / "scenes",
-                       spawn=lambda fn: fn())
+    svc = RoamService(painter or FakePainter(), FakeDepth(), FakeDreamer(), tmp_path / "scenes",
+                      spawn=lambda fn: None)
     return TestClient(create_app(svc, web))
 
 
@@ -53,111 +42,137 @@ def new(client):
     return client.post("/api/session").json()["session_id"]
 
 
-def started(client, theme="a quiet forest", moods=()):
+def started(client, place="a quiet forest", moods=()):
     sid = new(client)
-    r = client.post(f"/api/session/{sid}/start", json={"theme": theme, "moods": list(moods)})
+    r = client.post(f"/api/session/{sid}/start", json={"place": place, "moods": list(moods)})
     assert r.status_code == 200, r.text
     return sid, r.json()
 
 
-def test_full_flow(client):
-    sid, v = started(client, moods=["night"])
-    assert v["steps"] == 0 and v["theme"] == "a quiet forest" and v["moods"] == ["night"]
-    assert v["image_url"] == f"/scenes/{v['view_id']}.jpg"
-    r = client.get(v["image_url"])
-    assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
-
-    w = client.post(f"/api/session/{sid}/walk", json={"yaw": 10}).json()
-    assert w["steps"] == 1 and w["view_id"] != v["view_id"]
-    assert {"id", "text", "u", "y", "w", "h"} <= w["labels"][0].keys()
-    assert client.get(w["image_url"]).status_code == 200
-
-    b = client.post(f"/api/session/{sid}/back", json={"yaw": 10}).json()
-    assert b["steps"] == 2
-
-    label = b["labels"][-1]["id"]
-    a = client.post(f"/api/session/{sid}/approach", json={"label": label})
-    assert a.status_code == 200 and a.json()["steps"] == 3
-
-    assert client.post(f"/api/session/{sid}/theme", json={"theme": "a desert"}).json() == {"ok": True}
-    assert client.post(f"/api/session/{sid}/moods", json={"moods": []}).json() == {"ok": True}
-    assert client.post(f"/api/session/{sid}/walk", json={"yaw": 0}).json()["theme"] == "a desert"
+def test_start_returns_spot(client):
+    sid, spot = started(client, moods=["night"])
+    assert set(spot) == {"spot_id", "image_url", "depth_url", "heading", "scale", "distance", "place",
+                         "neighbours", "arrived"}
+    assert spot["place"] == "a quiet forest"
+    assert spot["scale"] == 1 and spot["distance"] == 0 and spot["arrived"] is None
+    assert spot["neighbours"] and set(spot["neighbours"][0]) == {"name", "bearing"}
 
 
-def test_prefetch_returns_202_while_painter_is_blocked(tmp_path):
-    painter = GatedPainter()
-    client = make_client(tmp_path, painter)
+def test_scenes_serve_jpeg_and_png(client):
+    _, spot = started(client)
+    img = client.get(spot["image_url"])
+    assert img.status_code == 200 and img.content[:3] == b"\xff\xd8\xff"
+    depth = client.get(spot["depth_url"])
+    assert depth.status_code == 200 and depth.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_next_returns_new_spot(client):
+    sid, first = started(client)
+    r = client.post(f"/api/session/{sid}/next", json={"exit_heading": 90})
+    assert r.status_code == 200, r.text
+    nxt = r.json()
+    assert nxt["spot_id"] != first["spot_id"]
+    assert nxt["image_url"] != first["image_url"]
+
+
+def test_theme_and_moods_ok(client):
     sid, _ = started(client)
-    results = {}
-    t = threading.Thread(target=lambda: results.update(
-        r=client.post(f"/api/session/{sid}/walk", json={"yaw": 0})))
+    assert client.post(f"/api/session/{sid}/theme", json={"place": "a harbour"}).json() == {"ok": True}
+    assert client.post(f"/api/session/{sid}/moods", json={"moods": ["night"]}).json() == {"ok": True}
+
+
+def test_unknown_session_404(client):
+    r = client.post("/api/session/nope/next", json={"exit_heading": 0})
+    assert r.status_code == 404 and r.json()["error"] == "unknown_session"
+    r = client.post("/api/session/nope/start", json={"place": "forest", "moods": []})
+    assert r.status_code == 404
+
+
+def test_not_started_409(client):
+    sid = new(client)
+    r = client.post(f"/api/session/{sid}/next", json={"exit_heading": 0})
+    assert r.status_code == 409 and r.json()["error"] == "not_started"
+    assert client.post(f"/api/session/{sid}/heading", json={"heading": 0}).status_code == 409
+
+
+def test_bad_input_422(client):
+    sid = new(client)
+    r = client.post(f"/api/session/{sid}/start", json={"place": "   ", "moods": []})
+    assert r.status_code == 422 and r.json()["error"] == "bad_input"
+    r = client.post(f"/api/session/{sid}/start", json={"place": "x" * 1001, "moods": []})
+    assert r.status_code == 422
+    r = client.post(f"/api/session/{sid}/start", json={"moods": []})
+    assert r.status_code == 422 and r.json()["error"] == "bad_input"
+
+
+def test_validation_error_never_echoes_input(client):
+    sid, _ = started(client)
+    secret = "hunter2-secret"
+    r = client.post(f"/api/session/{sid}/next", json={"exit_heading": secret})
+    assert r.status_code == 422 and secret not in r.text
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize("route,key", [("next", "exit_heading"), ("heading", "heading")])
+def test_non_finite_heading_422(client, route, key, bad):
+    sid, _ = started(client)
+    r = client.post(f"/api/session/{sid}/{route}", content=f'{{"{key}": {bad}}}',
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 422 and r.json()["error"] == "bad_input"
+
+
+def test_gpu_unavailable_503(tmp_path, monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    painter = FakePainter()
+    c = make_client(tmp_path, painter)
+    sid = new(c)
+    painter.fail_next = True
+    r = c.post(f"/api/session/{sid}/start", json={"place": "forest", "moods": []})
+    assert r.status_code == 503 and r.json()["error"] == "gpu_unavailable"
+    assert c.post(f"/api/session/{sid}/start", json={"place": "forest", "moods": []}).status_code == 200
+
+
+def test_busy_409_while_move_in_flight(tmp_path):
+    painter = GatedPainter()
+    c = make_client(tmp_path, painter)
+    sid, _ = started(c)
+    painter.armed = True
+    out = {}
+    t = threading.Thread(target=lambda: out.update(r=c.post(f"/api/session/{sid}/next", json={"exit_heading": 200})))
+    t.start()
+    try:
+        assert painter.entered.wait(5)
+        r = c.post(f"/api/session/{sid}/next", json={"exit_heading": 10})
+        assert r.status_code == 409 and r.json()["error"] == "busy"
+    finally:
+        painter.gate.set()
+        t.join(10)
+    assert out["r"].status_code == 200
+
+
+def test_heading_returns_202_while_painter_blocks(tmp_path):
+    painter = GatedPainter()
+    c = make_client(tmp_path, painter)
+    sid, _ = started(c)
+    painter.armed = True
+    out = {}
+    t = threading.Thread(target=lambda: out.update(r=c.post(f"/api/session/{sid}/next", json={"exit_heading": 200})))
     t.start()
     try:
         assert painter.entered.wait(5)
         t0 = time.monotonic()
-        r = client.post(f"/api/session/{sid}/prefetch", json={"yaw": 90})
+        r = c.post(f"/api/session/{sid}/heading", json={"heading": 45})
         assert r.status_code == 202 and r.json() == {"ok": True}
-        assert time.monotonic() - t0 < 1
+        assert time.monotonic() - t0 < 1.0
+        assert not painter.gate.is_set() and t.is_alive()   # the move is still blocked
     finally:
         painter.gate.set()
         t.join(10)
-    assert results["r"].status_code == 200
-
-
-def test_unknown_session_404(client):
-    r = client.post("/api/session/nope/walk", json={"yaw": 0})
-    assert r.status_code == 404 and r.json()["error"] == "unknown_session"
-    assert client.post("/api/session/nope/start", json={"theme": "x", "moods": []}).status_code == 404
-
-
-def test_walk_before_start_409(client):
-    sid = new(client)
-    r = client.post(f"/api/session/{sid}/walk", json={"yaw": 0})
-    assert r.status_code == 409 and r.json()["error"] == "not_started"
-
-
-def test_unknown_label_400(client):
-    sid, _ = started(client)
-    r = client.post(f"/api/session/{sid}/approach", json={"label": "zzz"})
-    assert r.status_code == 400 and r.json()["error"] == "unknown_label"
-
-
-def test_empty_theme_422(client):
-    sid = new(client)
-    r = client.post(f"/api/session/{sid}/start", json={"theme": "   ", "moods": []})
-    assert r.status_code == 422 and r.json()["error"] == "bad_input"
-
-
-@pytest.mark.parametrize("path,body", [
-    ("walk", '{"yaw": NaN}'),
-    ("walk", '{"yaw": Infinity}'),
-    ("walk", '{"yaw": "left"}'),
-    ("walk", "{}"),
-    ("back", '{"yaw": NaN}'),
-    ("prefetch", '{"yaw": NaN}'),
-    ("start", '{"moods": []}'),
-    ("start", '{"theme": "' + "x" * 1001 + '", "moods": []}'),
-    ("moods", '{"moods": "night"}'),
-    ("approach", "{}"),
-])
-def test_validation_errors_use_error_format(client, path, body):
-    sid = new(client)
-    r = client.post(f"/api/session/{sid}/{path}", content=body, headers={"content-type": "application/json"})
-    assert r.status_code == 422
-    j = r.json()
-    assert j["error"] == "bad_input" and isinstance(j["message"], str) and j["message"]
-
-
-def test_oom_503_and_server_survives(tmp_path):
-    painter = FakePainter()
-    client = make_client(tmp_path, painter)
-    sid, _ = started(client)
-    painter.fail_next = True
-    r = client.post(f"/api/session/{sid}/walk", json={"yaw": 0})
-    assert r.status_code == 503 and r.json()["error"] == "gpu_unavailable"
-    assert client.post(f"/api/session/{sid}/walk", json={"yaw": 0}).status_code == 200
-    assert client.post("/api/session").status_code == 200
+    assert out["r"].status_code == 200
 
 
 def test_static_index_served(client):
-    assert client.get("/").status_code == 200
+    r = client.get("/")
+    assert r.status_code == 200 and "canvas" in r.text
