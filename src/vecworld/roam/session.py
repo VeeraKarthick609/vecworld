@@ -48,6 +48,7 @@ class RoamSession:
     prefetch: dict[str, Predream] = field(default_factory=dict)   # the pre-dreamed set, by queue key
     pending: list[Callable[[Journey], Journey]] = field(default_factory=list)  # journey edits during a move
     visited: list[str] = field(default_factory=list)
+    names: tuple[str, list] | None = None   # (place, LLM places): re-applied to every journey a move commits
     places_for: str | None = None            # the place whose neighbours the LLM has answered (or failed) for
     refilling: str | None = None             # the place a places refill is running for
     busy: bool = False

@@ -101,38 +101,39 @@ def _rebuilt(j: Journey, neighbours: list[Neighbour], carry: dict[str, str]) -> 
 
 
 def _with_place(j: Journey, place: str, bearing: float) -> Journey:
-    """The typed place becomes a neighbour at `bearing`; neighbours too close to it make way."""
+    """The typed place becomes a neighbour at `bearing`; neighbours too close to it make way, except the place
+    you came from, which always stays behind you (unless it is the typed place)."""
     if place.lower() == j.place.lower():
         return j
-    keep = [n for n in j.neighbours if n.name.lower() != place.lower() and _diff(n.bearing, bearing) >= MIN_SEPARATION]
+    keep = [n for n in j.neighbours if n.name.lower() != place.lower()
+            and (n.name == j.came_from or _diff(n.bearing, bearing) >= MIN_SEPARATION)]
     new = Neighbour(place, round(bearing % 360, 6), GENERIC_SCENERY)
     return _rebuilt(j, sorted(keep + [new], key=lambda n: n.bearing), {})
 
 
 def _renamed(j: Journey, place: str, found: list[tuple[str, tuple[str, ...]]]) -> Journey:
-    """The LLM's places take over the fallback neighbours' slots (bearings and drift kept); the came-from stays."""
+    """The LLM's places take over the fallback neighbours' slots (bearings and drift kept). The came-from place,
+    typed places and names already present stay. Idempotent, so it can be re-applied to any journey of `place`."""
     if j.place != place:
         return j
-    taken = {place.lower(), (j.came_from or "").lower()}
+    fallback = {n.lower() for n in fallback_neighbours(place)}
+    answered = {name.lower() for name, _ in found if name}
+    present = {n.name.lower() for n in j.neighbours} | {place.lower(), (j.came_from or "").lower()}
     fresh: list[tuple[str, tuple[str, ...]]] = []
     for name, scenery in found:
-        if name and name.lower() not in taken:
-            taken.add(name.lower())
+        if name and name.lower() not in present:
+            present.add(name.lower())
             fresh.append((name, tuple(scenery[:3]) + GENERIC_SCENERY[len(scenery[:3]):3]))
     it = iter(fresh)
     out, carry = [], {}
     for n in j.neighbours:
-        if n.name == j.came_from:
+        if (n.name != j.came_from and n.name.lower() in fallback and n.name.lower() not in answered
+                and (nxt := next(it, None)) is not None):
+            out.append(Neighbour(nxt[0], n.bearing, nxt[1]))
+            carry[nxt[0]] = n.name
+        else:
             out.append(n)
-            continue
-        nxt = next(it, None)
-        if nxt is None:
-            if n.name.lower() not in {o.name.lower() for o in out} | {f[0].lower() for f in fresh}:
-                out.append(n)
-            continue
-        out.append(Neighbour(nxt[0], n.bearing, nxt[1]))
-        carry[nxt[0]] = n.name
-    return _rebuilt(j, out, carry)
+    return _rebuilt(j, out, carry) if carry else j
 
 
 class RoamService:
@@ -193,7 +194,7 @@ class RoamService:
                 s.prefetch, s.pending = {}, []
                 s.spot, s.spot_stats, s.ref, s.ref_pending = spot, stats, stats, False
                 s.journey, s.moods, s.steps, s.visited = journey, moods, 0, [place]
-                s.places_for, s.hint = None, 0.0
+                s.places_for, s.names, s.hint = None, None, 0.0
                 s.files.append(paths)
                 self._submit_set(s)
                 view = self._view(s, paths, None)
@@ -207,13 +208,19 @@ class RoamService:
         exit_heading = self._heading(exit_heading)
         s = self._started(sid)
         with self._claim(s):
+            running = None
             with self._lock:
                 hints = s.hints
                 built = self._take(s, exit_heading)
                 if built is None:
+                    running = self._keep_running(s, exit_heading)
+            if running is not None:
+                # On the single worker a demand build would only start after this job anyway.
+                built = self._wait(s, running)
+            if built is None:
+                with self._lock:
                     self.queue.submit_set([], s.id)   # the queued set would only delay the exact heading
                     snap = self._snap(s)
-            if built is None:
                 built = self._run(s, lambda: self._build(snap, exit_heading))
             return self._commit(s, built, exit_heading, hints)
 
@@ -254,7 +261,10 @@ class RoamService:
 
     def _key(self, s: RoamSession, heading: int) -> str:
         # The queue reuses a queued/running job by key with its original fn, so the key names everything the
-        # build depends on: the world version (moods, theme, neighbours) and the spot it starts from.
+        # build depends on: the world version (moods, theme, typed places) and the spot it starts from.
+        # One exception: the LLM's neighbour names landing do not bump the version (see _rename). Such a
+        # pre-dream's journey is renamed at commit; its prompt may name a fallback place unless the player was
+        # already drifting toward it, which does bump.
         return f"{s.version}:{s.spot.id}:{heading}"
 
     def _current(self, s: RoamSession, e: Predream) -> bool:
@@ -326,6 +336,32 @@ class RoamService:
                    key=lambda t: t[:2], default=None)
         return None if best is None else best[2].future.result(timeout=0)
 
+    def _keep_running(self, s: RoamSession, exit_heading: float) -> Future | None:
+        """The running pre-dream closest to the exit within TAKE_WITHIN, with the rest of the queued set cancelled;
+        None if there is none. Queued (not started) pre-dreams lose to a demand build. Caller holds the lock."""
+        best = min(((_diff(e.heading, exit_heading), e.heading, k) for k, e in s.prefetch.items()
+                    if self._current(s, e) and e.future.running() and _diff(e.heading, exit_heading) <= TAKE_WITHIN),
+                   default=None)
+        if best is None:
+            return None
+        k = best[2]
+        e = s.prefetch[k]
+        f = self.queue.submit_set([(k, self._job(self._snap(s), e.heading))], s.id).get(k)
+        if f is not None and f is not e.future:
+            f.cancel()    # it ended between our look and the queue's; its own future still holds the result
+        return e.future
+
+    def _wait(self, s: RoamSession, f: Future) -> _Built | None:
+        """The pre-dream's result, waited for outside the lock; None if it failed (build on demand instead)."""
+        try:
+            return f.result()
+        except CancelledError:
+            raise UnknownSession(s.id) from None
+        except Exception as e:  # noqa: BLE001 - out of memory or broken: build on demand instead
+            if not isinstance(e, GpuUnavailable):
+                log.warning("pre-dream failed (%s); building on demand", type(e).__name__)
+            return None
+
     # --- building a spot --------------------------------------------------------------------
 
     def _snap(self, s: RoamSession) -> _Snap:
@@ -362,6 +398,8 @@ class RoamService:
             self._check_alive(s, paths)
             assert built.parent_id == s.spot.id, "a build from another spot reached commit"
             j = built.journey
+            if s.names is not None:       # the LLM's places, if they landed after this build's snapshot
+                j = _renamed(j, *s.names)
             for fn in s.pending:          # theme or neighbour changes made during this move
                 j = fn(j)
             s.pending = []
@@ -387,7 +425,8 @@ class RoamService:
     def _maybe_refill(self, s: RoamSession) -> None:
         """Ask the LLM for the current place's neighbours, once per place, one refill at a time."""
         with self._lock:
-            if s.journey is None or s.refilling is not None or s.places_for == s.journey.place:
+            if (self._sessions.get(s.id) is not s or s.journey is None or s.refilling is not None
+                    or s.places_for == s.journey.place):
                 return
             place = s.refilling = s.journey.place
             visited, moods = list(s.visited), list(s.moods)
@@ -401,12 +440,25 @@ class RoamService:
                 found = []
             with self._lock:
                 s.refilling, s.places_for = None, place
-                if (found and s.journey is not None and s.journey.place == place
-                        and _renamed(s.journey, place, found).neighbours != s.journey.neighbours):
-                    self._edit(s, lambda j: _renamed(j, place, found))
+                if found and self._sessions.get(s.id) is s and s.journey is not None and s.journey.place == place:
+                    self._rename(s, place, found)
             self._maybe_refill(s)     # the place changed while this ran
 
         self._spawn(refill)
+
+    def _rename(self, s: RoamSession, place: str, found: list) -> None:
+        """Apply the LLM's places without discarding the pre-dreamed set: every move re-applies them to the
+        journey it built (see _commit). Only a player mid-drift toward a renamed neighbour, heading its way, has
+        pre-dreams whose prompts name the wrong place, so only then is the set invalidated. Caller holds the lock."""
+        s.names = (place, found)
+        old, new = s.journey, _renamed(s.journey, place, found)
+        if new is old:
+            return
+        s.journey = new
+        kept = {n.name for n in new.neighbours}
+        if any(old.drift.get(n.name, 0) >= 1 and n.name not in kept and _diff(n.bearing, s.hint) <= TAKE_WITHIN
+               for n in old.neighbours):
+            self._bump(s)
 
     # --- helpers ----------------------------------------------------------------------
 
@@ -494,7 +546,8 @@ class RoamService:
                 j = fn(j)
             s.journey = j
         s.pending = []
-        if s.spot is not None and not s.prefetch:   # a mood/theme change dropped the set mid-move
+        # A mood/theme change dropped the set mid-move, or the move cancelled its queued part: pre-dream again.
+        if s.spot is not None and (not s.prefetch or not all(_alive(e.future) for e in s.prefetch.values())):
             self._submit_set(s)
 
     def _started(self, sid: str) -> RoamSession:

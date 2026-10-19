@@ -21,12 +21,15 @@ class GatedPainter(FakePainter):
     def __init__(self):
         super().__init__()
         self.armed = False
+        self.fail_at = None             # the 1-based step call that raises a CUDA OOM
         self.entered, self.gate = threading.Event(), threading.Event()
 
     def step(self, *a, **kw):
         if self.armed:
             self.entered.set()
             assert self.gate.wait(5)
+        if self.fail_at == len(steps_of(self)) + 1:
+            self.fail_next = True
         return super().step(*a, **kw)
 
 
@@ -534,7 +537,7 @@ def test_fallback_until_the_llm_answers(make):
     assert [n.name for n in s.journey.neighbours] == FakeDreamer.PLACES
     assert [n.bearing for n in s.journey.neighbours] == bearings
     assert s.journey.neighbours[0].scenery == ("a path of 0 stones", "a mossy fence post", "a crooked old tree")
-    assert s.version == version + 1                    # pre-dreamed fallback spots are stale now
+    assert s.version == version                        # not drifting toward anyone: the set is kept
 
 
 def test_refill_skipped_while_one_runs_then_catches_up(make):
@@ -701,3 +704,188 @@ def test_predreaming_never_touches_the_session(svc):
     svc.heading(s.id, s.journey.neighbours[0].bearing)
     wait_set(s)
     assert (s.spot, s.journey, dict(s.journey.drift), s.steps, s.ref, s.version) == before
+
+
+# --- review fixes: places answers keep the set, waiting on a running pre-dream ----------------------
+
+def spy_queue(svc, thread_of):
+    """Events: the move's thread called submit_set, and it submitted an on-demand job."""
+    set_called, demand = threading.Event(), threading.Event()
+    submit, submit_set = svc.queue.submit, svc.queue.submit_set
+
+    def spy_submit(fn, owner, prefetch=False):
+        if threading.current_thread() is thread_of[0] and not prefetch:
+            demand.set()
+        return submit(fn, owner, prefetch=prefetch)
+
+    def spy_set(jobs, owner):
+        out = submit_set(jobs, owner)
+        if threading.current_thread() is thread_of[0]:
+            set_called.set()
+        return out
+
+    svc.queue.submit, svc.queue.submit_set = spy_submit, spy_set
+    return set_called, demand
+
+
+def test_places_answer_keeps_a_finished_set_and_the_move_carries_the_names(make):
+    jobs = []
+    svc = make(spawn=jobs.append)
+    s = started(svc, "forest")
+    wait_set(s)
+    old, version = set_futures(s), s.version
+    jobs.pop()()                                  # the LLM answers; nobody is drifting yet
+    assert s.version == version and set_futures(s) == old
+    v = svc.next(s.id, 0)                         # a spot pre-dreamed from the fallback journey
+    assert v.spot_id == spot_of(next(f for k, f in old.items() if key_heading(k) == 0)).id
+    assert [n.name for n in v.neighbours] == FakeDreamer.PLACES
+    assert [n.name for n in s.journey.neighbours] == FakeDreamer.PLACES
+
+
+def test_places_answer_invalidates_only_mid_drift_toward_a_renamed_neighbour(make):
+    jobs = []
+    svc = make(spawn=jobs.append, queue=ManualQueue())
+    away, toward = started(svc, "forest"), started(svc, "forest")
+    for s in (away, toward):
+        n0 = s.journey.neighbours[0]
+        svc.next(s.id, n0.bearing)                # drift 1 toward n0
+    svc.heading(away.id, (away.journey.neighbours[0].bearing + 180) % 360)   # turned away from it
+    versions = (away.version, toward.version)
+    for f in list(jobs):
+        f()
+    assert away.version == versions[0]
+    assert toward.version == versions[1] + 1
+    assert all(k.startswith(f"{toward.version}:") for k in toward.prefetch)
+    assert toward.journey.drift[FakeDreamer.PLACES[0]] == 1   # drift carried to the new name
+
+
+def test_next_waits_on_a_running_predream_in_the_cone(make):
+    svc = make(painter=GatedPainter())
+    s = svc.new_session()
+    svc.painter.armed = True
+    svc.start(s.id, "forest", [])
+    assert svc.painter.entered.wait(5)            # 0 running; 60 and 300 queued
+    old = {key_heading(k): f for k, f in set_futures(s).items()}
+    thread_of, out = [None], []
+    set_called, demand = spy_queue(svc, thread_of)
+    t = threading.Thread(target=lambda: out.append(svc.next(s.id, 20)))
+    thread_of[0] = t
+    t.start()
+    assert set_called.wait(5)                     # it chose while 0 was still running
+    assert not old[0].done()
+    svc.painter.armed = False
+    svc.painter.gate.set()
+    t.join(5)
+    assert not demand.is_set()
+    assert old[60].cancelled() and old[300].cancelled()
+    assert out[0].spot_id == spot_of(old[0]).id and out[0].heading == 0
+
+
+def test_running_predream_failure_falls_back_to_demand(make, monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    svc = make(painter=GatedPainter())
+    s = svc.new_session()
+    svc.painter.armed = True
+    svc.start(s.id, "forest", [])
+    assert svc.painter.entered.wait(5)
+    old = {key_heading(k): f for k, f in set_futures(s).items()}
+    thread_of, out = [None], []
+    set_called, demand = spy_queue(svc, thread_of)
+    t = threading.Thread(target=lambda: out.append(svc.next(s.id, 20)))
+    thread_of[0] = t
+    t.start()
+    assert set_called.wait(5)
+    svc.painter.armed = False
+    svc.painter.fail_at = 1                       # the running 0 job fails
+    svc.painter.gate.set()
+    t.join(5)
+    assert isinstance(old[0].exception(timeout=0), GpuUnavailable)
+    assert demand.is_set()
+    assert out[0].heading == pytest.approx(20) and s.steps == 1
+
+
+def test_failed_move_resubmits_a_cancelled_set(make, monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    svc = make(painter=GatedPainter())
+    s = svc.new_session()
+    svc.painter.armed = True
+    svc.start(s.id, "forest", [])
+    assert svc.painter.entered.wait(5)            # 0 running; 60 and 300 queued
+    errors, thread_of = [], [None]
+    _, demand = spy_queue(svc, thread_of)
+
+    def move():
+        try:
+            svc.next(s.id, 180)                   # nothing near: 60 and 300 are cancelled, 180 built on demand
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    t = threading.Thread(target=move)
+    thread_of[0] = t
+    t.start()
+    assert demand.wait(5)
+    svc.painter.armed = False
+    svc.painter.fail_at = 2                       # the 0 job finishes, the demand build runs out of memory
+    svc.painter.gate.set()
+    t.join(5)
+    assert len(errors) == 1 and isinstance(errors[0], GpuUnavailable)
+    assert sorted(key_heading(k) for k in s.prefetch) == [0, 60, 300]
+    assert not any(e.future.cancelled() for e in s.prefetch.values())
+    wait_set(s)
+
+
+def test_theme_keeps_the_came_from_place(make):
+    svc = make(queue=ManualQueue())
+    s = started(svc, "forest")
+    target = s.journey.neighbours[0].name
+    bearing, _ = walk_to(svc, s, target)
+    back = (bearing + 180) % 360
+    svc.heading(s.id, back + 10)
+    svc.set_theme(s.id, "volcano")
+    names = {n.name: n.bearing for n in s.journey.neighbours}
+    assert names["forest"] == pytest.approx(back) and names["volcano"] == pytest.approx((back + 10) % 360)
+
+
+def test_refill_after_eviction_submits_nothing(make, monkeypatch):
+    import vecworld.roam.service as service
+
+    monkeypatch.setattr(service, "MAX_SESSIONS", 1)
+    jobs, q = [], ManualQueue()
+    svc = make(spawn=jobs.append, queue=q)
+    a = started(svc, "forest")
+    svc.new_session()                             # evicts a
+    sets = len(q.sets)
+    jobs.pop()()
+    assert len(q.sets) == sets and jobs == []
+    assert [n.name for n in a.journey.neighbours] == fallback_neighbours("forest")
+
+
+def test_commit_after_eviction_mid_move_deletes_its_files(make, monkeypatch):
+    import vecworld.roam.service as service
+
+    monkeypatch.setattr(service, "MAX_SESSIONS", 1)
+    svc = make(painter=GatedPainter())
+    a = started(svc)
+    wait_set(a)
+    svc.painter.armed = True
+    errors = []
+
+    def move():
+        try:
+            svc.next(a.id, 120)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    t = threading.Thread(target=move)
+    t.start()
+    assert svc.painter.entered.wait(5)
+    svc.new_session()                             # the cap evicts a while its move is on the GPU
+    svc.painter.armed = False
+    svc.painter.gate.set()
+    t.join(5)
+    assert len(errors) == 1 and isinstance(errors[0], UnknownSession)
+    assert list(svc.scene_dir.iterdir()) == []
