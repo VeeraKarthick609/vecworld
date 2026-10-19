@@ -227,7 +227,8 @@ async function step(exit) {
 }
 
 // Tell the server the player is in `entry` (walked back into the previous spot, or into a placed child after
-// stepping back): it steps into that spot, no painting. If it refuses, the world re-roots on the server's spot.
+// stepping back): it steps into that spot, no painting. A spot the server no longer holds is dropped from the world
+// (so it can't be walked into again) and the world re-roots on the server's spot.
 async function enterServer(entry) {
   entering = true;
   const from = here;
@@ -237,9 +238,11 @@ async function enterServer(entry) {
     else if (entry.parent === from) cameFrom = (entry.heading + 180) % 360;   // on into the child
     pending = null; pendingFails = 0; stuck = null;
     settle(v, entry);
+    if (world.current !== entry) enterWanted = world.current;   // crossed on meanwhile: that spot next
   } catch (err) {
     toast(err.message);
     if (world.spots.includes(here) && world.current !== here) { world.enter(here, hero.pos); switches++; }
+    if (err.code === "unknown_spot" && entry !== here && world.spots.includes(entry)) world.remove(entry);
   } finally {
     entering = false;
   }

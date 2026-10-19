@@ -397,15 +397,56 @@ def test_walking_back_through_the_parent_and_out_its_far_side(server, browser):
     before, z0 = js(browser, "roam.switches"), js(browser, "roam.world.z")
     key_down(browser, "w")
     try:
-        time.sleep(3)
-        assert js(browser, "roam.switches") - before <= 2
-        assert js(browser, "roam.world.z") > z0 + 1.5                   # kept walking south
+        wait(browser, f"roam.world.z > {z0 + 1.5}", timeout=30)        # kept walking south (by distance, not clock)
+        assert js(browser, "roam.switches") - before <= 2, js(browser, "JSON.stringify(roam)")
         wait(browser, "roam.steps.length === 2")
     finally:
         key_up(browser, "w")
     step = js(browser, "roam.steps")[1]
     assert step["from"] == first and step["inServerSpot"], step
     assert ang(step["exit"], 180) < 20, step
+    assert js(browser, "window.roamErrors") == []
+
+
+def walk(d, bearing, until, timeout=60):
+    """Hold W looking along `bearing` until the JS condition holds."""
+    d.execute_script(f"roamDev.look({bearing}, 0.18)")
+    key_down(d, "w")
+    try:
+        wait(d, until, timeout=timeout)
+    finally:
+        key_up(d, "w")
+
+
+def test_back_into_a_spot_after_exploring_three_ways_from_it(server, browser):
+    """Out and back from the first spot three times (north, east, west): walking back from the third child still
+    steps the server into the first spot, and there is no switching back and forth."""
+    url, svc, _ = server
+    start(browser, url)
+    first = js(browser, "roam.spotId")
+    here = f"roam.spotId === {first!r} && !roam.entering && roam.inServerSpot"
+    away = f"roam.spotId !== {first!r} && roam.inServerSpot && !roam.stepping"
+    walk(browser, 0, away)           # child 1, north
+    walk(browser, 180, here)         # back
+    walk(browser, 90, away)          # child 2, east
+    walk(browser, 270, here)         # back...
+    walk(browser, 270, away)         # ...and on out the far side: child 3, west
+    third = js(browser, "roam.spotId")
+    n = len(svc.calls)
+    browser.execute_script("roamDev.look(90, 0.18)")
+    before, x0 = js(browser, "roam.switches"), js(browser, "roam.world.x")
+    key_down(browser, "w")
+    try:
+        wait(browser, here, timeout=20)          # back in the first spot, the server with it
+        # Kept walking east (by distance: a loaded machine runs the game slower than the clock), with at most the
+        # switch back plus one on into a new spot on the way.
+        wait(browser, f"roam.world.x > {x0 + 1.5}", timeout=30)
+        assert js(browser, "roam.switches") - before <= 2, js(browser, "JSON.stringify(roam)")
+    finally:
+        key_up(browser, "w")
+    assert ("enter", first) in svc.since(n)
+    assert js(browser, "roam.spotId") != third
+    assert "faded" not in (js(browser, "document.getElementById('toast').textContent") or "")
     assert js(browser, "window.roamErrors") == []
 
 

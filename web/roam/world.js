@@ -331,6 +331,7 @@ export class World {
     e.group.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.map?.dispose(); o.material.dispose(); } });
     this.spots = this.spots.filter(s => s !== e);
     if (this.override === e) this.override = null;
+    if (this.fade && (this.fade.from === e || this.fade.to === e)) this.fade = null;   // never draw a freed spot
   }
 
   render(renderer, scene, camera) {

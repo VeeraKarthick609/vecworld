@@ -267,10 +267,19 @@ class RoamService:
                     j = v.journey
                     if s.names is not None:   # the LLM's places, if they landed after it was current
                         j = _renamed(j, *s.names, s.typed)
+                    # Places typed since stay where they were typed.
+                    have = {n.name.lower() for n in j.neighbours}
+                    for n in s.journey.neighbours:
+                        if n.name.lower() in s.typed and n.name.lower() not in have:
+                            j = _with_place(j, n.name, n.bearing)
                     s.spot, s.spot_stats, s.journey, s.ref = v.spot, v.spot_stats, j, v.ref
+                    s.files.remove(v.paths)   # the most recent now: its files are the last to go
+                    s.files.append(v.paths)
                     s.prefetch = {}
                     self._submit_set(s)
-                return self._view(s, s.visits[s.spot.id].paths, None)
+                view = self._view(s, s.visits[s.spot.id].paths, None)
+            self._forget_files(s)
+            return view
 
     def _ancestors(self, s: RoamSession) -> list[str]:
         """The ids the current spot was built from, nearest first, as far back as the session still holds."""
@@ -569,11 +578,20 @@ class RoamService:
             raise UnknownSession(s.id)
 
     def _forget_files(self, s: RoamSession, keep: int = KEEP_SPOTS) -> None:
-        """Delete the session's spot files but the newest `keep` spots'."""
+        """Delete the session's spot files but the `keep` most recently made or entered spots', and (keep > 0)
+        always the way back and forth: the current spot, its parent and its newest child."""
         with self._lock:
-            old = s.files[:max(0, len(s.files) - keep)]
-            del s.files[:len(old)]
-            s.visits = {k: v for k, v in s.visits.items() if v.paths in s.files}
+            wanted = set(s.files[max(0, len(s.files) - keep):]) if keep else set()
+            if keep and s.spot is not None and (cur := s.visits.get(s.spot.id)) is not None:
+                wanted.add(cur.paths)
+                if cur.parent_id in s.visits:
+                    wanted.add(s.visits[cur.parent_id].paths)
+                children = [v.paths for v in s.visits.values() if v.parent_id == s.spot.id]
+                if children:
+                    wanted.add(max(children, key=s.files.index))
+            old = [pair for pair in s.files if pair not in wanted]
+            s.files = [pair for pair in s.files if pair in wanted]
+            s.visits = {k: v for k, v in s.visits.items() if v.paths in wanted}
         for pair in old:
             for p in pair:
                 p.unlink(missing_ok=True)

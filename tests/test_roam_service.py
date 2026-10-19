@@ -974,7 +974,7 @@ def test_enter_the_parent_restores_it_and_next_builds_its_child(make):
     assert (v.distance, v.scale, v.place) == (0.0, 1.0, "forest")
     assert s.journey is a_journey and s.ref == a_ref and s.journey.drift[target.name] == 0
     assert all(f":{a}:" in k for k in s.prefetch) and len(s.prefetch) == 3   # pre-dreaming around the parent
-    assert s.files == files and all(p.exists() for pair in files for p in pair)
+    assert sorted(s.files) == sorted(files) and all(p.exists() for pair in files for p in pair)
     c = svc.next(s.id, (target.bearing + 120) % 360)
     assert s.visits[c.spot_id].parent_id == a and c.spot_id != b_view.spot_id
     assert c.place == "forest"
@@ -1036,3 +1036,32 @@ def test_enter_is_busy_during_a_move(make):
         svc.painter.gate.set()
         t.join(5)
     assert s.busy is False
+
+
+def test_the_way_back_survives_many_children(make):
+    """Exploring several directions from one spot (out, back, out again) never deletes that spot's files: the
+    current spot's parent is always kept, and so is its newest child."""
+    svc = make(queue=ManualQueue())
+    s = started(svc)
+    a = s.spot.id
+    children = []
+    for heading in (0, 90, 180, 270):
+        children.append(svc.next(s.id, heading).spot_id)
+        assert a in s.visits and all(p.exists() for p in s.visits[a].paths)
+        assert svc.enter(s.id, a).spot_id == a           # back into the first spot
+        assert children[-1] in s.visits                   # the child just left is still there to walk into
+    assert svc.enter(s.id, children[-1]).spot_id == children[-1]
+    assert svc.enter(s.id, a).spot_id == a
+    assert len(s.files) <= 4
+
+
+def test_typed_place_survives_stepping_back(make):
+    svc = make(queue=ManualQueue())
+    s = started(svc)
+    a = s.spot.id
+    svc.next(s.id, 0)
+    svc.set_theme(s.id, "volcano")
+    assert any(n.name == "volcano" for n in s.journey.neighbours)
+    svc.enter(s.id, a)
+    volcano = [n for n in s.journey.neighbours if n.name == "volcano"]
+    assert len(volcano) == 1 and volcano[0].bearing == pytest.approx(0)
