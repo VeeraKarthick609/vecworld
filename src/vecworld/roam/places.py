@@ -10,7 +10,6 @@ from dataclasses import dataclass
 DRIFT_SPOTS = 3  # consecutive spots walked toward a neighbour before you arrive there
 CONE_DEG = 45.0  # heading within this of a bearing counts as walking toward it
 MIN_SEPARATION = 60.0
-_STEP_WEIGHT = 0.25  # neighbour's share of the prompt blend per spot of drift (arrival at DRIFT_SPOTS)
 
 FALLBACK_PLACES: dict[str, list[str]] = {
     "forest": ["lake", "village", "mountain", "meadow"],
@@ -103,19 +102,16 @@ class Journey:
 
     def step(self, heading: float) -> DriftState:
         """One spot walked on `heading`. Drift +1 for the neighbour within 45 degrees, others reset."""
-        toward = None
+        inside = [n for n in self.neighbours if _angle_diff(heading, n.bearing) <= CONE_DEG]
+        toward = min(inside, key=lambda n: _angle_diff(heading, n.bearing), default=None)
         for n in self.neighbours:
-            if toward is None and _angle_diff(heading, n.bearing) <= CONE_DEG:
-                toward = n
-                self.drift[n.name] += 1
-            else:
-                self.drift[n.name] = 0
+            self.drift[n.name] = self.drift[n.name] + 1 if n is toward else 0
         if toward is None:
             return DriftState([(self.place, 1.0)], "", None)
         d = self.drift[toward.name]
         if d >= DRIFT_SPOTS:
             return DriftState([(toward.name, 1.0)], "", toward.name)
-        w = _STEP_WEIGHT * d
+        w = d / DRIFT_SPOTS
         return DriftState([(self.place, 1 - w), (toward.name, w)], toward.scenery[min(d, len(toward.scenery)) - 1], None)
 
     def arrive(self, name: str, new_names: list[str], rng,

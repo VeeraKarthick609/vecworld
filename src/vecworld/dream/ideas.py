@@ -185,12 +185,13 @@ class QwenDreamer:
         from vecworld.roam.places import fallback_neighbours  # lazy: roam.places must not import this module
 
         text = self._generate(places_request(place, journey, moods, n), 40 * n + 20)
+        seen = {j.lower() for j in journey} | {place.lower()}
         found = [(nm, sc) for nm, sc in parse_places(text, n + len(journey) + 1)
-                 if nm != place.lower() and nm not in journey][:n]
+                 if nm not in seen][:n]
         have = {nm for nm, _ in found}
         for nm in fallback_neighbours(place):
             if len(found) >= n:
                 break
-            if nm not in have and nm != place.lower() and nm not in journey:
+            if nm not in have and nm not in seen:
                 found.append((nm, GENERIC_SCENERY))
         return found

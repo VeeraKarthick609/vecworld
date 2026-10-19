@@ -64,3 +64,12 @@ def test_qwen_places_filters_and_fills_from_fallbacks_without_a_model():
     out = d.places("forest", ["village"], [], 3)
     assert out[0][0] == "reed marsh" and len(out) == 3 and all(len(sc) == 3 for _, sc in out)
     assert {n for n, _ in out}.isdisjoint({"forest", "village"}) and len({n for n, _ in out}) == 3
+
+
+def test_qwen_places_excludes_journey_case_insensitively():
+    from vecworld.dream.ideas import QwenDreamer
+
+    d = object.__new__(QwenDreamer)
+    d._generate = lambda messages, max_new_tokens: "Old Mill: a creaking wheel; a mossy weir; a stack of sacks\n"
+    out = d.places("Forest", ["Old Mill"], [], 2)
+    assert "old mill" not in [n for n, _ in out] and "forest" not in [n for n, _ in out]

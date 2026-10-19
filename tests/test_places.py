@@ -50,9 +50,9 @@ def test_drift_advances_toward_a_neighbour_then_arrives():
     s = j.step(80.0)
     assert j.drift["lake"] == 1 and s.arrived is None and s.scenery == "reeds"
     assert s.weights[0][0] == "forest" and s.weights[1][0] == "lake"
-    assert s.weights[0][1] + s.weights[1][1] == pytest.approx(1.0) and 0 < s.weights[1][1] < 1
+    assert s.weights[1][1] == pytest.approx(1 / 3) and s.weights[0][1] == pytest.approx(2 / 3)
     s2 = j.step(100.0)
-    assert j.drift["lake"] == 2 and s2.weights[1][1] > s.weights[1][1] and s2.scenery == "mud"
+    assert j.drift["lake"] == 2 and s2.weights[1][1] == pytest.approx(2 / 3) and s2.scenery == "mud"
     s3 = j.step(135.0)  # exactly 45 degrees off still counts
     assert s3.arrived == "lake" and j.drift["lake"] == DRIFT_SPOTS
 
@@ -127,3 +127,12 @@ def test_parse_places_missing_scenery_is_padded_and_bad_phrases_dropped():
         assert len(sc) == 3 and all(2 <= len(p.split()) <= 8 for p in sc)
     assert out[1][1][0] == "a rusty gate" and "whispers" not in out[1][1]
     assert parse_places("", 3) == [] and parse_places("Here are some:\n", 3) == []
+
+
+def test_overlapping_cones_pick_the_nearest_neighbour():
+    ns = [Neighbour("origin", 190.0, ("a", "b", "c")), Neighbour("near", 120.0, ("x", "y", "z"))]
+    j = Journey("here", ns)
+    j.step(160.0)  # origin 30 off, near 40 off: origin nearer
+    assert j.drift == {"origin": 1, "near": 0}
+    j.step(150.0)  # origin 40 off, near 30 off: near wins, origin resets
+    assert j.drift == {"origin": 0, "near": 1}
