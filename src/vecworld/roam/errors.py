@@ -1,4 +1,4 @@
-"""Errors the Dream Walk service raises; each maps to an HTTP status and a stable code."""
+"""Errors the Dream Roam service raises; each maps to an HTTP status and a stable code."""
 
 
 class GameError(Exception):
@@ -24,10 +24,6 @@ class UnknownSpot(GameError):
 
 class GpuUnavailable(GameError):
     status, code = 503, "gpu_unavailable"
-
-
-class UnknownLabel(GameError):
-    status, code = 400, "unknown_label"
 
 
 class UnknownSession(GameError, KeyError):

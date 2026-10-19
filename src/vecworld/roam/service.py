@@ -19,11 +19,11 @@ from pathlib import Path
 from typing import Callable
 
 from vecworld.config import MAX_SESSIONS, MAX_THEME_CHARS, MOOD_BG_STRENGTH, MOOD_WORDS, MOODS, SESSION_TTL, STYLE
-from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownSession, UnknownSpot
 from vecworld.dream.gpu import GpuQueue, Stopped
 from vecworld.dream.ideas import Dreamer
 from vecworld.dream.painter import Painter, Prompt
 from vecworld.roam.depth import DepthEstimator, depth_png
+from vecworld.roam.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownSession, UnknownSpot
 from vecworld.roam.places import (GENERIC_SCENERY, MIN_SEPARATION, Journey, Neighbour, assign_bearings,
                                   fallback_neighbours)
 from vecworld.roam.session import Predream, RoamSession, SpotView, Visit

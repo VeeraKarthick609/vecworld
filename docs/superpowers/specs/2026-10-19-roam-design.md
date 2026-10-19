@@ -77,6 +77,22 @@ Spikes: free roam at `/tmp/pano3d/` (`gen.py`, `index.html`, served on `:8092`),
   - **Movement:** camera-relative, and the character turns toward its direction of travel. Movement is clamped to a radius LIMIT = 0.55·NEAR.
   - **Known spike artefacts:** torn trunk edges, a raised ridge where ground meets the trees, and a streaky ground disc.
 
+- **Measured end to end on the built game** (2026-10-19, Task 9; real server on the laptop, headless Chrome on the Mac driving the keyboard, brisk walking toward a neighbour; server build times from a timing wrapper):
+
+  | journey | spots | start → first spot | spot build (server) | fogs while walking | fog lengths | arrived at |
+  |---|---|---|---|---|---|---|
+  | haunted forest + night | 8 in 43.6 s | 3.9 s | 4.96–5.53 s, median 5.30 | 8 (11/min), 15.1 s in all | 0.03–5.0 s | lake (spot 3), then marsh |
+  | desert oasis | 8 in 58.3 s | 2.8 s | 5.17–5.44 s, median 5.22 | 9 (9.3/min), 20.5 s | 0.02–5.1 s | desert dunes (spot 3), then oasis |
+  | snowy mountains | 8 in 52.4 s | 5.6 s | 5.21–5.60 s, median 5.32 | 9 (10.3/min), 19.0 s | 0.08–7.9 s | snowy peak trail (spot 3), then village |
+  | haunted forest + night, **running** | 8 in 52.9 s | 5.7 s | 5.23–5.59 s, median 5.33 | 10 (11.3/min), 33.4 s | 0.03–7.1 s | haunted glen (spot 3), then village |
+
+  - The first spot builds in 2.6–3.6 s; the rest of "start → first spot" is the depth/image download and the mesh.
+  - Spots follow each other every 5.2–5.7 s while walking (10–10.5 s after an on-demand build). The game is GPU-throughput bound: about 5.3 s per spot against at most ~5.7 s of walking rim to rim, so the heading pre-dream is usually still running at the edge ("waited" served 28 of 34 moves, "demand" 5, a finished pre-dream 1). Running only lengthens the fogs.
+  - Peak GPU memory 3764 MiB of 4096 (2662 MiB with the server idle).
+  - Frame time on the Mac's headless Chrome (Metal): p50 16.7 ms, p99 16.8 ms (vsync-bound 60 fps).
+  - The places LLM takes 9.4–22.4 s per answer on the CPU. The first LLM places landed 12–23 s after the start build began; in two of the four journeys the player had already arrived at a fallback neighbour by then, so the LLM's names for the start place were never seen.
+  - Walking 180° back returned into the kept spots without a fog in two of three journeys; in the snowy one the back walk left the current spot sideways into a new spot (a 4.5 s fog).
+
 ## 6. How it works
 
 - **Spots and transitions:**

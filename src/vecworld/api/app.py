@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from vecworld.dream.errors import GameError
+from vecworld.roam.errors import GameError
 from vecworld.roam.service import RoamService, SpotView
 
 

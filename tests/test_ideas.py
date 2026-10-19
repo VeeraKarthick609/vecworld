@@ -1,4 +1,4 @@
-from vecworld.dream.ideas import FALLBACK_IDEAS, ideas_request, parse_ideas
+from vecworld.dream.ideas import FALLBACK_IDEAS, ideas_request, parse_ideas, parse_places
 
 
 def test_parse_ideas_cleans_and_bounds():
@@ -73,3 +73,9 @@ def test_qwen_places_excludes_journey_case_insensitively():
     d._generate = lambda messages, max_new_tokens: "Old Mill: a creaking wheel; a mossy weir; a stack of sacks\n"
     out = d.places("Forest", ["Old Mill"], [], 2)
     assert "old mill" not in [n for n, _ in out] and "forest" not in [n for n, _ in out]
+
+
+def test_parse_places_drops_the_format_line_echoed_back():
+    # Seen live (desert oasis, 2026-10-19): signposts named "name" and "phrase".
+    text = "Name: phrase; phrase; phrase\nPhrase: phrase; phrase\nPalm grove: tall date palms; a clay well; reeds"
+    assert [p[0] for p in parse_places(text, 3)] == ["palm grove"]

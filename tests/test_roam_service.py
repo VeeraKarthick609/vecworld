@@ -7,7 +7,7 @@ from conftest import FakeDepth, FakeDreamer, FakePainter
 from PIL import Image
 
 from vecworld.config import MOOD_BG_STRENGTH, MOOD_WORDS, SESSION_TTL, STYLE
-from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownSession, UnknownSpot
+from vecworld.roam.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownSession, UnknownSpot
 from vecworld.roam.places import fallback_neighbours
 from vecworld.roam.service import RoamService, SpotView
 from vecworld.scenes.palette import palette_stats

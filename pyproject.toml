@@ -1,7 +1,7 @@
 [project]
 name = "vecworld"
 version = "0.1.0"
-description = "Dream Walk: wander a painted 360° dreamscape"
+description = "Dream Roam: roam a painted 360° dream world in third person"
 readme = "README.md"
 authors = [
     { name = "Veera", email = "veerakarthick609@gmail.com" }

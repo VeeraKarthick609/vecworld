@@ -1,6 +1,5 @@
 from pathlib import Path
 
-HOTSPOT_MIN = 0.3          # CLIPSeg peaks below this were wrong objects (gorilla 0.22 on an elephant)
 # A walk step schedules STEP_STEPS timesteps; the background is plain img2img at BG_STRENGTH of them.
 STEP_STEPS = 4
 # Each step is pulled this far back toward the reference panorama's LAB palette (reset by theme/mood).
@@ -12,7 +11,7 @@ STYLE = "impressionist oil painting, visible brushstrokes, dreamlike atmosphere"
 
 SCENE_DIR = Path("var/scenes")
 
-# Dream Walk: seamless cylindrical panorama
+# The painter: seamless cylindrical panorama
 PANO_W = 2048
 PANO_H = 512
 WIN = 64                   # latent window size
@@ -24,16 +23,7 @@ DOLLY = 1.15
 BG_STRENGTH = 0.6
 FOCUS_HALF = 0.08
 FOCUS_FEATHER = 0.06
-KEEP_OFFSET = 0.17
-KEEP_MAX_W = 0.1           # a label wider (fraction of the panorama) or taller than this is scenery, not an object
-KEEP_MAX_H = 0.6
-MAX_KEEPS = 2              # consecutive steps that keep what you walk toward, then it is walked past
 MOOD_BG_STRENGTH = 0.8     # background img2img strength of the first step after a mood change
-MAX_LABEL_AREA = 0.5       # CLIPSeg boxes covering more of the 512 crop than this (or taller than
-MAX_LABEL_H = 0.85         # MAX_LABEL_H) are the whole view, not the discovery
-QUIET_EVERY = 3
-DRIFT_STEPS = 3
-PREFETCH_TOLERANCE = 45.0
 MOODS = ("foggy", "night", "rain", "snow", "eerie", "warm")   # the chips; their prompt words below
 MOOD_WORDS = {
     "night": "at night, dark night sky, cold moonlight, deep shadows",

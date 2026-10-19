@@ -38,7 +38,7 @@ _WEATHER_STEMS = ("star", "snowflake", "moonlight", "frost", "glow", "fog", "mis
 _WEATHER_WORDS = {w + s for w in _WEATHER_STEMS for s in ("", "s")}
 _CHATTER = re.compile(r"^(?:here are|here is|sure|certainly|okay|ok)\b")
 MAX_PHRASE_CHARS = 48
-GEN_THREADS = 8  # of 16 logical cores; leave the rest for CLIPSeg on the step path
+GEN_THREADS = 8  # of 16 logical cores; leave the rest for the step path
 
 
 def is_visual(phrase: str) -> bool:
@@ -86,6 +86,7 @@ def ideas_request(theme: str, moods: list[str], n: int) -> list[dict]:
 
 GENERIC_SCENERY = ("a winding path", "a quiet clearing", "a weathered signpost")
 MAX_NAME_WORDS = 4
+_TEMPLATE = {"name", "phrase", "place"}   # the format line, echoed back as a place
 
 
 def places_request(place: str, journey: list[str], moods: list[str], n: int) -> list[dict]:
@@ -119,7 +120,7 @@ def parse_places(text: str, n: int) -> list[tuple[str, tuple[str, ...]]]:
         head, _, tail = line.partition(":")
         name = _clean(head)
         if (not name or not 1 <= len(name.split()) <= MAX_NAME_WORDS or len(name) > MAX_PHRASE_CHARS
-                or not _PHRASE.match(name) or name in (o[0] for o in out)):
+                or not _PHRASE.match(name) or name in _TEMPLATE or name in (o[0] for o in out)):
             continue
         phrases: list[str] = []
         for part in tail.split(";"):

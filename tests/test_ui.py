@@ -77,7 +77,7 @@ class RecordingService(RoamService):
     def enter(self, sid, spot_id):
         self._rec("enter", spot_id)
         if self.refuse_enter:
-            from vecworld.dream.errors import UnknownSpot
+            from vecworld.roam.errors import UnknownSpot
 
             raise UnknownSpot("That spot has faded from the dream.")
         return super().enter(sid, spot_id)
