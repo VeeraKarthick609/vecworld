@@ -1,4 +1,4 @@
-"""Pure panorama maths for the wrap-around Dream Walk canvas (no torch)."""
+"""Pure panorama maths for the wrap-around 360-degree panorama (no torch)."""
 import math
 
 import numpy as np

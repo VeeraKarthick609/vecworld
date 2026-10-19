@@ -1,38 +1,22 @@
-"""Discoveries for the dream walk: short phrases from a small local LLM.
+"""The dreamer: neighbouring places and their in-between scenery from a small local LLM.
 
 Only parsed phrases ever leave this module; raw model output is never logged.
 """
 from __future__ import annotations
 
-import random
 import re
 import threading
 from typing import Protocol
 
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 
-FALLBACK_IDEAS: tuple[str, ...] = (
-    "an old lantern on a post",
-    "a ruined stone archway",
-    "a still pond",
-    "a lone wooden bench",
-    "a crooked wooden fence",
-    "a mossy stone well",
-    "a narrow footbridge",
-    "a weathered signpost",
-    "a small stone shrine",
-    "an abandoned cart",
-    "a twisted old tree",
-    "a flickering campfire",
-)
-
 _BULLET = re.compile(r"^\s*(?:\d+\s*[.)]|[-*•]+)\s*")
-_PHRASE = re.compile(r"^[^\W_]+(?:[ '\-][^\W_]+)*$")  # letters+digits: the brief test needs "thing number 7"
-# Discoveries are painted and then located by CLIPSeg, so they must be visible things.
+_PHRASE = re.compile(r"^[^\W_]+(?:[ '\-][^\W_]+)*$")  # letters and digits, words joined by space, ' or -
+# Scenery phrases are painted, so they must be visible things.
 _NON_VISUAL_STEMS = ("whisper", "laugh", "echo", "sound", "silen", "scent", "smell", "feeling",
                      "memor", "voice", "music")
 _NON_VISUAL_WORDS = {"wind", "winds", "windy"}
-# Weather and light are painted by the mood, and CLIPSeg can't box them: not discoveries. Rejected
+# Weather and light are painted by the mood, not by a scenery phrase. Rejected
 # as the head noun (last word) or as a word of their own, so "a misty pond" and "glowing mushrooms" stay.
 _WEATHER_STEMS = ("star", "snowflake", "moonlight", "frost", "glow", "fog", "mist")
 _WEATHER_WORDS = {w + s for w in _WEATHER_STEMS for s in ("", "s")}
@@ -48,40 +32,6 @@ def is_visual(phrase: str) -> bool:
 
 
 _EDGE = " \t\"'“”‘’`.,;:!?*_()"
-
-
-def parse_ideas(text: str, limit: int = 8) -> list[str]:
-    """Short visible-object phrases from the model's list. Chatter lines ("Here are...", "Objects:") are
-    dropped; a one- or two-line answer is a comma list, otherwise each line's text after a comma is a
-    description of it ("a stone well, covered in moss") and is dropped too."""
-    out: list[str] = []
-    lines = [l for l in (_BULLET.sub("", l).strip() for l in text.splitlines()) if l]
-    lines = [l for l in lines if not (l.endswith(":") or _CHATTER.match(l.lower()))]
-    split = len([l for l in text.splitlines() if l.strip()]) < 3
-    for line in lines:
-        for part in line.split(",") if split else line.split(",")[:1]:
-            p = _BULLET.sub("", part).strip(_EDGE).lower()
-            p = " ".join(p.split())
-            if (not (2 <= len(p.split()) <= 8) or len(p) > MAX_PHRASE_CHARS or not _PHRASE.match(p) or p in out
-                    or not is_visual(p)):
-                continue
-            out.append(p)
-            if len(out) >= limit:
-                return out
-    return out
-
-
-def ideas_request(theme: str, moods: list[str], n: int) -> list[dict]:
-    """The chat messages asking the model for n discoveries."""
-    mood = f" ({', '.join(moods)})" if moods else ""
-    return [
-        {"role": "system", "content": "You invent evocative scenery for a painted dreamscape."},
-        {"role": "user", "content": (
-            f"List {n} short noun phrases (2 to 6 words each) naming concrete, visible objects or "
-            f'landmarks one might come upon while wandering in "{theme}"{mood}. Only things you '
-            "could photograph: no sounds, smells, feelings or weather. "
-            "One per line, no numbering, no explanations.")},
-    ]
 
 
 GENERIC_SCENERY = ("a winding path", "a quiet clearing", "a weathered signpost")
@@ -137,7 +87,6 @@ def parse_places(text: str, n: int) -> list[tuple[str, tuple[str, ...]]]:
 
 
 class Dreamer(Protocol):
-    def ideas(self, theme: str, moods: list[str], n: int) -> list[str]: ...
     def places(self, place: str, journey: list[str], moods: list[str], n: int
                ) -> list[tuple[str, tuple[str, ...]]]: ...
 
@@ -167,19 +116,6 @@ class QwenDreamer:
             finally:
                 self._torch.set_num_threads(prev)
         return self.tok.decode(ids[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-
-    def ideas(self, theme: str, moods: list[str], n: int) -> list[str]:
-        text = self._generate(ideas_request(theme, moods, n), 96)
-        found = parse_ideas(text, n)
-        if len(found) < n:
-            pool = list(FALLBACK_IDEAS)
-            random.shuffle(pool)
-            for p in pool:
-                if len(found) >= n:
-                    break
-                if p not in found:
-                    found.append(p)
-        return found
 
     def places(self, place: str, journey: list[str], moods: list[str], n: int
                ) -> list[tuple[str, tuple[str, ...]]]:

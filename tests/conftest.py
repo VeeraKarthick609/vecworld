@@ -33,18 +33,10 @@ class FakePainter:
 
 
 class FakeDreamer:
-    """Canned discoveries; records every call."""
-
-    IDEAS = ["an old lantern on a post", "a ruined stone chapel", "a misty pond",
-             "a lone wooden bench", "a mossy stone well", "a crooked fence"]
+    """Canned places; records every call."""
 
     def __init__(self):
-        self.calls: list[tuple[str, list[str], int]] = []
         self.place_calls: list[tuple[str, list[str], list[str], int]] = []
-
-    def ideas(self, theme, moods, n):
-        self.calls.append((theme, list(moods), n))
-        return [self.IDEAS[i % len(self.IDEAS)] for i in range(n)]
 
     PLACES = ["old mill", "reed marsh", "pine ridge", "stone bridge"]
 

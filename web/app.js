@@ -142,6 +142,7 @@ let exitBearing = null;   // where the pending /next leads (for the fog)
 let moodsPending = false; // a chip changed while /start was in flight
 const steps = [];         // every step taken, for the tests
 let cameFrom = null;      // the bearing back the way the player came
+let arrival = null;       // {entry, place}: a spot whose move arrived at a place, told when the player gets there
 let hint = { at: -Infinity, heading: 0 }, hintCount = 0;
 const hints = [];         // the last hints sent, {t, heading}, for the tests
 
@@ -151,7 +152,12 @@ function settle(v, entry) {
   here = entry;
   signposts.set(entry, v.neighbours);
   compass.set(v.neighbours, v.place, cameFrom);
-  if (v.arrived) toast(`Arrived at ${v.arrived}`);
+  arrival = v.arrived ? { entry, place: v.arrived } : null;
+}
+
+// A spot the player is now in: its arrival (if the move to it arrived at a place) is told once, now.
+function arrive(entry) {
+  if (arrival && arrival.entry === entry) { toast(`Arrived at ${arrival.place}`); arrival = null; }
 }
 
 async function begin(place) {
@@ -224,10 +230,14 @@ async function step(exit, walked) {
     pending = null; pendingFails = 0;
     const from = here;
     world.placeChild(from, v.heading, v.distance, v.scale, s);
-    // Waiting at the rim: in now. Otherwise the player switches on walking in (World.update).
-    if (braking && world.current === from) { world.enter(s, hero.pos); switches++; }
     cameFrom = (v.heading + 180) % 360;
     settle(v, s);
+    // Waiting at the rim it was asked for: in now. Otherwise (walking on, or waiting at another rim after
+    // turning round) the player switches on walking in (World.update).
+    const p = hero.pos, at = (Math.atan2(p.x, -p.y) * 180 / Math.PI + 360) % 360;
+    if (braking && world.current === from && Math.abs(rel(exit, at)) <= RETRY_TURN) {
+      world.enter(s, hero.pos); switches++; arrive(s);
+    }
   } finally {
     stepping = false;
     exitBearing = null;
@@ -399,7 +409,7 @@ function play(dt, now) {
   hero.collide(moved, dt, world.k);
   const dir = hero.dir.lengthSq() ? hero.dir.clone() : null;
   const to = world.update(p, dir);
-  if (to) { switches++; if (to !== here) enterWanted = to; }
+  if (to) { switches++; if (to !== here) enterWanted = to; else arrive(to); }
   if (enterWanted && !stepping && !entering) {
     if (enterWanted === world.current && enterWanted !== here) enterServer(enterWanted);
     enterWanted = null;

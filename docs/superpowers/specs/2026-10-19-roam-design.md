@@ -91,7 +91,7 @@ Spikes: free roam at `/tmp/pano3d/` (`gen.py`, `index.html`, served on `:8092`),
   - Peak GPU memory 3764 MiB of 4096 (2662 MiB with the server idle).
   - Frame time on the Mac's headless Chrome (Metal): p50 16.7 ms, p99 16.8 ms (vsync-bound 60 fps).
   - The places LLM takes 9.4–22.4 s per answer on the CPU. The first LLM places landed 12–23 s after the start build began; in two of the four journeys the player had already arrived at a fallback neighbour by then, so the LLM's names for the start place were never seen.
-  - Walking 180° back returned into the kept spots without a fog in two of three journeys; in the snowy one the back walk left the current spot sideways into a new spot (a 4.5 s fog).
+  - Walking 180° back returned into the kept spots without a fog in two of three journeys; in the snowy one a forward step (toward farm) was still in flight when the player turned back, and it landed while the player waited at the back rim: the viewer entered it from there, moving that spot to the player, with an "Arrived at farm" toast and a 4.5 s fog. Fixed since: a landed spot is entered at once only from the rim it was asked for, and its arrival is told when the player enters it.
 
 ## 6. How it works
 

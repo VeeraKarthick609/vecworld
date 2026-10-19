@@ -518,10 +518,11 @@ def test_back_in_a_spot_its_oldest_child_is_walked_into_again(server, browser):
 def test_a_refused_enter_drops_the_spot_and_does_not_loop(server, browser):
     """The server no longer holds the spot walked back into (unknown_spot): the viewer says so, drops it, re-roots
     on the server's spot, asks only once, and the next step goes out from that spot."""
-    url, svc, _ = server
+    url, svc, painter = server
     start(browser, url)
     first, second = step_into_a_child(browser, svc)
     svc.refuse_enter = True
+    painter.gate.clear()                 # no further step can land before the checks below
     n = len(svc.calls)
     browser.execute_script("roamDev.look(180, 0.18)")
     key_down(browser, "w")
@@ -536,12 +537,53 @@ def test_a_refused_enter_drops_the_spot_and_does_not_loop(server, browser):
     # the client's current spot is the second one, and it is the server's spot
     assert js(browser, "roamDev.world.current.meta.spot_id") == second
     assert js(browser, "roam.spotId") == second and js(browser, "roam.inServerSpot")
-    assert len(js(browser, "roam.steps")) == 1
-    walk(browser, 180, "roam.steps.length === 2 && !roam.stepping", timeout=30)   # on that way: a new spot
+    steps = js(browser, "roam.steps")
+    assert len(steps) == 1 or (len(steps) == 2 and js(browser, "roam.stepping")), steps   # none has landed
+    painter.gate.set()
+    walk(browser, 180, "roam.steps.length >= 2 && !roam.stepping", timeout=30)   # on that way: a new spot
     step = js(browser, "roam.steps")[1]
     assert step["from"] == second and step["inServerSpot"], step
     assert [a for a, _ in svc.since(n, "enter")] == [first]        # asked once, no retry storm
     assert first not in js(browser, "roam.spotIds")
+    assert js(browser, "window.roamErrors") == []
+
+
+def test_a_step_that_lands_while_braking_at_the_far_rim_is_not_entered(server, browser):
+    """A step asked for northward lands while the player has turned round and is waiting at the south rim: the
+    player stays put (not moved into the spot ahead), no arrival toast, and the spot is walked into later."""
+    url, svc, painter = server
+    painter.gate.clear()                 # every step blocks until released
+    start(browser, url)
+    first = js(browser, "roam.spotId")
+    walk(browser, 0, "roam.stepping")    # the step north is out
+    browser.execute_script("roamDev.look(180, 0.18)")
+    key_down(browser, "w")               # held throughout: braking at the south rim when the step lands
+    try:
+        wait(browser, "roam.braking && roamDev.hero.speed < 0.02", timeout=30)
+        pos = js(browser, "roam.pos")
+        assert pos["z"] > 0 and radius(browser) >= 0.9 * rim(browser)
+        browser.execute_script("document.getElementById('toast').hidden = true")
+        painter.gate.set()                # the north step lands...
+        time.sleep(0.05)
+        painter.gate.clear()              # ...and nothing after it (the walk back's own step would)
+        wait(browser, "roam.spotIds.length === 2")
+        ahead = next(x for x in js(browser, "roam.spotIds") if x != first)    # the spot dreamed north
+        state = js(browser, "JSON.stringify({cur: roamDev.world.current.meta.spot_id, pos: roam.pos, "
+                            "shift: roamDev.world.landShift, toast: document.getElementById('toast').hidden ? '' : "
+                            "document.getElementById('toast').textContent})")
+    finally:
+        key_up(browser, "w")
+    import json
+    state = json.loads(state)
+    assert state["cur"] == first, state                     # not entered from this rim
+    assert math.hypot(state["pos"]["x"] - pos["x"], state["pos"]["z"] - pos["z"]) < 0.05, (pos, state)
+    assert "Arrived" not in state["toast"], state
+    painter.gate.set()
+    wait(browser, "roamDev.hero.speed < 0.01 && !roam.entering && !roam.stepping")
+    assert ahead in js(browser, "roam.spotIds")
+    to_the_middle(browser)
+    walk(browser, 0, f"roamDev.world.current.meta.spot_id === {ahead!r} && roam.inServerSpot && !roam.entering",
+         timeout=40)                      # still there to walk into, the way it was dreamed
     assert js(browser, "window.roamErrors") == []
 
 
@@ -713,7 +755,8 @@ def test_walking_toward_a_place_arrives(server, browser):
     browser.execute_script(f"roamDev.look({target['bearing']}, 0.18)")
     key_down(browser, "w")
     try:
-        wait(browser, f"roam.place === {target['name']!r}", timeout=120)
+        # the toast comes when the player is in the spot that arrived (not when the server moves there)
+        wait(browser, f"roam.place === {target['name']!r} && roam.inServerSpot", timeout=120)
     finally:
         key_up(browser, "w")
     wait(browser, TOAST)
