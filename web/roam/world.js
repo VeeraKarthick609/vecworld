@@ -245,12 +245,19 @@ export class World {
     const outward = moving && dir.x * p.x + dir.y * p.y > 0;
     this.edge = !best && atEdge && outward ? { bearing: (Math.atan2(p.x, -p.y) / RAD + 360) % 360 } : null;
     if (!best) { this._r = r; return null; }
-    const from = this.current;
-    this._reroot(best, p);
-    this.crossfade(best, FADE_MS, from);
-    this._r = p.length();
-    this.prune();
+    this.enter(best, p);
     return best;
+  }
+
+  // Switch to spot e now, wherever the player stands: re-root on it and crossfade from the current spot. update()
+  // does this at a switch; the game also does it when the server hands it the next spot at an edge.
+  enter(e, p) {
+    if (e === this.current) return;
+    const from = this.current;
+    this._reroot(e, p);
+    this.crossfade(e, FADE_MS, from);
+    this._r = p.length(); this.edge = null;
+    this.prune();
   }
 
   _reroot(c, p) {

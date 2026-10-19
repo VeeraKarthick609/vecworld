@@ -1,39 +1,61 @@
-"use strict";
+// Dream Roam: type a place, then roam a dreamed world of 360° painted spots in any direction.
+//
+// The server holds the journey; the page holds the world around the player (web/roam/world.js). The first spot
+// comes from /start. Walking to the edge of a spot with nothing ahead asks /next for the spot that way; while it
+// comes the character eases to a stop in a dream fog, and when it lands it is placed beside its parent (distance,
+// heading and scale are parent-relative) and the world crossfades into it. The server pre-dreams around the
+// player's heading, which the page hints at most every HINT_MS when it has turned by more than HINT_DEG.
+//
+// The new spot is always placed from the spot the player is in. That is normally the server's spot; after walking
+// back into the previous one (possible until the next switch) it is that one, so the new spot appears ahead of the
+// player rather than ahead of a spot behind them.
+import * as THREE from "three";
+import { World, LIMIT } from "./roam/world.js";
+import { Hero, Keys, OrbitCam } from "./roam/hero.js";
+import { Signposts } from "./roam/signposts.js";
+import { Compass, rel } from "./roam/compass.js";
 
-// Dream Walk viewer: a 360° cylindrical panorama you look around in (client-side) and walk through
-// (the server paints the next spot, centred on the direction it walked: view.walked_yaw, in the old spot's frame).
+const HINT_MS = 300, HINT_DEG = 20;   // heading hints: at most this often, and only past this much turn
+const EASE_FROM = 0.85;               // while a spot is on its way, walking outward stops past this fraction of LIMIT
+const LOOK_X = 0.004, LOOK_Y = 0.003; // radians of camera turn per pixel of drag (as OrbitCam)
+const STICK_R = 44;                   // px the phone stick's knob travels
+const TOAST_MS = 3500;
+const STILL = Object.freeze({ fwd: 0, side: 0, run: false });
 
-const FOV = 90;              // horizontal degrees shown, narrowed on tall screens so the image keeps its aspect
-const TURN_SPEED = 150;      // degrees per second while A/D or ←/→ is held
-const MOVE_MS = 900;         // dolly + crossfade between spots
-const START_MS = 600;        // fade in of the first spot
-const DOLLY = 1.2;           // zoom reached by the old spot as you walk into it
-const SETTLE_MS = 500;       // still this long before the spot ahead is prefetched
-const PREFETCH_TOLERANCE = 45;
-const DRAG_CLICK = 6;        // px of drag after which a release is not a click
-
-const $ = (id) => document.getElementById(id);
-const canvas = $("view"), ctx = canvas.getContext("2d");
-const labelsEl = $("labels"), input = $("theme-text");
+const $ = id => document.getElementById(id);
+const input = $("place");
 const chips = [...document.querySelectorAll(".chip")];
 
-let sid = null;
-let view = null;             // the ViewOut on screen
-let labels = [];             // its labels
-let labelEls = [];           // [element, label] pairs on screen
-let image = null;            // its loaded panorama
-let yaw = 0;                 // degrees, 0 = the centre of the panorama, positive = right
-let busy = false;            // a start or move is in flight (request, image load or transition)
-let anim = null;             // {from, fromYaw, turnTo, to, toYaw, dir, t0, ms, done}
-let lastPrefetch = null;     // yaw of the last prefetch for this spot and theme/moods
-let settleTimer = 0;
+// --- the scene ------------------------------------------------------------------
 
-const deepFreeze = (o) => { Object.values(o).forEach((v) => v && typeof v === "object" && deepFreeze(v)); return Object.freeze(o); };
-window.vecworld = Object.freeze({
-  get yaw() { return yaw; },
-  get view() { return view; },
-  get labels() { return labels; },
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+renderer.setSize(innerWidth, innerHeight);
+const canvas = renderer.domElement;
+$("stage").append(canvas);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color("#0b0d12");
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 300);
+addEventListener("resize", () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
 });
+scene.add(new THREE.HemisphereLight(0xfff3dd, 0x3a4a2a, 2.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+sun.position.set(-3, 8, 4);
+scene.add(sun);
+
+const world = new World(scene);
+world.onError = err => { roamErrors.push(String(err.message || err)); toast("The dream stumbled, try again."); };
+const signposts = new Signposts(scene);
+const compass = new Compass($("compass"));
+// OrbitCam's own listeners are left inert on a detached element: the page handles the pointer itself (below),
+// because a pointer-lock request can reject and touch drags carry no movementX. Its Esc-releases-lock stays.
+const cam = new OrbitCam(document.createElement("div"));
+const keys = new Keys();
+let hero = null;
+const ready = Hero.load(scene).then(h => { hero = h; hero.object.visible = hero.shadow.visible = false; });
 
 // --- server -------------------------------------------------------------------
 
@@ -53,11 +75,11 @@ async function api(path, body) {
   return data;
 }
 
+let sid = null;
 async function session() {
   if (!sid) sid = (await api("/api/session")).session_id;
   return sid;
 }
-
 const call = async (what, body) => api(`/api/session/${await session()}/${what}`, body);
 
 function loadImage(url) {
@@ -69,13 +91,12 @@ function loadImage(url) {
   });
 }
 
-// --- HUD ----------------------------------------------------------------------
-
-function setBusy(on) {
-  busy = on;
-  $("spinner").hidden = !on || anim !== null;
-  document.body.classList.toggle("busy", on);
+async function build(v) {
+  const [pano, depth] = await Promise.all([loadImage(v.image_url), loadImage(v.depth_url)]);
+  return world.buildSpot(pano, depth, { spot_id: v.spot_id });
 }
+
+// --- HUD ----------------------------------------------------------------------
 
 let toastTimer;
 function toast(msg) {
@@ -83,285 +104,274 @@ function toast(msg) {
   t.textContent = msg;
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (t.hidden = true), 3500);
+  toastTimer = setTimeout(() => (t.hidden = true), TOAST_MS);
 }
 
-const activeMoods = () => chips.filter((c) => c.getAttribute("aria-pressed") === "true").map((c) => c.dataset.mood);
-
-// --- drawing ------------------------------------------------------------------
-
-function resize() {
-  const dpr = devicePixelRatio || 1;
-  canvas.width = Math.round(innerWidth * dpr);
-  canvas.height = Math.round(innerHeight * dpr);
-}
-addEventListener("resize", resize);
-resize();
-
-const wrapYaw = (a) => ((a + 180) % 360 + 360) % 360 - 180;
-const angleBetween = (a, b) => Math.abs(wrapYaw(a - b));
-
-// Degrees across the screen: 90°, or less on a screen taller than the panorama allows at 90°.
-function fov() {
-  const aspect = image ? image.naturalHeight / image.naturalWidth : 0.25;
-  return Math.min(FOV, 360 * aspect * innerWidth / innerHeight);
-}
-
-// Draw the window of a cylindrical panorama centred on yawDeg, wrapping around the seam, zoomed by zoom (≥ 1).
-function drawPano(img, yawDeg, zoom = 1, alpha = 1) {
-  const W = img.naturalWidth, H = img.naturalHeight, cw = canvas.width, ch = canvas.height;
-  const sw = W * fov() / 360 / zoom, sh = Math.min(H, sw * ch / cw);
-  const cx = ((W / 2 + yawDeg / 360 * W) % W + W) % W, sy = (H - sh) / 2;
-  ctx.globalAlpha = alpha;
-  const sx = cx - sw / 2;
-  for (const off of [-W, 0, W]) {              // up to three copies cover the wrap
-    const x = sx + off;
-    if (x + sw <= 0 || x >= W) continue;
-    const a = Math.max(0, x), b = Math.min(W, x + sw);
-    ctx.drawImage(img, a, sy, b - a, sh, (a - x) / sw * cw, 0, (b - a) / sw * cw, ch);
-  }
-  ctx.globalAlpha = 1;
-}
-
-function frame(t) {
-  ctx.fillStyle = "#0b0d12";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  if (anim) {
-    const k = Math.min(1, (t - anim.t0) / anim.ms);
-    const fade = anim.from ? Math.max(0, (k - 0.35) / 0.65) : k;
-    if (anim.dir > 0) {
-      // Walking on: dolly into the old spot (turning toward a clicked discovery on the way) while the new
-      // one, already a little closer, settles in facing the same way.
-      const turnK = Math.min(1, k / 0.6), ease = turnK * turnK * (3 - 2 * turnK);
-      if (anim.from) drawPano(anim.from, anim.fromYaw + wrapYaw(anim.turnTo - anim.fromYaw) * ease, 1 + (DOLLY - 1) * k);
-      drawPano(anim.to, anim.toYaw, 1 + (DOLLY - 1) * 0.3 * (1 - k), fade);
-    } else {
-      // Turning back: the old spot falls away as the new one pulls back from close up.
-      if (anim.from) drawPano(anim.from, anim.fromYaw, 1, 1 - fade);
-      drawPano(anim.to, anim.toYaw, 1 + (DOLLY - 1) * (1 - k), fade);
-    }
-    if (k >= 1) { const done = anim.done; anim = null; done(); }
-  } else if (image) {
-    drawPano(image, yaw);
-  }
-  placeLabels();
-  requestAnimationFrame(frame);
-}
-
-// --- labels -------------------------------------------------------------------
-
-function renderLabels() {
-  labelEls = labels.map((l) => {
-    const el = document.createElement("button");
-    el.type = "button";
-    el.className = "label";
-    el.dataset.id = l.id;
-    el.setAttribute("aria-label", `approach ${l.text}`);
-    const text = document.createElement("span");
-    text.textContent = l.text;
-    el.append(text);
-    el.addEventListener("click", () => {
-      if (dragged <= DRAG_CLICK) move("approach", { label: l.id }, wrapYaw((l.u - 0.5) * 360));
-    });
-    return [el, l];
-  });
-  labelsEl.replaceChildren(...labelEls.map(([el]) => el));
-}
-
-// Place each label from its panorama box (u = centre, y = top, w, h as fractions) relative to the yaw.
-function placeLabels() {
-  labelsEl.hidden = anim !== null;
-  if (anim) return;
-  const f = fov() / 360, cw = innerWidth, ch = innerHeight;
-  const ratio = image ? image.naturalWidth / image.naturalHeight : 4;
-  const vis = Math.min(1, f * ratio * ch / cw);    // fraction of the panorama's height on screen
-  const top = (1 - vis) / 2;
-  const centre = (0.5 + yaw / 360) % 1;
-  for (const [el, l] of labelEls) {
-    // Nearest copy of the label, so one just across the seam shows on the side it really is on.
-    const d = ((l.u - centre + 0.5) % 1 + 1) % 1 - 0.5;
-    if (Math.abs(d) - l.w / 2 >= f / 2) { el.style.display = "none"; continue; }
-    el.style.display = "";
-    const left = (0.5 + (d - l.w / 2) / f) * cw, width = l.w / f * cw;
-    const boxTop = (l.y - top) / vis * ch;
-    el.style.left = `${left}px`;
-    el.style.width = `${width}px`;
-    el.style.top = `${boxTop}px`;
-    el.style.height = `${l.h / vis * ch}px`;
-    // The name sits over the part of the box that is on screen, and never off its edges.
-    const span = el.firstChild, half = span.offsetWidth / 2;
-    const seen = (Math.max(0, left) + Math.min(cw, left + width)) / 2;
-    span.style.left = `${Math.min(Math.max(seen, half + 8), cw - half - 8) - left}px`;
-    span.style.top = `${Math.max(4, -boxTop + 8)}px`;
-  }
-}
-
-// --- moving -------------------------------------------------------------------
-
-function transition(img, dir, ms, turnTo, toYaw) {
-  return new Promise((done) => {
-    // Labels for the new spot go up in the frame the transition ends, never over the old one.
-    anim = { from: image, fromYaw: yaw, turnTo, to: img, toYaw, dir, t0: performance.now(), ms,
-             done: () => { renderLabels(); done(); } };
-    $("spinner").hidden = true;
-  });
-}
-
-// facing: the yaw (in the old spot's frame) you face once you arrive. The new spot's centre is where the
-// server walked (a prefetch may have walked up to 45° off it), so you keep facing what you faced.
-async function arrive(v, dir, facing = 0) {
-  const img = await loadImage(v.image_url);
-  const to = view ? wrapYaw(facing - v.walked_yaw) : 0;
-  const t = transition(img, dir, view ? MOVE_MS : START_MS, dir > 0 ? facing : yaw, to);
-  view = deepFreeze(v);
-  labels = view.labels;
-  image = img;
-  yaw = to;
-  await t;
-  lastPrefetch = null;
-  settled();
-}
-
-async function move(what, body, facing) {
-  if (busy || !view) return;
-  setBusy(true);
-  try {
-    const v = await call(what, body);
-    await arrive(v, what === "back" ? -1 : 1, facing);
-  } catch (e) {
-    toast(e.message);         // nothing changed: the previous view and labels are still on screen
-  } finally {
-    setBusy(false);
-  }
-}
-
-const walk = () => move("walk", { yaw }, yaw);
-const back = () => move("back", { yaw }, wrapYaw(yaw + 180));
-
-// --- prefetch -----------------------------------------------------------------
-
-function settled() {
-  clearTimeout(settleTimer);
-  settleTimer = setTimeout(() => {
-    if (!view || busy) return;
-    if (lastPrefetch !== null && angleBetween(yaw, lastPrefetch) <= PREFETCH_TOLERANCE) return;
-    lastPrefetch = yaw;
-    call("prefetch", { yaw }).catch(() => {});   // best effort; the server drops stale ones
-  }, SETTLE_MS);
-}
-
-function turn(by) {
-  yaw = wrapYaw(yaw + by);
-  settled();
-}
-
-// --- input --------------------------------------------------------------------
-
-const held = new Set();
+const activeMoods = () => chips.filter(c => c.getAttribute("aria-pressed") === "true").map(c => c.dataset.mood);
 const typing = () => document.activeElement === input;
+const camBearing = () => ((-cam.yaw * 180 / Math.PI) % 360 + 360) % 360;
 
-addEventListener("keydown", (e) => {
-  if (typing() || e.ctrlKey || e.metaKey || e.altKey) return;
-  const k = e.key.toLowerCase();
-  if (k.startsWith("arrow")) e.preventDefault();
-  if (busy || !view) return;
-  if (["a", "d", "arrowleft", "arrowright"].includes(k)) held.add(k);
-  else if ((k === "w" || k === "arrowup") && !e.repeat) walk();
-  else if ((k === "s" || k === "arrowdown") && !e.repeat) back();
-});
-addEventListener("keyup", (e) => held.delete(e.key.toLowerCase()));
-addEventListener("blur", () => held.clear());
-input.addEventListener("focus", () => held.clear());
+// --- the journey ----------------------------------------------------------------
 
-let last = performance.now();
-function turning(t) {
-  const dt = Math.min(0.1, (t - last) / 1000);
-  last = t;
-  if (busy || !view) held.clear();
-  const dir = (held.has("d") || held.has("arrowright") ? 1 : 0) - (held.has("a") || held.has("arrowleft") ? 1 : 0);
-  if (dir) turn(dir * TURN_SPEED * dt);
-  requestAnimationFrame(turning);
+let started = false, starting = false;
+let view = null;          // the server's current spot (SpotOut)
+let stepping = false;     // a /next is in flight, or its spot is being built
+let stuck = false;        // a /next failed at this edge: no retry until the player leaves the edge
+let exitBearing = null;   // where the pending /next leads (for the fog)
+let cameFrom = null;      // the bearing back the way the player came
+let hint = { at: -Infinity, heading: 0 }, hintCount = 0;
+const hints = [];         // the last hints sent, {t, heading}, for the tests
+
+// The server's spot v is now `entry` in the world: signposts, compass and arrival follow it.
+function settle(v, entry) {
+  view = v;
+  signposts.set(entry, v.neighbours);
+  compass.set(v.neighbours, v.place, cameFrom);
+  if (v.arrived) toast(`Arrived at ${v.arrived}`);
 }
-requestAnimationFrame(turning);
-requestAnimationFrame(frame);
 
-// Drag to look (mouse, pen or touch). Window listeners, not pointer capture, so a tap on a label still clicks it.
-let drag = null, dragged = 0;
-$("stage").addEventListener("pointerdown", (e) => {
-  if (e.button !== 0) return;
-  if (typing()) input.blur();
-  drag = e.clientX;
-  dragged = 0;
-});
-addEventListener("pointermove", (e) => {
-  if (drag === null) return;
-  const dx = e.clientX - drag;
-  drag = e.clientX;
-  dragged += Math.abs(dx);
-  if (!busy && view) turn(-dx * fov() / innerWidth);
-});
-addEventListener("pointerup", () => (drag = null));
-addEventListener("pointercancel", () => (drag = null));
-
-$("go-walk").addEventListener("click", walk);
-$("go-back").addEventListener("click", back);
-
-// The first theme starts the dream; later ones drift it.
-$("theme").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const theme = input.value.trim();
-  if (!theme) return;
-  if (view) {
-    try {
-      await call("theme", { theme });
-      input.value = "";
-      input.blur();
-      lastPrefetch = null;    // the server dropped the prefetch built for the old theme
-      settled();
-      toast(`the dream is drifting toward ${theme}`);
-    } catch (err) {
-      toast(err.message);
-    }
-    return;
-  }
-  if (busy) return;
-  setBusy(true);
+async function begin(place) {
+  starting = true;
   input.disabled = true;
   try {
-    const v = await call("start", { theme, moods: activeMoods() });
-    for (const c of chips) c.setAttribute("aria-pressed", String(v.moods.includes(c.dataset.mood)));
+    await ready;
+    const v = await call("start", { place, moods: activeMoods() });
+    const s = await build(v);
+    world.addSpot(s, { x: 0, z: 0 }, v.heading, 1);
+    hero.pos.set(0, 0);
+    hero.object.visible = hero.shadow.visible = true;
+    cam.yaw = OrbitCam.yawFor(v.heading);
+    hint = { at: -Infinity, heading: v.heading };   // the server pre-dreams around the spot heading to begin with
+    settle(v, s);
+    started = true;
     $("intro").hidden = true;
-    const landing = arrive(v, 1);
-    $("keys").hidden = false;
-    $("pad").hidden = false;
-    document.body.classList.add("dreaming");
+    $("compass").hidden = $("keys").hidden = $("stick").hidden = false;
+    document.body.classList.add("roaming");
     input.value = "";
-    input.placeholder = "drift the dream toward…";
-    await landing;
+    input.placeholder = "drift toward another place…";
   } catch (err) {
     toast(err.message);
   } finally {
+    starting = false;
     input.disabled = false;
-    setBusy(false);
-    if (view) input.blur();
+    if (started) input.blur();
+  }
+}
+
+async function step(exit) {
+  stepping = true;
+  exitBearing = exit;
+  const sent = hintCount;
+  try {
+    const v = await call("next", { exit_heading: exit });
+    if (hintCount === sent) hint = { at: performance.now(), heading: exit };   // the server now pre-dreams this way
+    const s = await build(v);
+    world.placeChild(world.current, v.heading, v.distance, v.scale, s);
+    world.enter(s, hero.pos);
+    cameFrom = (v.heading + 180) % 360;
+    settle(v, s);
+  } catch (err) {
+    toast(err.message);      // the current spot stays as it was, and playable
+    stuck = true;
+  } finally {
+    stepping = false;
+    exitBearing = null;
+  }
+}
+
+function sendHint(now) {
+  const h = hero.heading;
+  if (now - hint.at < HINT_MS || Math.abs(rel(hint.heading, h)) <= HINT_DEG) return;
+  hint = { at: now, heading: h };
+  hintCount++;
+  hints.push({ t: now, heading: h });
+  if (hints.length > 64) hints.shift();
+  call("heading", { heading: h }).catch(() => {});   // best effort: only steers the pre-dreaming
+}
+
+// --- controls -----------------------------------------------------------------
+
+const stick = { id: null, cx: 0, cy: 0, input: STILL };
+
+// Keys or the stick; nothing while typing; and, while the next spot is on its way, nothing that walks on outward
+// near the edge, so the character eases to a stop there instead of pushing against it.
+function control() {
+  if (typing()) return STILL;
+  const c = stick.id !== null ? stick.input : keys.input;
+  if (!stepping || (!c.fwd && !c.side)) return c;
+  const p = hero.pos, a = cam.yaw + Math.atan2(-c.side, c.fwd);
+  const outward = -Math.sin(a) * p.x - Math.cos(a) * p.y > 0;
+  return outward && p.length() >= EASE_FROM * LIMIT ? STILL : c;
+}
+
+// Look: drag anywhere on the world (mouse, pen or touch), or click to capture the mouse (Esc lets go).
+const look = { id: null, x: 0, y: 0 };
+const turn = (dx, dy) => cam.turn(-dx * LOOK_X, dy * LOOK_Y);
+canvas.addEventListener("pointerdown", e => {
+  if (typing()) input.blur();
+  if (!started || look.id !== null) return;
+  Object.assign(look, { id: e.pointerId, x: e.clientX, y: e.clientY });
+  if (e.pointerType === "mouse" && document.pointerLockElement !== canvas) {
+    try { canvas.requestPointerLock()?.catch?.(() => {}); } catch { /* no pointer lock: dragging still looks */ }
+  }
+});
+addEventListener("pointermove", e => {
+  if (document.pointerLockElement === canvas) { turn(e.movementX, e.movementY); return; }
+  if (e.pointerId !== look.id) return;
+  turn(e.clientX - look.x, e.clientY - look.y);
+  look.x = e.clientX; look.y = e.clientY;
+});
+const endLook = e => { if (e.pointerId === look.id) look.id = null; };
+addEventListener("pointerup", endLook);
+addEventListener("pointercancel", endLook);
+
+// The phone stick: push the knob the way to walk, relative to the camera; all the way out runs.
+const stickEl = $("stick"), knob = $("knob");
+function moveStick(e) {
+  let dx = e.clientX - stick.cx, dy = e.clientY - stick.cy;
+  const m = Math.hypot(dx, dy);
+  if (m > STICK_R) { dx *= STICK_R / m; dy *= STICK_R / m; }
+  knob.style.transform = `translate(${dx}px, ${dy}px)`;
+  stick.input = m < 0.2 * STICK_R ? STILL : { fwd: -dy / STICK_R, side: dx / STICK_R, run: m > 1.4 * STICK_R };
+}
+stickEl.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  if (typing()) input.blur();
+  const r = stickEl.getBoundingClientRect();
+  Object.assign(stick, { id: e.pointerId, cx: r.left + r.width / 2, cy: r.top + r.height / 2 });
+  stickEl.setPointerCapture(e.pointerId);
+  moveStick(e);
+});
+stickEl.addEventListener("pointermove", e => { if (e.pointerId === stick.id) moveStick(e); });
+const endStick = e => {
+  if (e.pointerId !== stick.id) return;
+  Object.assign(stick, { id: null, input: STILL });
+  knob.style.transform = "";
+};
+stickEl.addEventListener("pointerup", endStick);
+stickEl.addEventListener("pointercancel", endStick);
+
+addEventListener("keydown", e => {
+  if (!typing() && started && e.key.startsWith("Arrow")) e.preventDefault();
+});
+
+// The first place starts the dream; later ones drift it toward them.
+$("theme").addEventListener("submit", async e => {
+  e.preventDefault();
+  const place = input.value.trim();
+  if (!place) return;
+  if (!started) { if (!starting) begin(place); return; }
+  try {
+    await call("theme", { place });
+    input.value = "";
+    input.blur();
+    toast(`The dream drifts toward ${place}`);
+  } catch (err) {
+    toast(err.message);
   }
 });
 
-// Mood toggles: before the start they are sent with it; after, straight away.
+// Mood toggles: before the start they go with it; after, straight away.
 for (const chip of chips) {
   chip.addEventListener("click", async () => {
     const on = chip.getAttribute("aria-pressed") !== "true";
     chip.setAttribute("aria-pressed", String(on));
-    if (!view) return;
+    if (!started) return;
     try {
       await call("moods", { moods: activeMoods() });
-      lastPrefetch = null;    // the server dropped the prefetch built for the old moods
-      settled();
     } catch (err) {
       chip.setAttribute("aria-pressed", String(!on));
       toast(err.message);
     }
   });
 }
+
+// --- the frame ------------------------------------------------------------------
+
+const fogged = () => stepping || !!world.edge;
+
+function play(dt, now) {
+  hero.update(dt, control(), cam.yaw, world.k);
+  world.update(hero.pos, hero.dir.lengthSq() ? hero.dir : null);
+  world.tick(dt);
+  if (!world.edge) stuck = false;
+  else if (!stepping && !stuck) step(world.edge.bearing);
+  sendHint(now);
+  const fog = fogged(), toward = exitBearing ?? world.edge?.bearing;
+  document.body.classList.toggle("fogged", fog);
+  if (fog && toward != null) {
+    const d = rel(camBearing(), toward) * Math.PI / 180;   // the fog thickens on the side it lies
+    document.body.style.setProperty("--fog-x", `${50 + 40 * Math.sin(d)}%`);
+  }
+}
+
+function pose() {
+  const k = world.k, p = hero.pos;
+  hero.place(k);
+  signposts.place(k);
+  cam.apply(camera, new THREE.Vector3(k * p.x, 0, k * p.y));
+  scene.updateMatrixWorld();
+  camera.updateMatrixWorld();
+}
+
+function draw() {
+  if (!started) { renderer.render(scene, camera); return; }
+  pose();
+  world.render(renderer, scene, camera);
+  compass.update(camBearing());
+}
+
+let last = performance.now();
+renderer.setAnimationLoop(t => {
+  const dt = Math.min(0.05, (t - last) / 1000);
+  last = t;
+  if (started) play(dt, t);
+  draw();
+});
+
+// --- state for the tests (read-only) and their hooks ----------------------------
+
+window.roam = Object.freeze(Object.defineProperties({}, {
+  ready: { get: () => hero !== null, enumerable: true },
+  started: { get: () => started, enumerable: true },
+  spotId: { get: () => view?.spot_id ?? null, enumerable: true },
+  place: { get: () => view?.place ?? null, enumerable: true },
+  neighbours: { get: () => (view?.neighbours ?? []).map(n => ({ ...n })), enumerable: true },
+  pos: { get: () => hero && { x: hero.pos.x, z: hero.pos.y }, enumerable: true },
+  world: { get: () => hero && { x: world.abs.x + world.abs.s * hero.pos.x, z: world.abs.z + world.abs.s * hero.pos.y },
+           enumerable: true },
+  heading: { get: () => hero?.heading ?? null, enumerable: true },
+  camYaw: { get: () => cam.yaw, enumerable: true },
+  camBearing: { get: () => camBearing(), enumerable: true },
+  stepping: { get: () => stepping, enumerable: true },
+  fog: { get: () => started && fogged(), enumerable: true },
+  edge: { get: () => world.edge && { ...world.edge }, enumerable: true },
+  built: { get: () => world.spots.length, enumerable: true },
+  fading: { get: () => !!world.fade, enumerable: true },
+  signposts: { get: () => [...signposts.names], enumerable: true },
+  hints: { get: () => hints.map(h => ({ ...h })), enumerable: true },
+}));
+
+const gl = renderer.getContext();
+window.roamDev = {
+  world,
+  get hero() { return hero; },
+  // Look along a bearing (degrees), at a pitch.
+  look(bearing, pitch) { if (bearing != null) cam.yaw = OrbitCam.yawFor(bearing); if (pitch != null) cam.setPitch(pitch); },
+  // Render now and read the pixel at (fx, fy), fractions of the screen from the top left.
+  pixel(fx, fy) {
+    draw();
+    const px = new Uint8Array(4);
+    gl.readPixels(Math.round(fx * (gl.drawingBufferWidth - 1)), Math.round((1 - fy) * (gl.drawingBufferHeight - 1)),
+                  1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return [px[0], px[1], px[2]];
+  },
+  // Where the signpost's boards are on screen, as fractions from the top left.
+  signpostOnScreen() {
+    pose();
+    const v = signposts.group.localToWorld(new THREE.Vector3(0, 0.5, 0)).project(camera);
+    return [(v.x + 1) / 2, (1 - v.y) / 2];
+  },
+};
 
 session().catch(() => {});    // warm up; retried on first use if it failed

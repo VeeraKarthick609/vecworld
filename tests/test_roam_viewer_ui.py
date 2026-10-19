@@ -1,12 +1,12 @@
 """Browser tests for the Dream Roam viewer core: the transition dev page over the stand-in fixture spots
 (headless Firefox, a static server over web/)."""
 import functools
-import os
 import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from conftest import firefox
 
 from vecworld.__main__ import WEB_DIR
 
@@ -30,18 +30,7 @@ def site():
 
 @pytest.fixture
 def browser():
-    from selenium import webdriver
-    from selenium.webdriver.firefox.service import Service
-
-    opts = webdriver.FirefoxOptions()
-    opts.add_argument("-headless")
-    for k in ("webgl.force-enabled", "gfx.x11-egl.force-enabled"):
-        opts.set_preference(k, True)
-    opts.set_preference("webgl.out-of-process", False)
-    # headless Firefox has no GLX display: WebGL through surfaceless EGL on Mesa's software renderer (llvmpipe)
-    env = {**os.environ, "LIBGL_ALWAYS_SOFTWARE": "1", "EGL_PLATFORM": "surfaceless", "MOZ_WEBGL_FORCE_EGL": "1"}
-    d = webdriver.Firefox(options=opts, service=Service("/snap/bin/geckodriver", env=env))
-    d.set_window_size(800, 600)
+    d = firefox(800, 600)
     yield d
     d.quit()
 

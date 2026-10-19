@@ -6,6 +6,7 @@
   --glass-strong: rgba(10, 12, 18, 0.85);
   --line: rgba(255, 255, 255, 0.18);
   --gold: #ffcf5c;
+  --haze: 222, 228, 238;
 }
 
 * { box-sizing: border-box; }
@@ -19,7 +20,7 @@ html, body {
   overflow: hidden;
 }
 
-/* The panorama fills the screen; dragging anywhere on it looks around. */
+/* The world fills the screen; dragging anywhere on it looks around. */
 #stage {
   position: fixed; inset: 0;
   cursor: grab;
@@ -27,48 +28,81 @@ html, body {
   user-select: none;
 }
 #stage:active { cursor: grabbing; }
-#view { display: block; width: 100%; height: 100%; }
+#stage canvas { display: block; width: 100%; height: 100%; }
 
-#labels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
-
-/* A discovery: its box on the panorama (outlined on hover or focus), with the name always showing at the top. */
-.label {
-  position: absolute;
-  padding: 0; margin: 0;
-  background: none; color: inherit; font: inherit;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  outline: 2px dashed transparent;
-  outline-offset: 2px;
-  cursor: pointer;
-  pointer-events: auto;
-  transition: outline-color 0.15s, background 0.15s;
+/* Dream fog: a soft haze while the next spot is dreamed, thicker on the side the way ahead lies. */
+#fog {
+  position: fixed; inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.6s ease;
+  background:
+    radial-gradient(ellipse 70% 90% at var(--fog-x, 50%) 45%, rgba(var(--haze), 0.78), rgba(var(--haze), 0.32) 55%, rgba(var(--haze), 0.12) 100%);
+  backdrop-filter: blur(2px);
 }
-.label:hover, .label:focus-visible {
-  border-color: rgba(255, 255, 255, 0.22);
-  outline-color: rgba(255, 255, 255, 0.8);
-  background: rgba(255, 255, 255, 0.06);
-}
-.label span {
-  position: absolute; left: 50%; top: 4px;   /* left and top are set by placeLabels() */
+#fog span {
+  position: absolute; left: 50%; top: 30%;
   transform: translateX(-50%);
-  padding: 1px 8px; border-radius: 6px;
-  background: var(--glass);
-  font-size: 13px; white-space: nowrap;
-  pointer-events: none;
+  color: rgba(40, 46, 60, 0.75);
+  font-size: 14px; letter-spacing: 0.12em;
+  animation: breathe 2.4s ease-in-out infinite;
 }
-.label:hover span, .label:focus-visible span { background: var(--glass-strong); }
-.busy .label { pointer-events: none; opacity: 0.6; }
+@keyframes breathe { 50% { opacity: 0.35; } }
+.fogged #fog { opacity: 1; }
 
-#spinner {
-  position: absolute; left: 50%; top: 50%;
-  width: 36px; height: 36px; margin: -18px;
-  border: 3px solid var(--line); border-top-color: var(--ink);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+/* The compass: a strip of bearings along the top, the current place under it. */
+#compass {
+  position: fixed; left: 50%; top: 14px;
+  transform: translateX(-50%);
+  width: min(440px, calc(100vw - 32px));
   pointer-events: none;
+  text-align: center;
 }
-@keyframes spin { to { transform: rotate(360deg); } }
+#compass .strip {
+  position: relative;
+  height: 34px;
+  border-radius: 17px;
+  border: 1px solid var(--line);
+  background: var(--glass);
+  backdrop-filter: blur(6px);
+  overflow: hidden;
+}
+#compass .strip::after {          /* where you look */
+  content: ""; position: absolute; left: 50%; top: 0; bottom: 0;
+  width: 2px; margin-left: -1px;
+  background: linear-gradient(var(--gold), transparent);
+}
+#compass .tick { font-size: 12px; font-weight: 600; color: var(--ink-dim); }
+#compass .tick.minor { font-size: 10px; font-weight: 400; opacity: 0.7; }
+#compass .tick, #compass .came-from { position: absolute; top: 50%; transform: translate(-50%, -50%); white-space: nowrap; }
+#compass .place {                 /* over the strip, at its bearing */
+  position: absolute; top: 17px;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+  padding: 0 8px; border-radius: 10px;
+  background: #2c2717;
+  border: 1px solid rgba(255, 207, 92, 0.55);
+  color: var(--ink); font-size: 12px; line-height: 20px;
+}
+#compass .place b { font-weight: 500; }
+#compass .place i { font-style: normal; color: var(--gold); margin-right: 3px; }
+/* Off the strip: pinned under the end you would turn toward. */
+#compass .place.off-left, #compass .place.off-right { top: 50px; opacity: 0.85; }
+#compass .place.off-left { left: 0; transform: translate(0, -50%); }
+#compass .place.off-right { left: auto; right: 0; transform: translate(0, -50%); }
+#compass .place.off-right i { float: right; margin: 0 0 0 3px; }
+#compass .came-from {
+  top: auto; bottom: -1px; transform: translateX(-50%);
+  font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--ink-dim);
+}
+#compass .came-from::before { content: "⤺ "; }
+#compass .came-from[hidden] { display: none; }
+#compass .here {
+  margin-top: 4px;
+  font-size: 13px; color: var(--ink);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
 
 #intro {
   position: fixed; left: 50%; top: 38%;
@@ -130,41 +164,40 @@ html, body {
   pointer-events: none;
 }
 #keys kbd {
-  font: inherit; padding: 0 5px; border-radius: 4px;
+  font: inherit; padding: 0 5px; margin: 0 1px; border-radius: 4px;
   border: 1px solid var(--line); background: var(--glass);
 }
 
-/* Walk / turn back buttons for touch screens, bottom right. */
-#pad { display: none; }
-#pad button {
-  width: 56px; height: 56px;
+/* The phone stick, bottom left above the dock: only on touch or narrow screens. */
+#stick { display: none; }
+#knob {
+  width: 44px; height: 44px;
   border-radius: 50%;
-  border: 1px solid var(--line);
-  background: var(--glass);
-  color: var(--ink);
-  font-size: 24px; line-height: 1;
-  cursor: pointer;
-  backdrop-filter: blur(6px);
-  touch-action: manipulation;
+  background: rgba(238, 241, 246, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  pointer-events: none;
 }
-#pad button:active { background: var(--glass-strong); border-color: rgba(255, 255, 255, 0.45); }
-.busy #pad button { opacity: 0.5; }
 
 @media (max-width: 640px), (pointer: coarse) {
-  #pad:not([hidden]) {
-    position: fixed; right: 16px; bottom: 20px;
-    display: flex; flex-direction: column; gap: 10px;
+  #stick:not([hidden]) {
+    position: fixed; left: 20px; bottom: 150px;
+    width: 112px; height: 112px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 50%;
+    border: 1px solid var(--line);
+    background: var(--glass);
+    backdrop-filter: blur(6px);
+    touch-action: none;
   }
   #keys { display: none; }
 }
 @media (max-width: 640px) {
-  /* Once dreaming, leave the right-hand column to the buttons. */
-  .dreaming #dock { left: 16px; transform: none; width: calc(100vw - 32px - 72px); }
   #intro h1 { font-size: 34px; }
+  #compass .tick.minor { display: none; }
 }
 
 #toast {
-  position: fixed; left: 50%; top: 20px;
+  position: fixed; left: 50%; top: 80px;
   transform: translateX(-50%);
   padding: 8px 16px; border-radius: 8px;
   background: var(--glass); border: 1px solid var(--line);

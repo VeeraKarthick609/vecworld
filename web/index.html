@@ -2,24 +2,34 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Dream Walk</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Dream Roam</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="style.css">
+  <script>
+    // Collected for the tests: any uncaught error or rejection on this page.
+    window.roamErrors = [];
+    addEventListener("error", e => roamErrors.push(String(e.message || e.error)));
+    addEventListener("unhandledrejection", e => roamErrors.push(String(e.reason && e.reason.stack || e.reason)));
+  </script>
+  <script type="importmap">{"imports":{"three":"./vendor/three.module.min.js","three/addons/":"./vendor/"}}</script>
 </head>
 <body>
-  <main id="stage" aria-label="the dream; drag to look around">
-    <canvas id="view"></canvas>
-    <div id="labels"></div>
-    <div id="spinner" hidden></div>
-  </main>
+  <main id="stage" aria-label="the dream; drag to look around"></main>
 
-  <div id="intro">
-    <h1>Dream Walk</h1>
-    <p>Type a place to dream of and pick a mood.<br>Then look around, walk on, and step toward what you find.</p>
+  <div id="fog" aria-hidden="true"><span>dreaming the way ahead…</span></div>
+
+  <div id="compass" hidden>
+    <div class="strip" aria-label="compass"></div>
+    <div class="here"></div>
   </div>
 
-  <div id="keys" hidden>drag or <kbd>A</kbd> <kbd>D</kbd> to look · <kbd>W</kbd> walk · <kbd>S</kbd> turn back · click a discovery to approach</div>
+  <div id="intro">
+    <h1>Dream Roam</h1>
+    <p>Type a place to dream of and pick a mood.<br>Then walk anywhere: signposts point to the places nearby.</p>
+  </div>
+
+  <div id="keys" hidden><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> walk · <kbd>Shift</kbd> run · drag or click to look, <kbd>Esc</kbd> lets go</div>
 
   <div id="dock">
     <!-- Must match vecworld.config.MOODS (checked by tests/test_ui.py). -->
@@ -32,17 +42,14 @@
       <button type="button" class="chip" data-mood="warm" aria-pressed="false">warm</button>
     </div>
     <form id="theme">
-      <input id="theme-text" autocomplete="off" maxlength="120" placeholder="dream of a place…" aria-label="theme" autofocus>
+      <input id="place" autocomplete="off" maxlength="120" placeholder="dream of a place…" aria-label="place" autofocus>
     </form>
   </div>
 
-  <div id="pad" hidden>
-    <button type="button" id="go-walk" aria-label="walk on">↑</button>
-    <button type="button" id="go-back" aria-label="turn back">↓</button>
-  </div>
+  <div id="stick" hidden aria-label="walk"><div id="knob"></div></div>
 
   <div id="toast" role="status" hidden></div>
 
-  <script src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </body>
 </html>

@@ -62,3 +62,22 @@ class FakeDepth:
 
         w, h = pano.size
         return np.repeat(np.linspace(0, 1, h, dtype=np.float32)[:, None], w, axis=1)
+
+
+def firefox(width: int, height: int):
+    """Headless Firefox with WebGL: headless has no GLX display, so WebGL runs through surfaceless EGL on Mesa's
+    software renderer (llvmpipe)."""
+    import os
+
+    from selenium import webdriver
+    from selenium.webdriver.firefox.service import Service
+
+    opts = webdriver.FirefoxOptions()
+    opts.add_argument("-headless")
+    for k in ("webgl.force-enabled", "gfx.x11-egl.force-enabled"):
+        opts.set_preference(k, True)
+    opts.set_preference("webgl.out-of-process", False)
+    env = {**os.environ, "LIBGL_ALWAYS_SOFTWARE": "1", "EGL_PLATFORM": "surfaceless", "MOZ_WEBGL_FORCE_EGL": "1"}
+    d = webdriver.Firefox(options=opts, service=Service("/snap/bin/geckodriver", env=env))
+    d.set_window_size(width, height)
+    return d
