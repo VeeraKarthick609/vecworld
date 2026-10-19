@@ -7,7 +7,7 @@ from conftest import FakeDepth, FakeDreamer, FakePainter
 from PIL import Image
 
 from vecworld.config import MOOD_BG_STRENGTH, MOOD_WORDS, SESSION_TTL, STYLE
-from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownSession
+from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownSession, UnknownSpot
 from vecworld.roam.places import fallback_neighbours
 from vecworld.roam.service import RoamService, SpotView
 from vecworld.scenes.palette import palette_stats
@@ -956,3 +956,83 @@ def test_llm_place_displaced_by_a_typed_place_does_not_come_back(make):
     svc.next(s.id, first.bearing)
     assert FakeDreamer.PLACES[0] not in [n.name for n in s.journey.neighbours]
     assert "volcano" in [n.name for n in s.journey.neighbours]
+
+
+# --- stepping back into a spot ------------------------------------------------------------
+
+def test_enter_the_parent_restores_it_and_next_builds_its_child(make):
+    svc = make(queue=ManualQueue())
+    s = started(svc, "forest")
+    a = s.spot.id
+    a_journey, a_ref = s.journey, s.ref
+    target = s.journey.neighbours[0]
+    b_view = svc.next(s.id, target.bearing)        # drifting toward a neighbour
+    assert s.journey.drift[target.name] == 1
+    files = list(s.files)
+    v = svc.enter(s.id, a)
+    assert v.spot_id == a and s.spot.id == a and v.arrived is None
+    assert (v.distance, v.scale, v.place) == (0.0, 1.0, "forest")
+    assert s.journey is a_journey and s.ref == a_ref and s.journey.drift[target.name] == 0
+    assert all(f":{a}:" in k for k in s.prefetch) and len(s.prefetch) == 3   # pre-dreaming around the parent
+    assert s.files == files and all(p.exists() for pair in files for p in pair)
+    c = svc.next(s.id, (target.bearing + 120) % 360)
+    assert s.visits[c.spot_id].parent_id == a and c.spot_id != b_view.spot_id
+    assert c.place == "forest"
+
+
+def test_enter_the_child_again_restores_its_journey(make):
+    svc = make(queue=ManualQueue())
+    s = started(svc, "forest")
+    a = s.spot.id
+    target = s.journey.neighbours[0].name
+    _, (v1, v2, v3) = walk_to(svc, s, target)      # v3 arrives
+    arrived_journey = s.journey
+    svc.enter(s.id, v2.spot_id)
+    assert s.journey.place == "forest" and s.journey.drift[target] == 2
+    v = svc.enter(s.id, v3.spot_id)                # walked back into the child
+    assert v.place == target and s.journey is arrived_journey
+    with pytest.raises(UnknownSpot):
+        svc.enter(s.id, a)                         # its files are gone (three spots kept)
+
+
+def test_enter_a_grandparent_while_its_files_last(make):
+    svc = make(queue=ManualQueue())
+    s = started(svc)
+    a = s.spot.id
+    svc.next(s.id, 0)
+    svc.next(s.id, 0)
+    assert svc.enter(s.id, a).spot_id == a        # a move can land while the player walks back two spots
+
+
+def test_enter_an_unknown_or_sibling_spot_is_refused(make):
+    svc = make(queue=ManualQueue())
+    s = started(svc)
+    a = s.spot.id
+    b = svc.next(s.id, 0).spot_id
+    svc.enter(s.id, a)
+    svc.next(s.id, 180)
+    for bad in ("nope", b):                        # b is now a sibling of the current spot
+        with pytest.raises(UnknownSpot) as e:
+            svc.enter(s.id, bad)
+        assert e.value.status == 409 and e.value.code == "unknown_spot"
+    assert svc.enter(s.id, s.spot.id).spot_id == s.spot.id   # the current spot: nothing to do
+
+
+def test_enter_is_busy_during_a_move(make):
+    svc = make(painter=GatedPainter())
+    s = started(svc)
+    a = s.spot.id
+    svc.next(s.id, 0)
+    wait_set(s)
+    svc.painter.armed = True
+    t = threading.Thread(target=lambda: svc.next(s.id, 120))
+    t.start()
+    try:
+        assert svc.painter.entered.wait(5)
+        with pytest.raises(Busy):
+            svc.enter(s.id, a)
+    finally:
+        svc.painter.armed = False
+        svc.painter.gate.set()
+        t.join(5)
+    assert s.busy is False

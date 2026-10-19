@@ -176,3 +176,24 @@ def test_heading_returns_202_while_painter_blocks(tmp_path):
 def test_static_index_served(client):
     r = client.get("/")
     assert r.status_code == 200 and "canvas" in r.text
+
+
+def test_enter_steps_back_into_the_parent(client):
+    sid, first = started(client)
+    second = client.post(f"/api/session/{sid}/next", json={"exit_heading": 90}).json()
+    r = client.post(f"/api/session/{sid}/enter", json={"spot_id": first["spot_id"]})
+    assert r.status_code == 200, r.text
+    back = r.json()
+    assert set(back) == set(first) and back["spot_id"] == first["spot_id"] and back["arrived"] is None
+    assert back["image_url"] == first["image_url"] and client.get(back["image_url"]).status_code == 200
+    third = client.post(f"/api/session/{sid}/next", json={"exit_heading": 270}).json()
+    assert third["spot_id"] not in (first["spot_id"], second["spot_id"])
+    r = client.post(f"/api/session/{sid}/enter", json={"spot_id": second["spot_id"]})   # now a sibling
+    assert r.status_code == 409 and r.json()["error"] == "unknown_spot"
+
+
+def test_enter_validates(client):
+    sid, _ = started(client)
+    r = client.post(f"/api/session/{sid}/enter", json={"spot_id": "x" * 65})
+    assert r.status_code == 422 and r.json()["error"] == "bad_input"
+    assert client.post(f"/api/session/{new(client)}/enter", json={"spot_id": "x"}).json()["error"] == "not_started"

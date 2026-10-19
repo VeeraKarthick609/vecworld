@@ -18,6 +18,10 @@ class Busy(GameError):
     status, code = 409, "busy"
 
 
+class UnknownSpot(GameError):
+    status, code = 409, "unknown_spot"
+
+
 class GpuUnavailable(GameError):
     status, code = 503, "gpu_unavailable"
 

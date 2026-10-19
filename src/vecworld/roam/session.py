@@ -23,6 +23,17 @@ class SpotView:
 
 
 @dataclass(frozen=True)
+class Visit:
+    """A spot the session can step back into, with the journey state it had when it was last the current spot."""
+    spot: Spot
+    spot_stats: Stats
+    journey: Journey
+    ref: Stats
+    paths: tuple[Path, Path]
+    parent_id: str | None       # the spot it was built from (None for the first)
+
+
+@dataclass(frozen=True)
 class Predream:
     """One pre-dreamed direction: built from `spot_id` in world `version` toward `heading`."""
     heading: float
@@ -55,3 +66,4 @@ class RoamSession:
     busy: bool = False
     last_used: float = 0.0
     files: list[tuple[Path, Path]] = field(default_factory=list)  # (jpg, png) per spot still on disk, oldest first
+    visits: dict[str, Visit] = field(default_factory=dict)   # by spot id: the spots whose files are still on disk

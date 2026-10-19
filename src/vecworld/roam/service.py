@@ -19,14 +19,14 @@ from pathlib import Path
 from typing import Callable
 
 from vecworld.config import MAX_SESSIONS, MAX_THEME_CHARS, MOOD_BG_STRENGTH, MOOD_WORDS, MOODS, SESSION_TTL, STYLE
-from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownSession
+from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownSession, UnknownSpot
 from vecworld.dream.gpu import GpuQueue
 from vecworld.dream.ideas import Dreamer
 from vecworld.dream.painter import Painter, Prompt
 from vecworld.roam.depth import DepthEstimator, depth_png
 from vecworld.roam.places import (GENERIC_SCENERY, MIN_SEPARATION, Journey, Neighbour, assign_bearings,
                                   fallback_neighbours)
-from vecworld.roam.session import Predream, RoamSession, SpotView
+from vecworld.roam.session import Predream, RoamSession, SpotView, Visit
 from vecworld.roam.spot import Spot, first_spot, next_spot
 from vecworld.scenes.palette import Stats, palette_stats
 
@@ -216,6 +216,7 @@ class RoamService:
                 s.journey, s.moods, s.steps, s.visited = journey, moods, 0, [place]
                 s.places_for, s.names, s.typed, s.hint = None, None, set(), 0.0
                 s.files.append(paths)
+                s.visits = {spot.id: Visit(spot, stats, journey, stats, paths, None)}
                 self._submit_set(s)
                 view = self._view(s, paths, None)
         self._forget_files(s)
@@ -249,6 +250,41 @@ class RoamService:
                     snap = self._snap(s)
                 built = self._run(s, lambda: self._build(snap, exit_heading))
             return self._commit(s, built, exit_heading, hints)
+
+    def enter(self, sid: str, spot_id: str) -> SpotView:
+        """Step back into a spot the player walked into without a move: one the current spot was built from (its
+        parent, or further back while the files last: a move can land while the player walks back), or one built
+        from the current spot. The journey and colour reference return to what they were when it was current; the
+        pre-dreamed set is made around it. No GPU work."""
+        s = self._started(sid)
+        with self._claim(s):
+            with self._lock:
+                if spot_id != s.spot.id:
+                    v = s.visits.get(spot_id)
+                    if v is None or not (v.parent_id == s.spot.id or spot_id in self._ancestors(s)):
+                        raise UnknownSpot("That spot has faded from the dream.")
+                    self._leave(s)
+                    j = v.journey
+                    if s.names is not None:   # the LLM's places, if they landed after it was current
+                        j = _renamed(j, *s.names, s.typed)
+                    s.spot, s.spot_stats, s.journey, s.ref = v.spot, v.spot_stats, j, v.ref
+                    s.prefetch = {}
+                    self._submit_set(s)
+                return self._view(s, s.visits[s.spot.id].paths, None)
+
+    def _ancestors(self, s: RoamSession) -> list[str]:
+        """The ids the current spot was built from, nearest first, as far back as the session still holds."""
+        out, v = [], s.visits.get(s.spot.id)
+        while v is not None and v.parent_id is not None and v.parent_id not in out:
+            out.append(v.parent_id)
+            v = s.visits.get(v.parent_id)
+        return out
+
+    def _leave(self, s: RoamSession) -> None:
+        """Remember the current spot's journey and reference as they are now. Caller holds the lock."""
+        v = s.visits.get(s.spot.id)
+        if v is not None:
+            s.visits[s.spot.id] = Visit(v.spot, v.spot_stats, s.journey, s.ref, v.paths, v.parent_id)
 
     def heading(self, sid: str, heading: float) -> None:
         """The player's heading: re-target the pre-dreamed set around it. Never paints on this thread."""
@@ -430,6 +466,7 @@ class RoamService:
             for fn in s.pending:          # theme or neighbour changes made during this move
                 j = fn(j)
             s.pending = []
+            self._leave(s)
             s.spot, s.spot_stats, s.journey, s.steps = built.spot, stats, j, s.steps + 1
             s.files.append(paths)
             if built.arrived:
@@ -440,6 +477,7 @@ class RoamService:
                 s.ref, s.ref_pending = stats, False
             if s.hints == hints:          # no newer hint arrived during the move: keep walking this way
                 s.hint = exit_heading
+            s.visits[built.spot.id] = Visit(built.spot, stats, j, s.ref, paths, built.parent_id)
             s.prefetch = {}
             self._submit_set(s)
             view = self._view(s, paths, built.arrived)
@@ -535,6 +573,7 @@ class RoamService:
         with self._lock:
             old = s.files[:max(0, len(s.files) - keep)]
             del s.files[:len(old)]
+            s.visits = {k: v for k, v in s.visits.items() if v.paths in s.files}
         for pair in old:
             for p in pair:
                 p.unlink(missing_ok=True)

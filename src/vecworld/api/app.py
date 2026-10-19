@@ -21,6 +21,10 @@ class NextIn(BaseModel):
     exit_heading: float = Field(allow_inf_nan=False)
 
 
+class EnterIn(BaseModel):
+    spot_id: str = Field(max_length=64)
+
+
 class HeadingIn(BaseModel):
     heading: float = Field(allow_inf_nan=False)
 
@@ -81,6 +85,11 @@ def create_app(service: RoamService, web_dir: Path) -> FastAPI:
     @app.post("/api/session/{sid}/next")
     async def next_spot(sid: str, body: NextIn):
         return spot_out(await run(service.next, sid, body.exit_heading))
+
+    @app.post("/api/session/{sid}/enter")
+    async def enter(sid: str, body: EnterIn):
+        # No GPU work and never waits (a move in flight makes it 409 busy), so it runs inline.
+        return spot_out(service.enter(sid, body.spot_id))
 
     @app.post("/api/session/{sid}/heading", status_code=202)
     async def heading(sid: str, body: HeadingIn):

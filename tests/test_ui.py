@@ -1,5 +1,6 @@
 """Browser tests for the Dream Roam game viewer, against the real app running fake models (headless Firefox,
 software WebGL)."""
+import math
 import socket
 import threading
 import time
@@ -68,6 +69,10 @@ class RecordingService(RoamService):
             v.image_path.rename(aside)
             self.hidden = (aside, v.image_path)
         return v
+
+    def enter(self, sid, spot_id):
+        self._rec("enter", spot_id)
+        return super().enter(sid, spot_id)
 
     def heading(self, sid, heading):
         self._rec("heading", heading)
@@ -335,58 +340,132 @@ def test_failed_next_keeps_current_spot(server, browser):
     assert js(browser, "window.roamErrors") == []
 
 
-def test_walking_back_then_out_steps_from_the_server_spot(server, browser):
-    """Back in the previous spot (past the bisector), an edge there re-roots on the server's spot first: the next
-    spot is asked for from it and placed beside it, not beside the spot the player wandered back into."""
+def bearing(a, b):
+    """World bearing (degrees) from point a to point b, both {x, z}."""
+    return math.degrees(math.atan2(b["x"] - a["x"], -(b["z"] - a["z"]))) % 360
+
+
+def step_into_a_child(d, svc):
+    """Walk north from the first spot until the server steps into the next one; returns (first, second) ids."""
+    first = js(d, "roam.spotId")
+    d.execute_script("roamDev.look(0, 0.18)")
+    key_down(d, "w")
+    try:
+        wait(d, f"roam.spotId !== {first!r} && roam.inServerSpot")
+    finally:
+        key_up(d, "w")
+    return first, js(d, "roam.spotId")
+
+
+def test_walking_back_then_out_steps_from_the_spot_the_player_is_in(server, browser):
+    """Back in the previous spot (past the bisector), the server is told (/enter), and the next /next is asked from
+    that spot: its exit heading is the bearing from that spot's origin to where the player walks out."""
     url, svc, _ = server
     start(browser, url)
-    first = js(browser, "roam.spotId")
-    browser.execute_script("roamDev.look(0, 0.18)")
-    key_down(browser, "w")
-    try:
-        wait(browser, f"roam.spotId !== {first!r}")
-    finally:
-        key_up(browser, "w")
-    second = js(browser, "roam.spotId")
+    first, second = step_into_a_child(browser, svc)
+    n = len(svc.calls)
     browser.execute_script("roamDev.look(180, 0.18)")
     key_down(browser, "w")
     try:
-        wait(browser, "!roam.inServerSpot")              # walked back into the first spot
+        wait(browser, f"roam.spotId === {first!r} && !roam.entering")    # walked back in, and the server knows
     finally:
         key_up(browser, "w")
+    assert ("enter", first) in svc.since(n)
     browser.execute_script("roamDev.look(90, 0.18)")
-    n = len(svc.calls)
     key_down(browser, "w")
     try:
-        wait(browser, f"roam.spotId !== {second!r}")
+        wait(browser, f"roam.steps.length === 2 && roam.spotId !== {first!r} && !roam.stepping")
     finally:
         key_up(browser, "w")
-    steps = js(browser, "roam.steps")
-    assert len(steps) == 2 and steps[1]["from"] == second and steps[1]["inServerSpot"], steps
-    assert js(browser, "roam.parentSpotId") == second
-    assert [round(h, 6) for h, _ in svc.since(n, "next")] == [round(steps[1]["exit"], 6)]
-    assert 45 < steps[1]["exit"] < 180, steps      # eastward, measured from the server's spot
+    step = js(browser, "roam.steps")[1]
+    assert step["from"] == first and step["inServerSpot"], step
+    assert js(browser, "roam.parentSpotId") == first
+    nexts = [h for h, _ in svc.since(n, "next")]
+    assert nexts == [pytest.approx(step["exit"] % 360)]
+    assert ang(step["exit"], bearing(step["origin"], step["player"])) <= 10, step
+    assert 45 < step["exit"] < 135, step           # east of the first spot
     assert js(browser, "window.roamErrors") == []
+
+
+def test_walking_back_through_the_parent_and_out_its_far_side(server, browser):
+    """Along the child→parent line and on out of the parent: one switch back, steady movement, no re-root
+    ping-pong, and the next spot asked from the parent."""
+    url, svc, _ = server
+    start(browser, url)
+    first, second = step_into_a_child(browser, svc)
+    browser.execute_script("roamDev.look(180, 0.18)")
+    before, z0 = js(browser, "roam.switches"), js(browser, "roam.world.z")
+    key_down(browser, "w")
+    try:
+        time.sleep(3)
+        assert js(browser, "roam.switches") - before <= 2
+        assert js(browser, "roam.world.z") > z0 + 1.5                   # kept walking south
+        wait(browser, "roam.steps.length === 2")
+    finally:
+        key_up(browser, "w")
+    step = js(browser, "roam.steps")[1]
+    assert step["from"] == first and step["inServerSpot"], step
+    assert ang(step["exit"], 180) < 20, step
+    assert js(browser, "window.roamErrors") == []
+
+
+def test_creeping_up_to_the_rim_and_turning_back_commits_nothing(server, browser):
+    """The commit point depends on speed: creeping in short taps to well past where a walk would commit, then
+    turning back, sends no /next."""
+    url, svc, _ = server
+    start(browser, url)
+    n = len(svc.calls)
+    browser.execute_script("roamDev.look(0, 0.18)")
+    hold(browser, "w", 1.0)
+    for _ in range(40):                                 # LIMIT 2.2; walking at full speed commits by r ≈ 1.7
+        if radius(browser) >= 1.85 or js(browser, "roam.steps.length"):
+            break
+        hold(browser, "w", 0.1)
+        wait(browser, "roamDev.hero.speed < 0.01")
+    assert js(browser, "roam.steps") == [] and radius(browser) >= 1.85
+    browser.execute_script("roamDev.look(180, 0.18)")
+    hold(browser, "w", 1.0)
+    assert radius(browser) < 1.4
+    assert svc.since(n, "next") == [] and js(browser, "roam.steps") == []
+
+
+def fail_a_build_walking_north(d, svc):
+    """Walk north with the next spot's panorama hidden: /next succeeds, its spot can't build."""
+    svc.hide_next_image = True
+    d.execute_script("roamDev.look(0, 0.18)")
+    key_down(d, "w")
+    try:
+        wait(d, TOAST)
+        assert "didn't load" in d.find_element("id", "toast").text
+        assert "step back and try again" in d.find_element("id", "toast").text
+    finally:
+        key_up(d, "w")
 
 
 def test_spot_that_failed_to_build_is_built_again_without_a_new_next(server, browser):
     url, svc, _ = server
     start(browser, url)
     first = js(browser, "roam.spotId")
-    svc.hide_next_image = True           # /next succeeds, but its panorama won't load
-    browser.execute_script("roamDev.look(0, 0.18)")
     n = len(svc.calls)
-    key_down(browser, "w")
-    try:
-        wait(browser, TOAST)
-        assert "didn't load" in browser.find_element("id", "toast").text
-    finally:
-        key_up(browser, "w")
+    fail_a_build_walking_north(browser, svc)
     assert js(browser, "roam.spotId") == first
     aside, original = svc.hidden
     aside.rename(original)
     hold(browser, "s", 1.2)
     wait(browser, "!roam.stuck")
+    # Out to the east the way stays closed: the server's next spot lies north.
+    browser.execute_script("document.getElementById('toast').hidden = true; roamDev.look(90, 0.18)")
+    key_down(browser, "w")
+    try:
+        wait(browser, f"{TOAST} && roam.braking", timeout=20)
+        assert "step back and try again" in browser.find_element("id", "toast").text
+        wait(browser, "roamDev.hero.speed < 0.01")
+        assert not js(browser, "roam.fog") and not js(browser, "roam.stepping")
+    finally:
+        key_up(browser, "w")
+    assert len(js(browser, "roam.steps")) == 1
+    hold(browser, "s", 1.2)                           # back west, toward the middle
+    browser.execute_script("roamDev.look(0, 0.18)")
     key_down(browser, "w")
     try:
         wait(browser, f"roam.spotId !== {first!r}")
@@ -395,6 +474,26 @@ def test_spot_that_failed_to_build_is_built_again_without_a_new_next(server, bro
     assert len(svc.since(n, "next")) == 1              # the spot the server had moved to, built this time
     assert js(browser, "roam.steps.map(s => s.rebuild)") == [False, True]
     assert js(browser, "roam.spotId") == original.stem
+    assert js(browser, "window.roamErrors") == []
+
+
+def test_spot_that_keeps_failing_to_build_is_given_up(server, browser):
+    url, svc, _ = server
+    start(browser, url)
+    first = js(browser, "roam.spotId")
+    n = len(svc.calls)
+    fail_a_build_walking_north(browser, svc)           # its panorama never comes back
+    hold(browser, "s", 1.2)
+    wait(browser, "!roam.stuck")
+    browser.execute_script("roamDev.look(0, 0.18)")
+    key_down(browser, "w")
+    try:
+        wait_for(lambda: ("enter", first) in svc.since(n), timeout=30)   # given up: the server steps back
+        wait(browser, f"roam.spotId !== {first!r}")          # and a fresh /next goes out and lands
+    finally:
+        key_up(browser, "w")
+    assert [k for k, _ in svc.since(n) if k in ("next", "enter")][:3] == ["next", "enter", "next"]
+    assert js(browser, "roam.steps.map(s => s.rebuild)")[:3] == [False, True, False]
     assert js(browser, "window.roamErrors") == []
 
 
