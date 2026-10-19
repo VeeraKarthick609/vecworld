@@ -516,8 +516,8 @@ def test_back_in_a_spot_its_oldest_child_is_walked_into_again(server, browser):
 
 
 def test_a_refused_enter_drops_the_spot_and_does_not_loop(server, browser):
-    """The server no longer holds the spot walked back into (unknown_spot): the viewer says so, drops it, stays
-    in (re-roots on) the server's spot, and asks only once."""
+    """The server no longer holds the spot walked back into (unknown_spot): the viewer says so, drops it, re-roots
+    on the server's spot, asks only once, and the next step goes out from that spot."""
     url, svc, _ = server
     start(browser, url)
     first, second = step_into_a_child(browser, svc)
@@ -526,16 +526,21 @@ def test_a_refused_enter_drops_the_spot_and_does_not_loop(server, browser):
     browser.execute_script("roamDev.look(180, 0.18)")
     key_down(browser, "w")
     try:
-        wait(browser, TOAST, timeout=30)
+        wait(browser, f"roam.entering || !roam.spotIds.includes({first!r})", timeout=30)   # switched back in
     finally:
-        key_up(browser, "w")
+        key_up(browser, "w")                         # stop there: no step may go out before the checks below
+    wait(browser, TOAST)
     assert "faded" in browser.find_element("id", "toast").text
     wait(browser, f"!roam.spotIds.includes({first!r}) && !roam.entering")
-    # Back on the server's spot: still walking (the coast), the next step goes out from it.
-    assert js(browser, "roam.world && roam.spotIds.includes(" + repr(second) + ")")
-    assert all(st["from"] == second and st["inServerSpot"] for st in js(browser, "roam.steps")[1:])
-    hold(browser, "w", 1.5)                              # on back that way: no retry storm
-    assert [a for a, _ in svc.since(n, "enter")] == [first]
+    wait(browser, "roamDev.hero.speed < 0.01")
+    # the client's current spot is the second one, and it is the server's spot
+    assert js(browser, "roamDev.world.current.meta.spot_id") == second
+    assert js(browser, "roam.spotId") == second and js(browser, "roam.inServerSpot")
+    assert len(js(browser, "roam.steps")) == 1
+    walk(browser, 180, "roam.steps.length === 2 && !roam.stepping", timeout=30)   # on that way: a new spot
+    step = js(browser, "roam.steps")[1]
+    assert step["from"] == second and step["inServerSpot"], step
+    assert [a for a, _ in svc.since(n, "enter")] == [first]        # asked once, no retry storm
     assert first not in js(browser, "roam.spotIds")
     assert js(browser, "window.roamErrors") == []
 

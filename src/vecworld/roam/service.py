@@ -481,7 +481,7 @@ class RoamService:
 
     def _commit(self, s: RoamSession, built: _Built, exit_heading: float, hints: int, served: str) -> SpotView:
         stats = palette_stats(built.spot.image)
-        paths = self._paths(built.spot)
+        paths = self._save(built.spot)   # first: a failed write leaves the session on its spot
         with self._lock:
             self._check_alive(s, paths)
             assert built.parent_id == s.spot.id, "a build from another spot reached commit"
@@ -506,10 +506,6 @@ class RoamService:
             s.prefetch = {}
             self._submit_set(s)
             view = self._view(s, paths, built.arrived, served)
-        # Written once the new spot's pre-dreams are on the GPU, so the encoding never leaves it idle.
-        self._write(built.spot, paths)
-        with self._lock:
-            self._check_alive(s, paths)   # evicted meanwhile: nothing may keep its files
         self._forget_files(s)
         self._maybe_refill(s)
         return view

@@ -34,7 +34,8 @@ class GpuQueue:
         self._queues: tuple[OrderedDict, OrderedDict] = (OrderedDict(), OrderedDict())
         # (owner, key) -> future, for keyed prefetch jobs queued or running
         self._keyed: dict[tuple[str, Hashable], Future] = {}
-        self._running: tuple[tuple[str, Hashable] | None, threading.Event] | None = None   # (running_key, stop)
+        # the running job: (running_key, stop event, future)
+        self._running: tuple[tuple[str, Hashable] | None, threading.Event, Future] | None = None
         self._thread = threading.Thread(target=self._run, name="gpu-queue", daemon=True)
         self._thread.start()
 
@@ -69,6 +70,12 @@ class GpuQueue:
             wanted = {}
             for key, fn in jobs:
                 wanted.setdefault(key, fn)
+            run = self._running
+            if stop_running and run is not None and run[0] is not None and run[0][0] == owner \
+                    and run[0][1] not in wanted:
+                run[1].set()
+                if self._keyed.get(run[0]) is run[2]:   # doomed: a later set wanting this key gets a fresh job
+                    del self._keyed[run[0]]
             q = self._queues[_PREFETCH]
             old = q.get(owner)
             queued = {rk[1]: (item) for item in (old or ()) if (rk := item[2]) is not None}
@@ -85,10 +92,6 @@ class GpuQueue:
                 self._keyed[rk] = fut
                 result[key] = fut
                 items.append((fut, fn, rk))
-            run = self._running
-            if stop_running and run is not None and run[0] is not None and run[0][0] == owner \
-                    and run[0][1] not in wanted:
-                run[1].set()
             for fut, _, rk in queued.values():  # queued but no longer wanted
                 fut.cancel()
                 if self._keyed.get(rk) is fut:
@@ -141,7 +144,7 @@ class GpuQueue:
             stop = threading.Event()
             try:
                 with self._cond:
-                    self._running = (rk, stop)
+                    self._running = (rk, stop, fut)
                 _job.stop = stop
                 if fut.set_running_or_notify_cancel():
                     try:

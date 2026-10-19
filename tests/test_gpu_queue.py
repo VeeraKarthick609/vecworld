@@ -420,3 +420,23 @@ def test_check_stop_outside_a_job_is_a_no_op():
     from vecworld.dream.gpu import check_stop
 
     check_stop()
+
+
+def test_a_job_told_to_stop_is_not_handed_out_again_for_its_key():
+    """Review fix: re-requesting a key whose running job was just told to stop gets a fresh job, not the doomed one."""
+    from vecworld.dream.gpu import Stopped
+
+    q, order = GpuQueue(), []
+    started, release = threading.Event(), threading.Event()
+    first = q.submit_set([("h", _stoppable(started, release, order, "h"))], "a")
+    assert started.wait(5)
+    q.submit_set([("x", _rec(order, "x"))], "a", stop_running=True)     # h told to stop
+    again = q.submit_set([("h", _rec(order, "h2"))], "a")               # ...and wanted again at once
+    assert again["h"] is not first["h"]
+    assert again["h"].result(timeout=5) == "h2"
+    try:
+        first["h"].result(timeout=5)
+        raise AssertionError("not stopped")
+    except Stopped:
+        pass
+    release.set()

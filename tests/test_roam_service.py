@@ -1228,25 +1228,21 @@ def test_a_view_served_by_waiting_on_a_running_predream_says_so(make):
     assert out[0].served == "waited"
 
 
-def test_the_next_set_goes_to_the_gpu_before_the_spot_is_written_out(make):
-    """Pacing: writing a spot's JPEG and depth PNG must not keep the GPU idle; the new spot's pre-dreams are
-    queued first."""
+def test_a_failed_write_leaves_the_session_on_its_spot(make, monkeypatch):
+    """Review fix: the new spot's files are written before the session moves to it, so a failed write (disk full)
+    changes nothing: same spot, no files of the new one, and the next move still works."""
     svc = make(queue=ManualQueue())
     s = started(svc)
-    events = []
-    submit_set, write = svc.queue.submit_set, svc._write
+    before = (s.spot, s.steps, list(s.files))
 
-    def spy_set(jobs, owner, stop_running=False):
-        events.append(("set", [k for k, _ in jobs]))
-        return submit_set(jobs, owner, stop_running=stop_running)
+    def boom(spot, paths):
+        raise OSError("disk full")
 
-    def spy_write(spot, paths):
-        events.append(("write", spot.id))
-        return write(spot, paths)
+    monkeypatch.setattr(svc, "_write", boom)
+    with pytest.raises(OSError):
+        svc.next(s.id, 90, walked=3.0)
+    assert (s.spot, s.steps, list(s.files)) == before and not s.busy
+    assert sorted(p.name for p in svc.scene_dir.iterdir()) == sorted(p.name for p in before[2][0])
+    monkeypatch.undo()
+    assert svc.next(s.id, 90, walked=3.0).image_path.exists()
 
-    svc.queue.submit_set, svc._write = spy_set, spy_write
-    v = svc.next(s.id, 90, walked=3.0)
-    sets = [i for i, (k, a) in enumerate(events) if k == "set" and a and all(f":{v.spot_id}:" in x for x in a)]
-    writes = [i for i, (k, a) in enumerate(events) if k == "write" and a == v.spot_id]
-    assert sets and writes and sets[0] < writes[0], events
-    assert v.image_path.exists() and v.depth_path.exists()
