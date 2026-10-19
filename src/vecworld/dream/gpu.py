@@ -39,6 +39,10 @@ class GpuQueue:
         Queued jobs whose key is not in the set are cancelled; a queued or running job
         whose key is in the set is kept and its future returned. Running jobs are never
         cancelled. The owner keeps its place in the round-robin rotation.
+
+        Key contract: a repeated key reuses the original queued/running job AND its fn,
+        ignoring the new fn. Keys must therefore encode everything the fn depends on
+        (e.g. world version + heading). Finished (done or failed) jobs are never reused.
         """
         result: dict[Hashable, Future] = {}
         with self._cond:
@@ -51,7 +55,7 @@ class GpuQueue:
             items = []
             for key, fn in wanted.items():
                 kept = self._keyed.get((owner, key))
-                if kept is not None and not kept.cancelled():
+                if kept is not None and not kept.done():  # done covers cancelled; never reuse a finished job
                     result[key] = kept
                     if key in queued:  # still waiting: keep it, in the new order
                         items.append(queued.pop(key))
@@ -119,4 +123,4 @@ class GpuQueue:
             finally:
                 self._finish(fut, rk)
             # drop references so a finished/failed job's tensors can be freed
-            del item, fut, fn
+            del item, fut, fn, rk

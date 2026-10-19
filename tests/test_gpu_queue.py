@@ -280,3 +280,63 @@ def test_single_prefetch_does_not_keep_previous_with_same_name():
     assert f1.cancelled() and not f2.cancelled()
     release.set()
     assert f2.result(timeout=5) == "p2"
+
+
+def test_done_future_in_finish_window_is_not_reused(monkeypatch):
+    q, order = GpuQueue(), []
+    entered, go = threading.Event(), threading.Event()
+    orig = q._finish
+
+    def slow_finish(fut, rk):
+        entered.set()
+        assert go.wait(5)
+        orig(fut, rk)
+
+    monkeypatch.setattr(q, "_finish", slow_finish)
+    bad = q.submit_set([("h", lambda: 1 / 0)], "a")["h"]
+    assert entered.wait(5)
+    assert bad.done()  # resolved, but the worker has not dropped its key yet
+    retry = q.submit_set([("h", _rec(order, "h"))], "a")["h"]
+    assert retry is not bad
+    go.set()
+    assert retry.result(timeout=5) == "h"
+    assert isinstance(bad.exception(timeout=5), ZeroDivisionError)
+
+
+def test_set_of_three_vs_one_is_fair():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    sa = _set(q, "a", ["a1", "a2", "a3"], order)
+    sb = _set(q, "b", ["b1"], order)
+    release.set()
+    for f in (*sa.values(), *sb.values()):
+        f.result(timeout=5)
+    assert order == ["busy", "a1", "b1", "a2", "a3"]
+
+
+def _release_check(job_factory):
+    q = GpuQueue()
+    payload = _Payload()
+    ref = weakref.ref(payload)
+    fut = q.submit_set([("k", job_factory(payload))], "a")["k"]
+    fut.exception(timeout=5)
+    del payload, fut, job_factory
+    for _ in range(100):
+        gc.collect()
+        if ref() is None:
+            break
+        threading.Event().wait(0.01)
+    return ref
+
+
+def test_set_job_released_after_success():
+    assert _release_check(lambda p: (lambda: p and 1))() is None
+
+
+def test_set_job_released_after_failure():
+    def factory(p):
+        def boom():
+            p
+            raise RuntimeError("oom")
+        return boom
+    assert _release_check(factory)() is None
