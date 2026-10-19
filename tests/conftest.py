@@ -40,10 +40,18 @@ class FakeDreamer:
 
     def __init__(self):
         self.calls: list[tuple[str, list[str], int]] = []
+        self.place_calls: list[tuple[str, list[str], list[str], int]] = []
 
     def ideas(self, theme, moods, n):
         self.calls.append((theme, list(moods), n))
         return [self.IDEAS[i % len(self.IDEAS)] for i in range(n)]
+
+    PLACES = ["old mill", "reed marsh", "pine ridge", "stone bridge"]
+
+    def places(self, place, journey, moods, n):
+        self.place_calls.append((place, list(journey), list(moods), n))
+        return [(self.PLACES[i % len(self.PLACES)],
+                 (f"a path of {i} stones", "a mossy fence post", "a crooked old tree")) for i in range(n)]
 
 
 class FakeDepth:

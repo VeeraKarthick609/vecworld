@@ -84,8 +84,61 @@ def ideas_request(theme: str, moods: list[str], n: int) -> list[dict]:
     ]
 
 
+GENERIC_SCENERY = ("a winding path", "a quiet clearing", "a weathered signpost")
+MAX_NAME_WORDS = 4
+
+
+def places_request(place: str, journey: list[str], moods: list[str], n: int) -> list[dict]:
+    """The chat messages asking the model for n related neighbouring places, each with 3 in-between sights."""
+    mood = f" ({', '.join(moods)})" if moods else ""
+    seen = f" Already visited, do not repeat: {', '.join(journey)}." if journey else ""
+    return [
+        {"role": "system", "content": "You invent places for a painted dreamscape one can wander through."},
+        {"role": "user", "content": (
+            f'List {n} different places that lie near "{place}"{mood} and relate to it. For each, give '
+            "its name (1 to 3 words) and 3 short phrases (2 to 6 words each) naming visible things one "
+            "passes on the way there. Only things you could photograph: no sounds, smells, feelings or "
+            f"weather.{seen} One place per line in exactly this format, no numbering, no explanations:\n"
+            "Name: phrase; phrase; phrase")},
+    ]
+
+
+def _clean(part: str) -> str:
+    return " ".join(_BULLET.sub("", part).strip(_EDGE).lower().split())
+
+
+def parse_places(text: str, n: int) -> list[tuple[str, tuple[str, ...]]]:
+    """(name, three scenery phrases) from "Name: phrase; phrase; phrase" lines. Chatter, headers and lines
+    without a usable name are dropped; bad scenery phrases are dropped and the rest padded to 3 with
+    generic scenery."""
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for line in text.splitlines():
+        line = _BULLET.sub("", line).strip()
+        if not line or line.endswith(":") or _CHATTER.match(line.lower()):
+            continue
+        head, _, tail = line.partition(":")
+        name = _clean(head)
+        if (not name or not 1 <= len(name.split()) <= MAX_NAME_WORDS or len(name) > MAX_PHRASE_CHARS
+                or not _PHRASE.match(name) or name in (o[0] for o in out)):
+            continue
+        phrases: list[str] = []
+        for part in tail.split(";"):
+            p = _clean(part)
+            if (2 <= len(p.split()) <= 8 and len(p) <= MAX_PHRASE_CHARS and _PHRASE.match(p) and is_visual(p)
+                    and p not in phrases):
+                phrases.append(p)
+        phrases = phrases[:3]
+        phrases += [g for g in GENERIC_SCENERY if g not in phrases][:3 - len(phrases)]
+        out.append((name, tuple(phrases)))
+        if len(out) >= n:
+            break
+    return out
+
+
 class Dreamer(Protocol):
     def ideas(self, theme: str, moods: list[str], n: int) -> list[str]: ...
+    def places(self, place: str, journey: list[str], moods: list[str], n: int
+               ) -> list[tuple[str, tuple[str, ...]]]: ...
 
 
 class QwenDreamer:
@@ -101,8 +154,7 @@ class QwenDreamer:
         self.tok = AutoTokenizer.from_pretrained(model_id)
         self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32).to("cpu").eval()
 
-    def ideas(self, theme: str, moods: list[str], n: int) -> list[str]:
-        messages = ideas_request(theme, moods, n)
+    def _generate(self, messages: list[dict], max_new_tokens: int) -> str:
         prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tok(prompt, return_tensors="pt")
         with self._lock:
@@ -110,10 +162,13 @@ class QwenDreamer:
             self._torch.set_num_threads(GEN_THREADS)
             try:
                 with self._torch.no_grad():
-                    ids = self.model.generate(**inputs, max_new_tokens=96, do_sample=False)
+                    ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
             finally:
                 self._torch.set_num_threads(prev)
-        text = self.tok.decode(ids[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        return self.tok.decode(ids[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+    def ideas(self, theme: str, moods: list[str], n: int) -> list[str]:
+        text = self._generate(ideas_request(theme, moods, n), 96)
         found = parse_ideas(text, n)
         if len(found) < n:
             pool = list(FALLBACK_IDEAS)
@@ -123,4 +178,19 @@ class QwenDreamer:
                     break
                 if p not in found:
                     found.append(p)
+        return found
+
+    def places(self, place: str, journey: list[str], moods: list[str], n: int
+               ) -> list[tuple[str, tuple[str, ...]]]:
+        from vecworld.roam.places import fallback_neighbours  # lazy: roam.places must not import this module
+
+        text = self._generate(places_request(place, journey, moods, n), 40 * n + 20)
+        found = [(nm, sc) for nm, sc in parse_places(text, n + len(journey) + 1)
+                 if nm != place.lower() and nm not in journey][:n]
+        have = {nm for nm, _ in found}
+        for nm in fallback_neighbours(place):
+            if len(found) >= n:
+                break
+            if nm not in have and nm != place.lower() and nm not in journey:
+                found.append((nm, GENERIC_SCENERY))
         return found

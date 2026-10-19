@@ -37,3 +37,30 @@ def test_request_names_moods_only_when_there_are_some():
     assert '"haunted forest" (night, eerie).' in ideas_request("haunted forest", ["night", "eerie"], 8)[1]["content"]
     plain = ideas_request("haunted forest", [], 8)[1]["content"]
     assert '"haunted forest". Only' in plain and "quiet" not in plain
+
+
+def test_places_request_shape():
+    from vecworld.dream.ideas import places_request
+
+    msgs = places_request("old forest", ["village", "lake"], ["foggy"], 3)
+    assert [m["role"] for m in msgs] == ["system", "user"]
+    u = msgs[1]["content"]
+    assert "old forest" in u and "foggy" in u and "3" in u and "Name: phrase; phrase; phrase" in u
+    assert "village" in u and "lake" in u  # the journey so far, so names don't repeat
+
+
+def test_places_request_without_moods_or_journey():
+    from vecworld.dream.ideas import places_request
+
+    assert places_request("oasis", [], [], 2)[1]["content"]
+
+
+def test_qwen_places_filters_and_fills_from_fallbacks_without_a_model():
+    from vecworld.dream.ideas import QwenDreamer
+
+    d = object.__new__(QwenDreamer)
+    d._generate = lambda messages, max_new_tokens: (
+        "Here are places:\n1. Forest: a; b; c\n2. Reed Marsh: tall green reeds; a rotting jetty; a heron on one leg\n")
+    out = d.places("forest", ["village"], [], 3)
+    assert out[0][0] == "reed marsh" and len(out) == 3 and all(len(sc) == 3 for _, sc in out)
+    assert {n for n, _ in out}.isdisjoint({"forest", "village"}) and len({n for n, _ in out}) == 3
