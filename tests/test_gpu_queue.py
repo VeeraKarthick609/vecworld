@@ -148,3 +148,135 @@ def test_failed_job_is_released_while_worker_idle():
             break
         threading.Event().wait(0.01)
     assert ref() is None
+
+
+def _set(q, owner, names, order):
+    return q.submit_set([(n, _rec(order, n)) for n in names], owner)
+
+
+def test_set_runs_heading_first():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    futs = _set(q, "a", ["heading", "left", "right"], order)
+    assert list(futs) == ["heading", "left", "right"]
+    release.set()
+    for f in futs.values():
+        f.result(timeout=5)
+    assert order == ["busy", "heading", "left", "right"]
+
+
+def test_resubmit_cancels_only_changed_queued_key():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    first = _set(q, "a", ["h", "l", "r"], order)
+    second = _set(q, "a", ["h", "r", "r2"], order)
+    assert second["h"] is first["h"] and second["r"] is first["r"]
+    assert first["l"].cancelled()
+    assert not first["h"].cancelled() and not first["r"].cancelled()
+    release.set()
+    for f in second.values():
+        f.result(timeout=5)
+    assert order == ["busy", "h", "r", "r2"]
+
+
+def test_resubmit_reorders_to_new_set_order():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    _set(q, "a", ["h", "l", "r"], order)
+    second = _set(q, "a", ["r", "h", "l"], order)
+    release.set()
+    for f in second.values():
+        f.result(timeout=5)
+    assert order == ["busy", "r", "h", "l"]
+
+
+def test_running_job_is_never_cancelled_and_is_reused():
+    q, order = GpuQueue(), []
+    started, release = threading.Event(), threading.Event()
+
+    def slow():
+        order.append("h")
+        started.set()
+        assert release.wait(5)
+        return "h"
+
+    first = q.submit_set([("h", slow), ("l", _rec(order, "l"))], "a")
+    assert started.wait(5)
+    # heading is running: a set without it must not cancel it; one with it reuses it
+    q.submit_set([("x", _rec(order, "x"))], "a")
+    assert not first["h"].cancelled() and first["h"].running()
+    again = q.submit_set([("h", _rec(order, "h2")), ("y", _rec(order, "y"))], "a")
+    assert again["h"] is first["h"]
+    assert first["l"].cancelled()
+    release.set()
+    assert first["h"].result(timeout=5) == "h"
+    again["y"].result(timeout=5)
+    assert order == ["h", "y"]
+
+
+def test_finished_key_can_be_requeued():
+    q, order = GpuQueue(), []
+    f1 = _set(q, "a", ["h"], order)["h"]
+    assert f1.result(timeout=5) == "h"
+    f2 = _set(q, "a", ["h"], order)["h"]
+    assert f2 is not f1 and f2.result(timeout=5) == "h"
+    assert order == ["h", "h"]
+
+
+def test_externally_cancelled_key_is_requeued():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    f = _set(q, "a", ["h"], order)["h"]
+    assert f.cancel()
+    g = _set(q, "a", ["h"], order)["h"]
+    assert g is not f
+    release.set()
+    assert g.result(timeout=5) == "h"
+    assert order == ["busy", "h"]
+
+
+def test_empty_set_cancels_queued_and_leaves_queue_usable():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    futs = _set(q, "a", ["h", "l"], order)
+    assert q.submit_set([], "a") == {}
+    assert all(f.cancelled() for f in futs.values())
+    later = q.submit(_rec(order, "later"), "b", prefetch=True)
+    release.set()
+    assert later.result(timeout=5) == "later"
+    assert order == ["busy", "later"]
+
+
+def test_set_does_not_touch_other_owner_or_demand():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    d = q.submit(_rec(order, "d"), "a")
+    pb = _set(q, "b", ["b1"], order)
+    pa = _set(q, "a", ["a1"], order)
+    _set(q, "a", ["a2"], order)
+    assert pa["a1"].cancelled() and not pb["b1"].cancelled() and not d.cancelled()
+    release.set()
+    d.result(timeout=5), pb["b1"].result(timeout=5)
+    assert order[:3] == ["busy", "d", "b1"]
+
+
+def test_demand_jumps_ahead_of_set_and_owners_take_turns():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    sa = _set(q, "a", ["a1", "a2"], order)
+    sb = _set(q, "b", ["b1", "b2"], order)
+    d = q.submit(_rec(order, "d"), "c")
+    release.set()
+    for f in (*sa.values(), *sb.values(), d):
+        f.result(timeout=5)
+    assert order == ["busy", "d", "a1", "b1", "a2", "b2"]
+
+
+def test_single_prefetch_does_not_keep_previous_with_same_name():
+    q, order = GpuQueue(), []
+    busy, release = _blocker(q, order)
+    f1 = q.submit(_rec(order, "p1"), "a", prefetch=True)
+    f2 = q.submit(_rec(order, "p2"), "a", prefetch=True)
+    assert f1.cancelled() and not f2.cancelled()
+    release.set()
+    assert f2.result(timeout=5) == "p2"
