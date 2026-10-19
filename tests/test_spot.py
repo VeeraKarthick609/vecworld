@@ -79,10 +79,11 @@ def test_next_spot_pulls_palette_toward_ref():
 @pytest.mark.parametrize("parent_scale", [1.0, 2.0])
 def test_align_scale_matches_medians(k, parent_scale):
     # Parent sees radius 12 straight ahead (heading 0). After the dolly that content is z times closer,
-    # so a child at the same scale would see it at 12/z; this child's depth reads k times that.
+    # so a child in the parent's frame would see it at 12/z; this child's depth reads k times that.
+    # The scale is the parent-to-child ratio only: the parent's own scale does not enter it.
     parent = _spot(12.0, scale=parent_scale)
     child = _spot(k * 12.0 / DOLLY)
-    assert align_scale(parent, child, 0.0) == pytest.approx(parent_scale / k, rel=1e-3)
+    assert align_scale(parent, child, 0.0) == pytest.approx(1 / k, rel=1e-3)
 
 
 def test_align_scale_uses_parent_view_at_rel_heading():
@@ -102,12 +103,52 @@ def test_dolly_distance():
     assert dolly_distance() > 0
 
 
-def test_next_spot_records_distance_in_world_units():
+def test_next_spot_records_distance_in_parent_frame():
     parent = _spot(12.0, scale=2.0)
     child = next_spot(FakePainter(), FakeDepth(), parent, 0.0, [("b", 1.0)], None, 1, None)
-    # forward median radius of the parent in world units is 2 * 12
-    assert child.distance == pytest.approx(dolly_distance(DOLLY, radius=24.0), rel=1e-3)
+    # forward median radius in the parent's own frame is 12, whatever the parent's scale
+    assert child.distance == pytest.approx(dolly_distance(DOLLY, radius=12.0), rel=1e-3)
     assert np.isfinite(child.scale) and child.scale > 0
+
+
+class NanDepth:
+    def depth360(self, pano):
+        d = FakeDepth().depth360(pano)
+        d[:, :] = np.nan
+        return d
+
+
+def test_nan_depth_is_sanitised_and_guarded():
+    parent = _spot(12.0)
+    child = next_spot(FakePainter(), NanDepth(), parent, 30.0, [("b", 1.0)], None, 1, None)
+    assert np.isfinite(child.depth).all() and child.depth.min() >= 0 and child.depth.max() <= 1
+    assert np.isfinite(child.scale) and child.scale > 0
+    assert np.isfinite(child.distance) and child.distance > 0
+    # a parent whose stored depth is NaN (nothing to align on) still gives finite scale and distance
+    bad = Spot(id="b", image=_gradient(), depth=np.full((H, W), np.nan, np.float32), heading=0.0, scale=1.0)
+    grand = next_spot(FakePainter(), FakeDepth(), bad, 0.0, [("b", 1.0)], None, 1, None)
+    assert np.isfinite(grand.scale) and grand.scale > 0
+    assert np.isfinite(grand.distance) and grand.distance > 0
+
+
+def test_exit_heading_sign_puts_that_bearing_ahead():
+    # Independent of roll_to/yaw_to_u: a red marker column 60 degrees clockwise of the parent's forward
+    # (u = 0.5 + 60/360) must be dead ahead (the centre column) of what the painter repaints for exit +60.
+    w, h = 360, 64
+    a = np.zeros((h, w, 3), np.uint8)
+    x = int((0.5 + 60 / 360) * w)               # column 240
+    a[:, x, 0] = 255
+    parent = Spot(id="p", image=Image.fromarray(a), depth=np.full((h, w), 0.5, np.float32), heading=0.0, scale=1.0)
+    painter = FakePainter()
+    next_spot(painter, FakeDepth(), parent, 60.0, [("b", 1.0)], None, 1, None)
+    prev = np.asarray(painter.calls[0][1]["prev"]).astype(float)
+    peak = int(np.argmax(prev[h // 2, :, 0]))
+    assert abs(peak - w // 2) <= 2
+    # and it is not the mirror image: exit -60 puts it far from the centre
+    painter = FakePainter()
+    next_spot(painter, FakeDepth(), parent, -60.0, [("b", 1.0)], None, 1, None)
+    prev = np.asarray(painter.calls[0][1]["prev"]).astype(float)
+    assert abs(int(np.argmax(prev[h // 2, :, 0])) - w // 2) > 60
 
 
 def test_align_scale_clamps_a_wild_rescale():
