@@ -44,3 +44,10 @@ MOOD_WORDS = {
     "warm": "warm golden light",
 }
 MAX_THEME_CHARS = 120
+
+# Dream Roam: 360-degree depth from overlapping slices of the panorama
+DEPTH_SLICE = 512
+DEPTH_STEP = 256
+NEAR = 4.0
+FAR = 50.0
+EDGE_RATIO = 1.35

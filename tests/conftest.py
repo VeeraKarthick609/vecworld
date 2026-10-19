@@ -44,3 +44,13 @@ class FakeDreamer:
     def ideas(self, theme, moods, n):
         self.calls.append((theme, list(moods), n))
         return [self.IDEAS[i % len(self.IDEAS)] for i in range(n)]
+
+
+class FakeDepth:
+    """Deterministic ramp: near (1) at the bottom, far (0) at the top, at the panorama's size."""
+
+    def depth360(self, pano):
+        import numpy as np
+
+        w, h = pano.size
+        return np.repeat(np.linspace(0, 1, h, dtype=np.float32)[:, None], w, axis=1)
