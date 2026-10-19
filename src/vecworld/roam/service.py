@@ -20,14 +20,14 @@ from typing import Callable
 
 from vecworld.config import MAX_SESSIONS, MAX_THEME_CHARS, MOOD_BG_STRENGTH, MOOD_WORDS, MOODS, SESSION_TTL, STYLE
 from vecworld.dream.errors import BadInput, Busy, GpuUnavailable, NotStarted, UnknownSession, UnknownSpot
-from vecworld.dream.gpu import GpuQueue
+from vecworld.dream.gpu import GpuQueue, Stopped
 from vecworld.dream.ideas import Dreamer
 from vecworld.dream.painter import Painter, Prompt
 from vecworld.roam.depth import DepthEstimator, depth_png
 from vecworld.roam.places import (GENERIC_SCENERY, MIN_SEPARATION, Journey, Neighbour, assign_bearings,
                                   fallback_neighbours)
 from vecworld.roam.session import Predream, RoamSession, SpotView, Visit
-from vecworld.roam.spot import Spot, first_spot, next_spot
+from vecworld.roam.spot import Spot, first_spot, next_spot, spot_limits
 from vecworld.scenes.palette import Stats, palette_stats
 
 log = logging.getLogger(__name__)
@@ -218,18 +218,21 @@ class RoamService:
                 s.files.append(paths)
                 s.visits = {spot.id: Visit(spot, stats, journey, stats, paths, None)}
                 self._submit_set(s)
-                view = self._view(s, paths, None)
+                view = self._view(s, paths, None, "start")
         self._forget_files(s)
         self._maybe_refill(s)
         return view
 
-    def next(self, sid: str, exit_heading: float) -> SpotView:
-        """Step to the next spot: a finished pre-dreamed one within TAKE_WITHIN of the exit (closest first), else
-        the exact exit heading built at demand priority after cancelling the queued set."""
+    def next(self, sid: str, exit_heading: float, walked: float | None = None) -> SpotView:
+        """Step to the next spot: a finished pre-dreamed one within TAKE_WITHIN of the exit (closest first; it was
+        built for an exit at the walkable radius and says where it stands), else the exact exit heading built at
+        demand priority after cancelling the queued set, dollied by `walked` (the distance from the current spot's
+        centre to where the player leaves it, in its units; None = its walkable radius that way)."""
         exit_heading = self._heading(exit_heading)
+        walked = self._walked(walked)
         s = self._started(sid)
         with self._claim(s):
-            running = None
+            running, served = None, "predream"
             with self._lock:
                 hints = s.hints
                 built = self._take(s, exit_heading)
@@ -237,7 +240,7 @@ class RoamService:
                     running = self._keep_running(s, exit_heading)
             if running is not None:
                 # On the single worker a demand build would only start after this job anyway.
-                built = self._wait(s, running)
+                built, served = self._wait(s, running), "waited"
                 with self._lock:
                     if self._sessions.get(s.id) is not s:
                         raise UnknownSession(s.id)
@@ -245,23 +248,29 @@ class RoamService:
                     if built is not None and (built.version != s.version or built.parent_id != s.spot.id):
                         built = None
             if built is None:
+                served = "demand"
                 with self._lock:
-                    self.queue.submit_set([], s.id)   # the queued set would only delay the exact heading
+                    self._set([], s.id)   # the queued set (and a pre-dream painting elsewhere) would only delay it
                     snap = self._snap(s)
-                built = self._run(s, lambda: self._build(snap, exit_heading))
-            return self._commit(s, built, exit_heading, hints)
+                built = self._run(s, lambda: self._build(snap, exit_heading, walked))
+            view = self._commit(s, built, exit_heading, hints, served)
+            log.debug("next: %s, walked %s -> distance %.2f, scale %.2f", served, walked, view.distance, view.scale)
+            return view
 
     def enter(self, sid: str, spot_id: str) -> SpotView:
         """Step back into a spot the player walked into without a move: one the current spot was built from (its
-        parent, or further back while the files last: a move can land while the player walks back), or one built
-        from the current spot. The journey and colour reference return to what they were when it was current; the
+        parent, or further back while the files last: a move can land while the player walks back), one built
+        from the current spot, or one built from its parent (a sibling: the player walked from one child of a spot
+        into another). The journey and colour reference return to what they were when it was current; the
         pre-dreamed set is made around it. No GPU work."""
         s = self._started(sid)
         with self._claim(s):
             with self._lock:
                 if spot_id != s.spot.id:
                     v = s.visits.get(spot_id)
-                    if v is None or not (v.parent_id == s.spot.id or spot_id in self._ancestors(s)):
+                    up = self._ancestors(s)
+                    if v is None or not (v.parent_id == s.spot.id or spot_id in up
+                                         or (up and v.parent_id == up[0])):
                         raise UnknownSpot("That spot has faded from the dream.")
                     self._leave(s)
                     j = v.journey
@@ -277,7 +286,7 @@ class RoamService:
                     s.files.append(v.paths)
                     s.prefetch = {}
                     self._submit_set(s)
-                view = self._view(s, s.visits[s.spot.id].paths, None)
+                view = self._view(s, s.visits[s.spot.id].paths, None, "enter")
             self._forget_files(s)
             return view
 
@@ -365,7 +374,7 @@ class RoamService:
             if k not in chosen:
                 chosen[k] = float(h)
                 jobs.append((k, self._job(snap, float(h))))
-        futs = self.queue.submit_set(jobs, owner=s.id)
+        futs = self._set(jobs, s.id)
         out = {}
         for k, e in chosen.items():
             f = futs.get(k)
@@ -380,10 +389,16 @@ class RoamService:
                 out[k] = Predream(e, s.version, s.spot.id, f)
         s.prefetch = out
 
+    def _set(self, jobs: list, owner: str) -> dict:
+        """Make the queue's pre-dream set for a session. A pre-dream still painting that is not in it is stopped:
+        built from a spot the player left, or toward a direction no longer wanted, it would only hold up the GPU
+        (one spot's paint is ~5 s) for the spot the player walks toward next."""
+        return self.queue.submit_set(jobs, owner, stop_running=True)
+
     def _drop_set(self, s: RoamSession) -> None:
-        # caller holds the lock; a running job finishes but is never used
+        # caller holds the lock; a running job is stopped (if it checks in) and never used
         s.prefetch = {}
-        self.queue.submit_set([], s.id)
+        self._set([], s.id)
 
     def _bump(self, s: RoamSession) -> None:
         """The world changed: every pre-dreamed spot is stale. Caller holds the lock."""
@@ -418,7 +433,7 @@ class RoamService:
             return None
         k = best[2]
         e = s.prefetch[k]
-        f = self.queue.submit_set([(k, self._job(self._snap(s), e.heading))], s.id).get(k)
+        f = self._set([(k, self._job(self._snap(s), e.heading))], s.id).get(k)
         if f is not None and f is not e.future:
             f.cancel()    # it ended between our look and the queue's; its own future still holds the result
         return e.future
@@ -430,7 +445,7 @@ class RoamService:
         except CancelledError:
             raise UnknownSession(s.id) from None
         except Exception as e:  # noqa: BLE001 - out of memory or broken: build on demand instead
-            if not isinstance(e, GpuUnavailable):
+            if not isinstance(e, (GpuUnavailable, Stopped)):
                 log.warning("pre-dream failed (%s); building on demand", type(e).__name__)
             return None
 
@@ -444,8 +459,9 @@ class RoamService:
     def _job(self, snap: _Snap, heading: float):
         return lambda: self._build(snap, heading)
 
-    def _build(self, snap: _Snap, heading: float) -> _Built:
-        """Paint the spot one step from snap.spot toward heading. Pure: reads only the snapshot."""
+    def _build(self, snap: _Snap, heading: float, walked: float | None = None) -> _Built:
+        """Paint the spot one step from snap.spot toward heading, for a player who walked `walked` (None: to the
+        walkable radius, as a pre-dream expects). Pure: reads only the snapshot."""
         j = _copy(snap.journey)
         ds = j.step(heading)
         w = 1.0 if ds.arrived else (ds.weights[1][1] if len(ds.weights) > 1 else 0.0)
@@ -460,12 +476,12 @@ class RoamService:
             ref, bg = (_blend(snap.ref, snap.spot_stats, w) if w > 0 else snap.ref), None
         seed = (snap.seed + snap.steps + 1) % 2**31
         spot = self._paint(lambda: next_spot(self.painter, self.depth, snap.spot, heading, base, None, seed, ref,
-                                             bg_strength=bg))
+                                             bg_strength=bg, walked=walked))
         return _Built(spot, j, ds.arrived, snap.version, snap.spot.id, snap.ref_pending)
 
-    def _commit(self, s: RoamSession, built: _Built, exit_heading: float, hints: int) -> SpotView:
+    def _commit(self, s: RoamSession, built: _Built, exit_heading: float, hints: int, served: str) -> SpotView:
         stats = palette_stats(built.spot.image)
-        paths = self._save(built.spot)
+        paths = self._paths(built.spot)
         with self._lock:
             self._check_alive(s, paths)
             assert built.parent_id == s.spot.id, "a build from another spot reached commit"
@@ -489,7 +505,11 @@ class RoamService:
             s.visits[built.spot.id] = Visit(built.spot, stats, j, s.ref, paths, built.parent_id)
             s.prefetch = {}
             self._submit_set(s)
-            view = self._view(s, paths, built.arrived)
+            view = self._view(s, paths, built.arrived, served)
+        # Written once the new spot's pre-dreams are on the GPU, so the encoding never leaves it idle.
+        self._write(built.spot, paths)
+        with self._lock:
+            self._check_alive(s, paths)   # evicted meanwhile: nothing may keep its files
         self._forget_files(s)
         self._maybe_refill(s)
         return view
@@ -564,11 +584,18 @@ class RoamService:
         """{place}, {in-between scenery if drifting}, {mood words}, {STYLE}."""
         return ", ".join([name, *([scenery] if scenery else []), *(MOOD_WORDS[m] for m in moods), STYLE])
 
+    def _paths(self, spot: Spot) -> tuple[Path, Path]:
+        return self.scene_dir / f"{spot.id}.jpg", self.scene_dir / f"{spot.id}.png"
+
+    @staticmethod
+    def _write(spot: Spot, paths: tuple[Path, Path]) -> None:
+        spot.image.save(paths[0], quality=JPEG_QUALITY)
+        paths[1].write_bytes(depth_png(spot.depth))
+
     def _save(self, spot: Spot) -> tuple[Path, Path]:
-        jpg, png = self.scene_dir / f"{spot.id}.jpg", self.scene_dir / f"{spot.id}.png"
-        spot.image.save(jpg, quality=JPEG_QUALITY)
-        png.write_bytes(depth_png(spot.depth))
-        return jpg, png
+        paths = self._paths(spot)
+        self._write(spot, paths)
+        return paths
 
     def _check_alive(self, s: RoamSession, paths: tuple[Path, Path]) -> None:
         # caller holds the lock: a session evicted mid-move keeps no files and gets no set
@@ -579,16 +606,16 @@ class RoamService:
 
     def _forget_files(self, s: RoamSession, keep: int = KEEP_SPOTS) -> None:
         """Delete the session's spot files but the `keep` most recently made or entered spots', and (keep > 0)
-        always the way back and forth: the current spot, its parent and its newest child."""
+        always every spot the viewer keeps placed (world.js prune): the current spot, its parent, and every child
+        of either (the player can walk into any of them)."""
         with self._lock:
             wanted = set(s.files[max(0, len(s.files) - keep):]) if keep else set()
             if keep and s.spot is not None and (cur := s.visits.get(s.spot.id)) is not None:
                 wanted.add(cur.paths)
                 if cur.parent_id in s.visits:
                     wanted.add(s.visits[cur.parent_id].paths)
-                children = [v.paths for v in s.visits.values() if v.parent_id == s.spot.id]
-                if children:
-                    wanted.add(max(children, key=s.files.index))
+                family = {s.spot.id} | ({cur.parent_id} if cur.parent_id is not None else set())
+                wanted.update(v.paths for v in s.visits.values() if v.parent_id in family)
             old = [pair for pair in s.files if pair not in wanted]
             s.files = [pair for pair in s.files if pair in wanted]
             s.visits = {k: v for k, v in s.visits.items() if v.paths in wanted}
@@ -597,10 +624,10 @@ class RoamService:
                 p.unlink(missing_ok=True)
 
     @staticmethod
-    def _view(s: RoamSession, paths: tuple[Path, Path], arrived: str | None) -> SpotView:
+    def _view(s: RoamSession, paths: tuple[Path, Path], arrived: str | None, served: str) -> SpotView:
         sp = s.spot
         return SpotView(sp.id, paths[0], paths[1], sp.heading, sp.scale, sp.distance, s.journey.place,
-                        list(s.journey.neighbours), arrived)
+                        list(s.journey.neighbours), arrived, [round(float(x), 4) for x in spot_limits(sp)], served)
 
     @staticmethod
     def _place(place: str) -> str:
@@ -622,6 +649,18 @@ class RoamService:
         if not math.isfinite(h):
             raise BadInput("heading must be a number.")
         return h % 360.0
+
+    @staticmethod
+    def _walked(walked) -> float | None:
+        if walked is None:
+            return None
+        try:
+            w = float(walked)
+        except (TypeError, ValueError):
+            raise BadInput("walked must be a distance.") from None
+        if not math.isfinite(w) or w < 0:
+            raise BadInput("walked must be a distance.")
+        return w
 
     def _after_failed_move(self, s: RoamSession) -> None:
         """The spot stays as it was, but changes made during the move still land. Caller holds the lock."""

@@ -37,7 +37,7 @@ class FixturePainter:
         self.last = 0
         return self.images[0].copy()
 
-    def step(self, prev, base, focus, focus_at, seed, bg_strength=None):
+    def step(self, prev, base, focus, focus_at, seed, bg_strength=None, focus_half=None):
         time.sleep(self.delay)
         self.steps += 1
         self.last = 1 + self.steps % 2

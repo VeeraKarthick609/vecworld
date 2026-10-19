@@ -51,3 +51,22 @@ DEPTH_STEP = 256
 NEAR = 4.0
 FAR = 50.0
 EDGE_RATIO = 1.35
+
+# Dream Roam pacing: the player walks up to WALK_LIMIT from a spot's centre before its edge, and the next spot is
+# dollied by z = R / (R - walked) (R: the parent's median radius ahead), clamped to WALK_Z_MIN..WALK_Z_MAX.
+# Measured 2026-10-19 on the RTX 3050 Ti: a spot builds in ~5.5 s; at the walking speed (stride 1.1 per 0.958 s
+# cycle = 1.15 units/s) a radius of 6.5 is 5.7 s rim to rim. Real forest spots: scenery standing taller than
+# OBSTACLE_H above the ground starts 7-10 units out in most directions, 4-6 where a bush or mound is near.
+WALK_LIMIT = 6.5
+MIN_WALK = 2.2             # never less than the spike's 0.55 * NEAR, whatever the depth says
+WALL_FRACTION = 0.85       # stop this fraction of the way to scenery standing in the walking direction
+OBSTACLE_H = 1.0           # scenery this far above the ground plane (spot units; the camera eye is ~3.2 up) blocks
+WALL_HALF = 15.0           # degrees either side of a direction whose scenery bounds the walk that way
+LIMIT_BINS = 36            # the walkable radius is sampled every 360 / LIMIT_BINS degrees, 0 = the spot's forward
+WALK_Z_MIN = 1.15
+# Past ~2.5 the depth re-read of the zoomed-in view stops agreeing with the parent's (scale clamped at MIN_STEP).
+WALK_Z_MAX = 2.5
+# A bigger dolly magnifies more of the view ahead: the band regenerated from scratch grows to where the dolly
+# magnifies less than FOCUS_MAG (beyond it img2img at BG_STRENGTH keeps it sharp), up to FOCUS_HALF_MAX.
+FOCUS_MAG = 1.3
+FOCUS_HALF_MAX = 0.2

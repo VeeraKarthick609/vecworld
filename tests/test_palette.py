@@ -36,3 +36,16 @@ def test_half_strength_goes_halfway():
     before, want = palette_stats(img)[0], palette_stats(ref)[0]
     got = palette_stats(match_palette(img, palette_stats(ref), 0.5))[0]
     assert np.allclose(got, (before + want) / 2, atol=1.5)
+
+
+def test_stats_of_a_large_image_match_the_full_pixel_stats():
+    """palette_stats samples a large image (every few pixels, no filtering, so the spread is not smoothed away)."""
+    from vecworld.scenes.palette import _to_lab
+
+    rng = np.random.default_rng(3)
+    a = (rng.random((512, 2048, 3)) ** 2 * 255).astype(np.uint8)
+    a[:, :700] //= 3                                       # some structure: a dark third
+    img = Image.fromarray(a)
+    lab = _to_lab(img).reshape(-1, 3)
+    mean, std = palette_stats(img)
+    assert np.allclose(mean, lab.mean(0), atol=0.3) and np.allclose(std, lab.std(0), rtol=0.01)

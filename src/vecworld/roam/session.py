@@ -20,6 +20,8 @@ class SpotView:
     place: str
     neighbours: list[Neighbour]
     arrived: str | None     # the place this spot arrived at, if it did
+    limits: list[float] = field(default_factory=list)   # walkable radius every 360/len degrees from its forward
+    served: str = ""        # how the move got it: start, enter, predream (finished), waited (running) or demand
 
 
 @dataclass(frozen=True)

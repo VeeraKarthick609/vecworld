@@ -36,8 +36,8 @@ class GatedPainter(FakePainter):
 class TagPainter(FakePainter):
     """Step n (1-based) paints a solid (n * 20, 0, 0), so an unmatched spot names the call that made it."""
 
-    def step(self, prev, base, focus, focus_at, seed, bg_strength=None):
-        super().step(prev, base, focus, focus_at, seed, bg_strength=bg_strength)
+    def step(self, prev, base, focus, focus_at, seed, bg_strength=None, **kw):
+        super().step(prev, base, focus, focus_at, seed, bg_strength=bg_strength, **kw)
         n = len(steps_of(self))
         return Image.new("RGB", prev.size, (n * 20 % 256, 0, 0))
 
@@ -58,7 +58,7 @@ class ManualQueue:
             f.set_exception(e)
         return f
 
-    def submit_set(self, jobs, owner):
+    def submit_set(self, jobs, owner, stop_running=False):
         self.sets.append([k for k, _ in jobs])
         out = {}
         for k, fn in jobs:
@@ -369,7 +369,11 @@ def test_mood_change_cancels_the_queued_set(make):
     svc.painter.gate.set()
     wait_set(s)
     v = svc.next(s.id, 0)
-    assert v.spot_id != spot_of(old[0]).id
+    # 8b: the old-mood heading job that was running is stopped (at its next check-in) instead of finishing unused
+    from vecworld.dream.gpu import Stopped
+    with pytest.raises(Stopped):
+        old[0].result(timeout=5)
+    assert v.heading == pytest.approx(0)
 
 
 def test_theme_becomes_a_neighbour_at_the_current_heading(make):
@@ -718,8 +722,8 @@ def spy_queue(svc, thread_of):
             demand.set()
         return submit(fn, owner, prefetch=prefetch)
 
-    def spy_set(jobs, owner):
-        out = submit_set(jobs, owner)
+    def spy_set(jobs, owner, stop_running=False):
+        out = submit_set(jobs, owner, stop_running=stop_running)
         if threading.current_thread() is thread_of[0]:
             set_called.set()
         return out
@@ -896,8 +900,8 @@ def test_commit_after_eviction_mid_move_deletes_its_files(make, monkeypatch):
 class GatedTagPainter(GatedPainter):
     """Gated like GatedPainter; step n paints a solid (n * 20, 0, 0) like TagPainter."""
 
-    def step(self, prev, base, focus, focus_at, seed, bg_strength=None):
-        super().step(prev, base, focus, focus_at, seed, bg_strength=bg_strength)
+    def step(self, prev, base, focus, focus_at, seed, bg_strength=None, **kw):
+        super().step(prev, base, focus, focus_at, seed, bg_strength=bg_strength, **kw)
         return Image.new("RGB", prev.size, (len(steps_of(self)) * 20 % 256, 0, 0))
 
 
@@ -918,7 +922,9 @@ def test_mood_change_while_waiting_on_a_running_predream_rebuilds(make):
     svc.painter.armed = False
     svc.painter.gate.set()
     t.join(5)
-    assert out[0].spot_id != spot_of(old[0]).id   # the old-mood spot is never shown
+    from vecworld.dream.gpu import Stopped
+    with pytest.raises(Stopped):                  # 8b: the old-mood job is stopped, so it is never shown
+        old[0].result(timeout=5)
     assert demand.is_set() and out[0].heading == pytest.approx(20)
     call = steps_of(svc.painter)[s.spot.image.getpixel((0, 0))[0] // 20 - 1]
     assert NIGHT in call["base"][0][0] and call["bg_strength"] == MOOD_BG_STRENGTH
@@ -1004,14 +1010,20 @@ def test_enter_a_grandparent_while_its_files_last(make):
     assert svc.enter(s.id, a).spot_id == a        # a move can land while the player walks back two spots
 
 
-def test_enter_an_unknown_or_sibling_spot_is_refused(make):
+def test_enter_an_unknown_or_cousin_spot_is_refused(make):
+    """8b: siblings (children of the current spot's parent) are now kept and enterable; a spot further off is not."""
     svc = make(queue=ManualQueue())
     s = started(svc)
     a = s.spot.id
     b = svc.next(s.id, 0).spot_id
+    b1 = svc.next(s.id, 0).spot_id                 # b's child
+    svc.enter(s.id, b)
     svc.enter(s.id, a)
-    svc.next(s.id, 180)
-    for bad in ("nope", b):                        # b is now a sibling of the current spot
+    c = svc.next(s.id, 180).spot_id
+    assert svc.enter(s.id, b).spot_id == b         # a sibling of c
+    assert svc.enter(s.id, c).spot_id == c         # and back
+    svc.next(s.id, 180)                            # into c's child: b1 is now a cousin
+    for bad in ("nope", b1):
         with pytest.raises(UnknownSpot) as e:
             svc.enter(s.id, bad)
         assert e.value.status == 409 and e.value.code == "unknown_spot"
@@ -1040,7 +1052,7 @@ def test_enter_is_busy_during_a_move(make):
 
 def test_the_way_back_survives_many_children(make):
     """Exploring several directions from one spot (out, back, out again) never deletes that spot's files: the
-    current spot's parent is always kept, and so is its newest child."""
+    current spot's parent is always kept, and so are its children."""
     svc = make(queue=ManualQueue())
     s = started(svc)
     a = s.spot.id
@@ -1052,7 +1064,7 @@ def test_the_way_back_survives_many_children(make):
         assert children[-1] in s.visits                   # the child just left is still there to walk into
     assert svc.enter(s.id, children[-1]).spot_id == children[-1]
     assert svc.enter(s.id, a).spot_id == a
-    assert len(s.files) <= 4
+    assert len(s.files) <= 5        # 8b: the first spot and all four of its children (was <= 4: newest child only)
 
 
 def test_typed_place_survives_stepping_back(make):
@@ -1065,3 +1077,176 @@ def test_typed_place_survives_stepping_back(make):
     svc.enter(s.id, a)
     volcano = [n for n in s.journey.neighbours if n.name == "volcano"]
     assert len(volcano) == 1 and volcano[0].bearing == pytest.approx(0)
+
+
+# --- walking farther: the walked distance and the walk limits (Task 8b) --------------------------------------
+
+def test_demand_build_dollies_by_the_walked_distance(make):
+    svc = make(queue=ManualQueue())                 # pre-dreams never run: every move builds on demand
+    s = started(svc)
+    v = svc.next(s.id, 90, walked=3.0)
+    assert v.distance == pytest.approx(3.0, rel=1e-3)
+    v = svc.next(s.id, 90, walked=3.5)
+    assert v.distance == pytest.approx(3.5, rel=1e-3)
+
+
+def test_predreams_expect_the_exit_at_the_walk_limit(svc):
+    from vecworld.roam.spot import limit_at
+
+    s = started(svc)
+    first = s.spot
+    wait_set(s)
+    for k, f in set_futures(s).items():
+        h = key_heading(k)
+        assert spot_of(f).distance == pytest.approx(limit_at(first.limits, h), rel=1e-3), h
+
+
+def test_a_predream_is_placed_by_its_own_distance_whatever_was_walked(svc):
+    s = started(svc)
+    wait_set(s)
+    by_heading = {key_heading(k): f for k, f in set_futures(s).items()}
+    v = svc.next(s.id, 10, walked=1.0)              # left early: the pre-dream still says where it stands
+    assert v.spot_id == spot_of(by_heading[0]).id
+    assert v.distance == pytest.approx(spot_of(by_heading[0]).distance) and v.distance > 1.5
+
+
+def test_views_carry_the_walk_limits(make):
+    from vecworld.config import LIMIT_BINS
+
+    svc = make(queue=ManualQueue())
+    s = started(svc)
+    v = svc.start(s.id, "forest", [])
+    assert len(v.limits) == LIMIT_BINS and v.limits == pytest.approx(list(s.spot.limits), rel=1e-3)
+    w = svc.next(s.id, 45, walked=2.0)
+    assert w.limits == pytest.approx(list(s.spot.limits), rel=1e-3)
+
+
+def test_bad_walked_distance(svc):
+    s = started(svc)
+    for bad in (-0.1, float("nan"), float("inf"), "far"):
+        with pytest.raises(BadInput):
+            svc.next(s.id, 0, walked=bad)
+    assert s.steps == 0
+
+
+def test_every_child_of_the_current_spot_stays_enterable(make):
+    """Out from one spot four ways (back in between), then into each of its children again, oldest first: the
+    current spot's children all keep their files (the viewer keeps them all placed)."""
+    svc = make(queue=ManualQueue())
+    s = started(svc)
+    a = s.spot.id
+    children = []
+    for heading in (0, 90, 180, 270):
+        children.append(svc.next(s.id, heading).spot_id)
+        svc.enter(s.id, a)
+    for c in children:
+        assert svc.enter(s.id, c).spot_id == c
+        assert all(p.exists() for p in s.visits[c].paths)
+        assert svc.enter(s.id, a).spot_id == a
+    # and from one child straight into another (the player crossed the parent's middle without its /enter landing)
+    svc.enter(s.id, children[3])
+    assert svc.enter(s.id, children[0]).spot_id == children[0]
+    assert set(children) <= set(s.visits)
+
+
+class StopPainter(FakePainter):
+    """Step call number `block_at` (1-based) waits for `gate`, checking in with the GPU queue like the real painter
+    (so it can be stopped); `entered` is set when it starts waiting."""
+
+    def __init__(self, block_at):
+        super().__init__()
+        self.block_at = block_at
+        self.entered, self.gate = threading.Event(), threading.Event()
+
+    def step(self, *a, **kw):
+        from vecworld.dream.gpu import check_stop
+
+        if len(steps_of(self)) + 1 == self.block_at:
+            self.calls.append(("step", {}))        # counted now, so the next call doesn't block too
+            self.entered.set()
+            while not self.gate.wait(0.01):
+                check_stop()
+            return self._img("teal")
+        return super().step(*a, **kw)
+
+
+def test_a_move_elsewhere_stops_the_running_predream(make):
+    from vecworld.dream.gpu import Stopped
+
+    svc = make(painter=StopPainter(block_at=1))
+    s = started(svc)
+    assert svc.painter.entered.wait(5)              # the heading-0 pre-dream is painting
+    fut = {key_heading(k): f for k, f in set_futures(s).items()}
+    out = []
+    t = threading.Thread(target=lambda: out.append(svc.next(s.id, 180, walked=3.0)))
+    t.start()
+    t.join(5)
+    svc.painter.gate.set()
+    assert out and out[0].heading == pytest.approx(180)   # built without waiting for the stuck pre-dream
+    with pytest.raises(Stopped):
+        fut[0].result(timeout=5)
+
+
+def test_taking_a_predream_stops_the_one_still_painting_for_the_old_spot(make):
+    from vecworld.dream.gpu import Stopped
+
+    svc = make(painter=StopPainter(block_at=2))      # heading 0 finishes; the +60 one hangs
+    s = started(svc)
+    fut = {key_heading(k): f for k, f in set_futures(s).items()}
+    fut[0].result(timeout=5)
+    assert svc.painter.entered.wait(5)
+    v = svc.next(s.id, 0)
+    assert v.spot_id == spot_of(fut[0]).id
+    with pytest.raises(Stopped):
+        fut[60].result(timeout=5)
+    wait_set(s)                                     # the new spot's set paints straight away
+    assert all(f":{v.spot_id}:" in k for k in s.prefetch)
+
+
+def test_views_say_how_the_spot_was_served(make):
+    """For the pacing measurement: a finished pre-dream, a running one waited on, or a demand build."""
+    svc = make()
+    s = started(svc)
+    assert svc.start(s.id, "forest", []).served == "start"
+    wait_set(s)
+    assert svc.next(s.id, 10).served == "predream"
+    assert svc.next(s.id, 150).served == "demand"
+    a = s.spot.id
+    svc.next(s.id, 150)
+    assert svc.enter(s.id, a).served == "enter"
+
+
+def test_a_view_served_by_waiting_on_a_running_predream_says_so(make):
+    svc = make(painter=StopPainter(block_at=1))
+    s = started(svc)
+    assert svc.painter.entered.wait(5)
+    out = []
+    t = threading.Thread(target=lambda: out.append(svc.next(s.id, 0)))
+    t.start()
+    threading.Timer(0.3, svc.painter.gate.set).start()
+    t.join(5)
+    assert out[0].served == "waited"
+
+
+def test_the_next_set_goes_to_the_gpu_before_the_spot_is_written_out(make):
+    """Pacing: writing a spot's JPEG and depth PNG must not keep the GPU idle; the new spot's pre-dreams are
+    queued first."""
+    svc = make(queue=ManualQueue())
+    s = started(svc)
+    events = []
+    submit_set, write = svc.queue.submit_set, svc._write
+
+    def spy_set(jobs, owner, stop_running=False):
+        events.append(("set", [k for k, _ in jobs]))
+        return submit_set(jobs, owner, stop_running=stop_running)
+
+    def spy_write(spot, paths):
+        events.append(("write", spot.id))
+        return write(spot, paths)
+
+    svc.queue.submit_set, svc._write = spy_set, spy_write
+    v = svc.next(s.id, 90, walked=3.0)
+    sets = [i for i, (k, a) in enumerate(events) if k == "set" and a and all(f":{v.spot_id}:" in x for x in a)]
+    writes = [i for i, (k, a) in enumerate(events) if k == "write" and a == v.spot_id]
+    assert sets and writes and sets[0] < writes[0], events
+    assert v.image_path.exists() and v.depth_path.exists()

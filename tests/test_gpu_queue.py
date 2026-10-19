@@ -340,3 +340,83 @@ def test_set_job_released_after_failure():
             raise RuntimeError("oom")
         return boom
     assert _release_check(factory)() is None
+
+
+# --- stopping a running job nobody wants any more (Task 8b: pacing) ------------------------------------------
+
+def _stoppable(started, release, order, name):
+    """A job that checks in with the queue (as the painter does) until released; records how it ended."""
+    from vecworld.dream.gpu import check_stop
+
+    def job():
+        started.set()
+        try:
+            while not release.wait(0.01):
+                check_stop()
+        except BaseException:
+            order.append(f"{name} stopped")
+            raise
+        order.append(f"{name} done")
+        return name
+    return job
+
+
+def test_set_with_stop_running_stops_a_running_job_not_in_it():
+    from vecworld.dream.gpu import Stopped
+
+    q, order = GpuQueue(), []
+    started, release = threading.Event(), threading.Event()
+    first = q.submit_set([("h", _stoppable(started, release, order, "h"))], "a")
+    assert started.wait(5)
+    nxt = q.submit_set([("n", _rec(order, "n"))], "a", stop_running=True)
+    assert nxt["n"].result(timeout=5) == "n"            # did not wait for the release
+    try:
+        first["h"].result(timeout=5)
+        raise AssertionError("not stopped")
+    except Stopped:
+        pass
+    release.set()
+    assert order == ["h stopped", "n"]
+
+
+def test_stop_running_keeps_a_running_job_still_in_the_set():
+    q, order = GpuQueue(), []
+    started, release = threading.Event(), threading.Event()
+    first = q.submit_set([("h", _stoppable(started, release, order, "h"))], "a")
+    assert started.wait(5)
+    again = q.submit_set([("h", _rec(order, "h2"))], "a", stop_running=True)
+    assert again["h"] is first["h"]
+    release.set()
+    assert first["h"].result(timeout=5) == "h" and order == ["h done"]
+
+
+def test_stop_running_leaves_other_owners_and_demand_jobs_alone():
+    q, order = GpuQueue(), []
+    started, release = threading.Event(), threading.Event()
+    other = q.submit_set([("h", _stoppable(started, release, order, "b"))], "b")
+    assert started.wait(5)
+    q.submit_set([], "a", stop_running=True)
+    started2, release2 = threading.Event(), threading.Event()
+    release.set()
+    assert other["h"].result(timeout=5) == "b"
+    demand = q.submit(_stoppable(started2, release2, order, "d"), "a")
+    assert started2.wait(5)
+    q.submit_set([], "a", stop_running=True)
+    release2.set()
+    assert demand.result(timeout=5) == "d"
+
+
+def test_without_stop_running_a_running_job_finishes():
+    q, order = GpuQueue(), []
+    started, release = threading.Event(), threading.Event()
+    first = q.submit_set([("h", _stoppable(started, release, order, "h"))], "a")
+    assert started.wait(5)
+    q.submit_set([], "a")
+    release.set()
+    assert first["h"].result(timeout=5) == "h"
+
+
+def test_check_stop_outside_a_job_is_a_no_op():
+    from vecworld.dream.gpu import check_stop
+
+    check_stop()

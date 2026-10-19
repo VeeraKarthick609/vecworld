@@ -51,8 +51,9 @@ def started(client, place="a quiet forest", moods=()):
 
 def test_start_returns_spot(client):
     sid, spot = started(client, moods=["night"])
-    assert set(spot) == {"spot_id", "image_url", "depth_url", "heading", "scale", "distance", "place",
-                         "neighbours", "arrived"}
+    assert set(spot) == {"spot_id", "image_url", "depth_url", "heading", "scale", "distance", "limits", "place",
+                         "neighbours", "arrived", "served"}
+    assert spot["served"] == "start"
     assert spot["place"] == "a quiet forest"
     assert spot["scale"] == 1 and spot["distance"] == 0 and spot["arrived"] is None
     assert spot["neighbours"] and set(spot["neighbours"][0]) == {"name", "bearing"}
@@ -188,7 +189,9 @@ def test_enter_steps_back_into_the_parent(client):
     assert back["image_url"] == first["image_url"] and client.get(back["image_url"]).status_code == 200
     third = client.post(f"/api/session/{sid}/next", json={"exit_heading": 270}).json()
     assert third["spot_id"] not in (first["spot_id"], second["spot_id"])
-    r = client.post(f"/api/session/{sid}/enter", json={"spot_id": second["spot_id"]})   # now a sibling
+    r = client.post(f"/api/session/{sid}/enter", json={"spot_id": second["spot_id"]})   # now a sibling (8b: kept)
+    assert r.status_code == 200 and r.json()["spot_id"] == second["spot_id"]
+    r = client.post(f"/api/session/{sid}/enter", json={"spot_id": "gone"})
     assert r.status_code == 409 and r.json()["error"] == "unknown_spot"
 
 
@@ -197,3 +200,22 @@ def test_enter_validates(client):
     r = client.post(f"/api/session/{sid}/enter", json={"spot_id": "x" * 65})
     assert r.status_code == 422 and r.json()["error"] == "bad_input"
     assert client.post(f"/api/session/{new(client)}/enter", json={"spot_id": "x"}).json()["error"] == "not_started"
+
+
+def test_next_takes_the_walked_distance(tmp_path):
+    from vecworld.config import LIMIT_BINS
+
+    c = make_client(tmp_path)
+    sid, first = started(c)
+    assert len(first["limits"]) == LIMIT_BINS and all(x > 0 for x in first["limits"])
+    # far from every pre-dream (they may not have finished yet either way): built for what was walked
+    r = c.post(f"/api/session/{sid}/next", json={"exit_heading": 150, "walked": 3.25})
+    assert r.status_code == 200, r.text
+    assert r.json()["distance"] == pytest.approx(3.25, rel=1e-3)
+
+
+@pytest.mark.parametrize("walked", [-1, "far", None])
+def test_bad_walked_is_422(client, walked):
+    sid, _ = started(client)
+    r = client.post(f"/api/session/{sid}/next", json={"exit_heading": 0, "walked": walked})
+    assert r.status_code == 422 and r.json()["error"] == "bad_input"

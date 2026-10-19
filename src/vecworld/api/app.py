@@ -19,6 +19,8 @@ class StartIn(BaseModel):
 
 class NextIn(BaseModel):
     exit_heading: float = Field(allow_inf_nan=False)
+    # How far from the current spot's centre the player leaves it (its units). Left out: its walkable radius.
+    walked: float = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class EnterIn(BaseModel):
@@ -45,9 +47,11 @@ def spot_out(v: SpotView) -> dict:
         "heading": v.heading,
         "scale": v.scale,
         "distance": v.distance,
+        "limits": v.limits,
         "place": v.place,
         "neighbours": [{"name": n.name, "bearing": n.bearing} for n in v.neighbours],
         "arrived": v.arrived,
+        "served": v.served,
     }
 
 
@@ -84,7 +88,7 @@ def create_app(service: RoamService, web_dir: Path) -> FastAPI:
 
     @app.post("/api/session/{sid}/next")
     async def next_spot(sid: str, body: NextIn):
-        return spot_out(await run(service.next, sid, body.exit_heading))
+        return spot_out(await run(service.next, sid, body.exit_heading, body.walked))
 
     @app.post("/api/session/{sid}/enter")
     async def enter(sid: str, body: EnterIn):

@@ -21,7 +21,7 @@
 // Query: ?auto=0 manual WASD · ?chain=N spots (past 3 the fixtures repeat 1, 2, 1, 2…) · ?distance=d / ?scale=s
 // override every child's meta · ?haze=x dissolves through haze · ?clear=rrggbb clear colour (tests look for it).
 import * as THREE from "three";
-import { World, LIMIT, bearingVec } from "./world.js";
+import { World, bearingVec } from "./world.js";
 import { Hero, Keys, OrbitCam } from "./hero.js";
 
 const q = new URLSearchParams(location.search);
@@ -88,7 +88,8 @@ function autoInput() {
   if (next) { tx = next.origin.x; tz = next.origin.z; }
   else {
     const last = i + 1 >= CHAIN, v = bearingVec(last ? cur.heading : metaOf(i + 1).heading), f = last ? 0.8 : 1.5;
-    tx = v.x * f * LIMIT; tz = v.z * f * LIMIT;
+    const lim = world.limitAt(cur, last ? cur.heading : metaOf(i + 1).heading);
+    tx = v.x * f * lim; tz = v.z * f * lim;
     if (last && Math.hypot(tx - p.x, tz - p.y) < 0.1) autoDone = true;
   }
   if (autoDone) return { fwd: 0, side: 0, run: false };

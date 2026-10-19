@@ -6,12 +6,21 @@ from typing import Protocol
 import numpy as np
 from PIL import Image
 
-from vecworld.config import (BG_STRENGTH, PANO_H, PANO_W, STEP_STEPS, VAE_MARGIN, VAE_STRIDE, VAE_TILE,
-                             WIN)
+from vecworld.config import (BG_STRENGTH, FOCUS_HALF, PANO_H, PANO_W, STEP_STEPS, VAE_MARGIN, VAE_STRIDE,
+                             VAE_TILE, WIN)
+from vecworld.dream.gpu import check_stop
 from vecworld.dream.pano import focus_mask, ramp, tile_origins, windows, wrap_cols
 
 Prompt = list[tuple[str, float]]   # (text, weight); weights sum to 1
 BATCH = 4                          # UNet windows per forward pass
+
+
+def _active(wins, cols, k: int, k_bg: int | None) -> list[int]:
+    """The windows worth a UNet pass at step k. Before k_bg the unmasked part is reset (noised orig) at the next
+    step, so a window with no masked column there would only be thrown away. cols: the mask's columns > 0."""
+    if k_bg is None or k >= k_bg or cols is None:
+        return list(range(len(wins)))
+    return [i for i, (_, x) in enumerate(wins) if cols[wrap_cols(x, WIN, len(cols))].any()]
 EMB_CACHE = 64                     # text embeddings kept on the GPU (least recently used dropped)
 
 
@@ -19,7 +28,7 @@ class Painter(Protocol):
     def panorama(self, base: Prompt, seed: int) -> Image.Image: ...
 
     def step(self, prev: Image.Image, base: Prompt, focus: Prompt | None, focus_at: float | None,
-             seed: int, bg_strength: float | None = None) -> Image.Image: ...
+             seed: int, bg_strength: float | None = None, focus_half: float | None = None) -> Image.Image: ...
 
 
 class TurboPainter(Painter):
@@ -72,6 +81,7 @@ class TurboPainter(Painter):
         acc = wsum = None
         wt = torch.from_numpy(ramp(VAE_TILE * 8, (VAE_TILE - VAE_STRIDE) * 8)).to(lat.device)
         for x0 in tile_origins(w, shift):
+            check_stop()
             px = self.vae.decode(lat[..., wrap_cols(x0 - m, VAE_TILE + 2 * m, w)] / self._sf).sample
             px = px[..., m * 8:(m + VAE_TILE) * 8].float()
             if acc is None:
@@ -91,6 +101,7 @@ class TurboPainter(Painter):
         acc = wsum = None
         wt = torch.from_numpy(ramp(VAE_TILE, VAE_TILE - VAE_STRIDE)).to(x.device)
         for x0 in tile_origins(w, shift):
+            check_stop()
             lat = self.vae.encode(x[..., wrap_cols((x0 - m) * 8, (VAE_TILE + 2 * m) * 8, w * 8)]).latent_dist.mean
             lat = lat[..., m:m + VAE_TILE].float()
             if acc is None:
@@ -108,26 +119,32 @@ class TurboPainter(Painter):
 
         embs[i] is the text embedding for window i. keep = (orig, noise, mask, k_bg): up to and including
         step k_bg the unmasked part is reset to orig noised to the current timestep (differential
-        diffusion), so it denoises only timesteps[k_bg:], exactly like img2img.
+        diffusion), so it denoises only timesteps[k_bg:], exactly like img2img. Before k_bg, windows with no masked
+        column are skipped (_active): their prediction would be reset anyway, so the result is the same.
         """
         torch = self._torch
         h, w = latents.shape[-2:]
         wins = windows(h, w)
+        masked = None if keep is None else (keep[2].reshape(-1) > 0).cpu().numpy()
         for k, t in enumerate(timesteps):
             if keep is not None and k <= keep[3]:
                 orig, noise, mask, _ = keep
                 latents = mask * latents + (1 - mask) * self.sched.add_noise(orig, noise, t[None])
             lat_in = self.sched.scale_model_input(latents, t)
             eps, cnt = torch.zeros_like(latents), torch.zeros_like(latents[:, :1])
-            for b in range(0, len(wins), BATCH):
-                batch = wins[b:b + BATCH]
+            act = _active(wins, masked, k, None if keep is None else keep[3])
+            for b in range(0, len(act), BATCH):
+                check_stop()
+                idx = act[b:b + BATCH]
+                batch = [wins[i] for i in idx]
                 cols = [wrap_cols(x, WIN, w) for _, x in batch]
                 tiles = torch.cat([lat_in[..., y:y + WIN, :][..., c] for (y, _), c in zip(batch, cols)])
-                out = self.unet(tiles, t, encoder_hidden_states=torch.cat(embs[b:b + BATCH])).sample
+                out = self.unet(tiles, t, encoder_hidden_states=torch.cat([embs[i] for i in idx])).sample
                 for i, ((y, _), c) in enumerate(zip(batch, cols)):
                     eps[..., y:y + WIN, c] += out[i:i + 1]
                     cnt[..., y:y + WIN, c] += 1
-            latents = self.sched.step(eps / cnt, t, latents).prev_sample
+            # columns no window covered this step (skipped background) keep eps 0: they are reset next step
+            latents = self.sched.step(eps / cnt.clamp(min=1), t, latents).prev_sample
         return latents
 
     def _noise(self, seed: int):
@@ -144,11 +161,12 @@ class TurboPainter(Painter):
                                 shift=seed % VAE_TILE)
 
     def step(self, prev: Image.Image, base: Prompt, focus: Prompt | None, focus_at: float | None,
-             seed: int, bg_strength: float | None = None) -> Image.Image:
+             seed: int, bg_strength: float | None = None, focus_half: float | None = None) -> Image.Image:
         torch = self._torch
         bg_strength = BG_STRENGTH if bg_strength is None else bg_strength
         h, w = self._lat_shape[-2:]
-        m = np.zeros(w, np.float32) if focus_at is None else focus_mask(w, focus_at)
+        half = FOCUS_HALF if focus_half is None else focus_half
+        m = np.zeros(w, np.float32) if focus_at is None else focus_mask(w, focus_at, half)
         with torch.inference_mode():
             e_base = self._embed(base)
             e_focus = self._embed(focus) if focus is not None else e_base

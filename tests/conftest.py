@@ -25,9 +25,9 @@ class FakePainter:
         self._maybe_fail()
         return self._img("navy")
 
-    def step(self, prev, base, focus, focus_at, seed, bg_strength=None):
+    def step(self, prev, base, focus, focus_at, seed, bg_strength=None, focus_half=None):
         self.calls.append(("step", {"prev": prev, "base": base, "focus": focus, "focus_at": focus_at, "seed": seed,
-                                    "bg_strength": bg_strength}))
+                                    "bg_strength": bg_strength, "focus_half": focus_half}))
         self._maybe_fail()
         return self._img("teal")
 

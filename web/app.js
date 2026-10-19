@@ -3,6 +3,8 @@
 // The server holds the journey; the page holds the world around the player (web/roam/world.js). The first spot
 // comes from /start. Walking out toward the rim of a spot with nothing ahead asks /next for the spot that way, late:
 // once the rim is within the coast distance plus LEAD seconds of walking, so a player who turns back never commits.
+// It says how far from the spot's centre the player will leave it (walked: where the next spot is dreamed from;
+// each spot's rim comes from the server, see world.js).
 // The new spot is placed beside the server's spot (distance, heading and scale are parent-relative) and the player
 // switches into it on walking in (World.update). If it isn't there in time, the character coasts to a stop at the
 // rim in a dream fog and is moved into it as it lands. The server pre-dreams around the player's heading, which the
@@ -13,19 +15,22 @@
 // is in.
 
 import * as THREE from "three";
-import { World, LIMIT } from "./roam/world.js";
+import { World } from "./roam/world.js";
 import { ACCEL, Hero, Keys, OrbitCam } from "./roam/hero.js";
 import { Signposts } from "./roam/signposts.js";
 import { Compass, rel } from "./roam/compass.js";
 
 const HINT_MS = 300, HINT_DEG = 20;   // heading hints: at most this often, and only past this much turn
-const LEAD = 0.3;                     // seconds of walking before the coast to the rim, when /next goes out
-const RETRY_FROM = 0.6;               // after a failed /next, back inside this fraction of LIMIT the way opens again
+// Seconds of walking before the coast to the rim, when /next goes out: enough for the answer, its two images and
+// the mesh to land before the rim (measured ~0.4 s on the Tailscale LAN), so a ready spot is walked into without
+// braking.
+const LEAD = 0.8;
+const RETRY_FROM = 0.6;               // after a failed /next, back inside this fraction of the rim the way opens again
 const RETRY_TURN = 45;                // ... or heading for an exit this many degrees from the failed one
 const REBUILD_TRIES = 2;              // a spot /next returned that fails to build this often is given up
 const CLOSED = "The way is closed — try another direction.";
 const FADED = "The way ahead faded — step back and try again.";
-const FOG_RIM = 0.95;                 // a pending spot shows the fog once the player is past this fraction of LIMIT
+const FOG_RIM = 0.95;                 // a pending spot shows the fog once the player is past this fraction of the rim
 const LOOK_X = 0.004, LOOK_Y = 0.003; // radians of camera turn per pixel of drag (as OrbitCam)
 const STICK_R = 44;                   // px the phone stick's knob travels
 const TOAST_MS = 3500;
@@ -102,7 +107,7 @@ function loadImage(url) {
 
 async function build(v) {
   const [pano, depth] = await Promise.all([loadImage(v.image_url), loadImage(v.depth_url)]);
-  return world.buildSpot(pano, depth, { spot_id: v.spot_id });
+  return world.buildSpot(pano, depth, { spot_id: v.spot_id, limits: v.limits });
 }
 
 // --- HUD ----------------------------------------------------------------------
@@ -181,18 +186,25 @@ async function begin(place) {
 // The world's absolute position (the first spot's frame) of a point of the current frame, for the step log.
 const absolute = (x, z) => ({ x: world.abs.x + world.abs.s * x, z: world.abs.z + world.abs.s * z });
 
-async function step(exit) {
+// Fog and pacing, for the tests and the pacing measurement: every fog spell {t0, t1} (ms), and how each /next
+// was served (the server's own timing is in its log).
+const fogs = [];
+const nexts = [];
+
+async function step(exit, walked) {
   stepping = true;
   exitBearing = exit;
   const rebuild = pending !== null;
-  steps.push({ exit, from: here.meta.spot_id, inServerSpot: world.current === here, rebuild,
+  steps.push({ exit, walked, from: here.meta.spot_id, inServerSpot: world.current === here, rebuild,
                origin: absolute(here.origin.x, here.origin.z), player: absolute(hero.pos.x, hero.pos.y) });
   const sent = hintCount;
   let giveUp = false;
   try {
     let v;
     try {
-      v = pending ?? await call("next", { exit_heading: exit });
+      const t0 = performance.now();
+      v = pending ?? await call("next", { exit_heading: exit, walked });
+      if (!rebuild) nexts.push({ t0, ms: performance.now() - t0, distance: v.distance, walked, served: v.served });
     } catch (err) {
       toast(`${err.message} ${CLOSED}`);   // the current spot stays as it was, and playable
       stuck = exit;
@@ -359,13 +371,14 @@ for (const chip of chips) {
 
 // --- the frame ------------------------------------------------------------------
 
-const fogged = () => stepping && (braking || hero.pos.length() >= FOG_RIM * LIMIT);
+const fogged = () => stepping && (braking || hero.pos.length() >= FOG_RIM * world.rimAt(hero.pos.x, hero.pos.y));
 
 function play(dt, now) {
   const p = hero.pos, c = control(), want = travel(c);
   const exit = world.exitAhead(p, want);
   const busy = stepping || entering, coast = hero.speed / ACCEL / world.k;
-  if (stuck !== null && (p.length() < RETRY_FROM * LIMIT || (exit && Math.abs(rel(stuck, exit.bearing)) > RETRY_TURN)))
+  if (stuck !== null && (p.length() < RETRY_FROM * world.rimAt(p.x, p.y)
+                         || (exit && Math.abs(rel(stuck, exit.bearing)) > RETRY_TURN)))
     stuck = null;
   // Why the way out at this exit is closed, if it is: a failed step, or a spot the server moved to lying elsewhere.
   const closed = !exit ? null
@@ -373,7 +386,7 @@ function play(dt, now) {
     : stuck !== null ? CLOSED : null;
   if (exit && !closed && !busy && exit.gap <= coast + hero.speed * LEAD / world.k + 0.02) {
     if (world.current !== here) enterWanted = world.current;   // the server first steps into this spot
-    else step(exit.bearing);
+    else step(exit.bearing, exit.r);
   }
   // Waiting at a rim (a step or /enter on its way, or the way closed): stop walking on once the coast would just
   // reach it.
@@ -395,6 +408,10 @@ function play(dt, now) {
   world.tick(dt);
   sendHint(now);
   const fog = fogged();
+  if (fog && !wasFog) fogs.push({ t0: now, t1: null });
+  if (!fog && wasFog) fogs[fogs.length - 1].t1 = now;
+  if (fogs.length > 200) fogs.shift();
+  wasFog = fog;
   document.body.classList.toggle("fogged", fog);
   if (fog && exitBearing != null) {
     const d = rel(camBearing(), exitBearing) * Math.PI / 180;   // the fog thickens on the side the way lies
@@ -404,6 +421,7 @@ function play(dt, now) {
   if (samples.length > 600) samples.shift();
 }
 const samples = [];       // per frame: ground speed and walk-clip weight, for the tests
+let wasFog = false;
 
 function pose() {
   const k = world.k, p = hero.pos;
@@ -444,6 +462,9 @@ window.roam = Object.freeze(Object.defineProperties({}, {
   camYaw: { get: () => cam.yaw, enumerable: true },
   camBearing: { get: () => camBearing(), enumerable: true },
   stepping: { get: () => stepping, enumerable: true },
+  rim: { get: () => hero && started ? world.rimAt(hero.pos.x, hero.pos.y) : null, enumerable: true },
+  fogs: { get: () => fogs.map(f => ({ ...f })), enumerable: true },
+  nexts: { get: () => nexts.map(n => ({ ...n })), enumerable: true },
   fog: { get: () => started && fogged(), enumerable: true },
   braking: { get: () => braking, enumerable: true },
   stuck: { get: () => stuck !== null, enumerable: true },
@@ -455,6 +476,7 @@ window.roam = Object.freeze(Object.defineProperties({}, {
   entering: { get: () => entering, enumerable: true },
   edge: { get: () => world.edge && { ...world.edge }, enumerable: true },
   built: { get: () => world.spots.length, enumerable: true },
+  spotIds: { get: () => world.spots.map(e => e.meta.spot_id), enumerable: true },
   fading: { get: () => !!world.fade, enumerable: true },
   signposts: { get: () => [...signposts.names], enumerable: true },
   hints: { get: () => hints.map(h => ({ ...h })), enumerable: true },

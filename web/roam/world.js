@@ -9,19 +9,35 @@
 //
 // Headings are world bearings in degrees, 0 = north (−z, the first spot's forward), clockwise (east = +x). Every
 // spot's mesh is vertically placed so its fitted ground sits at y = 0, where the character walks.
+//
+// The walkable area. Each spot from the server carries meta.limits: how far from its centre the player may walk,
+// sampled every 360/n degrees from the spot's forward, clockwise, in its own units (src/vecworld/roam/spot.py
+// walk_limits: short of the painted scenery that way, and no further than the next spot's dolly can represent).
+// A spot without them (the dev page's fixtures) is a disc of radius LIMIT.
 import * as THREE from "three";
 
 export const NEAR = 4, FAR = 50, VSPAN = Math.PI / 2;
 export const GX = 512, GY = 128;               // the depth mesh grid (spec: 512×128)
-export const LIMIT = 0.55 * NEAR;              // walkable radius around the current spot's origin (spike)
+export const LIMIT = 0.55 * NEAR;              // walkable radius of a spot without meta.limits (the spike's)
 export const FADE_MS = 600;                    // crossfade length at a switch
-export const EDGE_AT = 0.98;                   // at |p| ≥ EDGE_AT·LIMIT the player is at the edge of the current spot
+export const EDGE_AT = 0.98;                   // at |p| ≥ EDGE_AT·rim the player is at the edge of the current spot
 const HYSTERESIS = 0.08;                       // a spot must be this much nearer than the current one to switch to
 const AHEAD = 45;                              // degrees: a spot is "ahead" when its bearing is this close to travel
 const SCALE_EASE = 0.6;                        // per second: how fast the view scale returns to 1 after a re-root
+const LAND_IN = 0.75;                          // a switch lands the player within this fraction of the new spot's rim
 const RAD = Math.PI / 180;
 
 export function bearingVec(deg) { return { x: Math.sin(deg * RAD), z: -Math.cos(deg * RAD) }; }
+const bearingTo = (x, z) => (Math.atan2(x, -z) / RAD + 360) % 360;
+
+// Spot e's walkable radius toward world bearing b, in e's own units (see the header): linear between samples.
+export function limitOf(e, b) {
+  const L = e.meta?.limits;
+  if (!L || !L.length) return LIMIT;
+  const n = L.length, x = (((b - e.heading) % 360) + 360) % 360 / (360 / n);
+  const i = Math.floor(x) % n, t = x - Math.floor(x);
+  return (1 - t) * L[i] + t * L[(i + 1) % n];
+}
 
 const angleBetween = (ax, az, bx, bz) =>
   Math.acos(Math.max(-1, Math.min(1, (ax * bx + az * bz) / (Math.hypot(ax, az) * Math.hypot(bx, bz) || 1)))) / RAD;
@@ -142,11 +158,12 @@ export class World {
     this.spots = [];
     this.current = null;
     this.edge = null;               // {bearing} while the player is at the edge with no spot ahead (fog goes here)
-    this._r = 0;                    // the player's distance from the current origin last frame
+    this._over = 0;                 // after a switch past the new spot's rim: how far out the player may still be
     this.fade = null;               // {from, to, elapsed, ms} (milliseconds)
     this.k = 1;                     // view scale (see the header)
     this.abs = { x: 0, z: 0, s: 1 };  // the current frame inside the first spot's frame (debug: absolute positions)
     this.haze = new THREE.Color("#dfe3ea"); this.hazeAmt = 0;
+    this.landShift = 0;             // how far the last switch moved the spot entered (frame units; see enter)
     this._rt = null; this._fadeMat = null; this.override = null;
   }
 
@@ -206,32 +223,42 @@ export class World {
     e.group.scale.setScalar(e.scale);
   }
 
+  // Spot e's walkable radius toward world bearing b from its origin, in frame units.
+  limitAt(e, b) { return limitOf(e, b) * e.scale; }
+
+  // The current spot's rim radius at the bearing of frame point (x, z).
+  rimAt(x, z) { return this.limitAt(this.current, bearingTo(x, z)); }
+
   // The walkable clamp alone (idempotent; update() applies it first). Returns the player's distance from the origin.
+  // Just after a switch the player may stand past the new spot's rim: walking inward is allowed, outward not, and
+  // the allowance shrinks as the player comes in.
   constrain(p) {
-    const r = p.length();
-    if (r > LIMIT && r > this._r) p.multiplyScalar(Math.max(LIMIT, this._r) / r);
+    const r = p.length(), lim = Math.max(this.rimAt(p.x, p.y), this._over);
+    if (r > lim) p.multiplyScalar(lim / r);
+    this._over = Math.min(this._over, p.length());
     return p.length();
   }
 
   // Keep the player in the world and choose its spot. p: position (frame units, THREE.Vector2 of x, z), adjusted in
   // place by the walkable clamp and on a re-root. dir: the unit direction of travel (x, z), or null when standing.
-  //  - Clamp: the player can't move outward past LIMIT (or past where it already is, just after a switch at the edge
-  //    into a spot whose origin is further than LIMIT away; walking inward is always allowed).
+  //  - Clamp: the player can't move outward past the current spot's rim (or past where it already is, just after a
+  //    switch at the edge into a spot whose origin is further than its rim away; walking inward is always allowed).
   //  - Switch (crossfade + re-root) to another spot when moving toward it and either inside its walkable radius and
-  //    nearer to it than to the current origin (the bisector), or at the edge with it ahead: its bearing within AHEAD°
-  //    of travel, on the player's side. (Inside its radius: after an edge switch between far-apart spots the player is
-  //    nearer the old origin than the new one, and must not be switched straight back.)
+  //    nearer to it than to the current origin (the bisector), or at the edge with it ahead: a child or the parent of
+  //    the current spot, its bearing within AHEAD° of travel, on the player's side. (Inside its radius: after an
+  //    edge switch between far-apart spots the player is nearer the old origin than the new one, and must not be
+  //    switched straight back.)
   //  - At the edge with no spot ahead, world.edge = {bearing} (where the game shows dream fog and waits).
   // Returns the spot switched to, or null.
   update(p, dir = null) {
     if (!this.current) return null;
     const r = this.constrain(p);
     const moving = dir && (dir.x || dir.y);
-    const atEdge = r >= EDGE_AT * LIMIT;
+    const atEdge = r >= EDGE_AT * this.rimAt(p.x, p.y);
     const best = moving ? this._ahead(p, dir, atEdge) : null;
     const outward = moving && dir.x * p.x + dir.y * p.y > 0;
-    this.edge = !best && atEdge && outward ? { bearing: (Math.atan2(p.x, -p.y) / RAD + 360) % 360 } : null;
-    if (!best) { this._r = r; return null; }
+    this.edge = !best && atEdge && outward ? { bearing: bearingTo(p.x, p.y) } : null;
+    if (!best) return null;
     this.enter(best, p);
     return best;
   }
@@ -241,14 +268,18 @@ export class World {
   _ahead(p, dir, atEdge) {
     const dist = e => Math.hypot(p.x - e.origin.x, p.y - e.origin.z);
     const toward = e => dir.x * (e.origin.x - p.x) + dir.y * (e.origin.z - p.y) > 0;
+    const inside = e => dist(e) <= this.limitAt(e, bearingTo(p.x - e.origin.x, p.y - e.origin.z));
     let best = null, bd = dist(this.current) - HYSTERESIS;
     for (const e of this.spots) {
-      if (e !== this.current && toward(e) && dist(e) <= LIMIT && dist(e) < bd) { best = e; bd = dist(e); }
+      if (e !== this.current && toward(e) && inside(e) && dist(e) < bd) { best = e; bd = dist(e); }
     }
     if (!best && atEdge) {
+      // only a spot dreamed from this one (the step out) or the one this was dreamed from (the way back): another
+      // spot kept around (a sibling) can lie far off this way, and is switched to only from inside its area
       let ba = AHEAD;
       for (const e of this.spots) {
-        if (e === this.current || e.origin.x * p.x + e.origin.z * p.y <= 0) continue;
+        if (e === this.current || !(e.parent === this.current || e === this.current.parent)
+            || e.origin.x * p.x + e.origin.z * p.y <= 0) continue;
         const a = angleBetween(dir.x, dir.y, e.origin.x, e.origin.z);
         if (a <= ba) { best = e; ba = a; }
       }
@@ -256,28 +287,51 @@ export class World {
     return best;
   }
 
-  // Where walking on from p along unit dir leaves the current spot's walkable disc, when no placed spot lies that
-  // way: {gap, bearing}, the distance to the rim along dir and the bearing (from the origin) of the point it is
-  // crossed. Null when dir is zero, inward, or a spot lies ahead. The game asks for the next spot before the edge.
+  // Where walking on from p along unit dir leaves the current spot's walkable area, when no placed spot lies that
+  // way: {gap, bearing, r}, the distance to the rim along dir, and the bearing and distance from the origin of the
+  // point it is crossed (r is what the next spot is dollied by). Null when dir is zero, inward, or a spot lies
+  // ahead. The game asks for the next spot before the edge.
   exitAhead(p, dir) {
     if (!this.current || !dir || !(dir.x || dir.y)) return null;
     const pd = p.x * dir.x + p.y * dir.y;
-    if (pd <= 0 && p.length() > 0.5 * LIMIT) return null;      // heading back in
+    if (pd <= 0 && p.length() > 0.5 * this.rimAt(p.x, p.y)) return null;      // heading back in
     if (this._ahead(p, dir, true)) return null;
-    const disc = pd * pd - p.lengthSq() + LIMIT * LIMIT;
-    const gap = disc > 0 ? Math.max(0, -pd + Math.sqrt(disc)) : 0;
-    const x = p.x + dir.x * gap, z = p.y + dir.y * gap;
-    return { gap, bearing: (Math.atan2(x, -z) / RAD + 360) % 360 };
+    const out = s => Math.hypot(p.x + dir.x * s, p.y + dir.y * s) >= this.rimAt(p.x + dir.x * s, p.y + dir.y * s);
+    let lo = 0, hi = 0;
+    if (!out(0)) {                       // march out to the rim, then bisect the crossing
+      const far = 4 * this.limitAt(this.current, bearingTo(dir.x, dir.y)) + 4 * p.length();
+      for (hi = 0.25; hi < far && !out(hi); hi += 0.25) lo = hi;
+      for (let i = 0; i < 12; i++) { const m = (lo + hi) / 2; if (out(m)) hi = m; else lo = m; }
+    }
+    const x = p.x + dir.x * hi, z = p.y + dir.y * hi;
+    return { gap: hi, bearing: bearingTo(x, z), r: Math.min(Math.hypot(x, z), this.rimAt(x, z)) };
   }
 
   // Switch to spot e now, wherever the player stands: re-root on it and crossfade from the current spot. update()
   // does this at a switch; the game also does it when the server hands it the next spot at an edge.
+  //
+  // Landing. A spot dreamed for a heading up to 45° off the way the player left (a pre-dream), or one whose depth
+  // reads its scenery nearer than the parent's (scale < 1, its rim small in this frame), can put the player outside
+  // its walkable area, i.e. inside its painted scenery. Then the spot (with any children placed from it) is moved
+  // toward the player, under the crossfade, until the player lands within LAND_IN of its rim.
   enter(e, p) {
     if (e === this.current) return;
     const from = this.current;
+    this.landShift = 0;
+    if (p) {
+      const dx = p.x - e.origin.x, dz = p.y - e.origin.z, d = Math.hypot(dx, dz);
+      const room = LAND_IN * this.limitAt(e, bearingTo(dx, dz));
+      if (d > room) {
+        const f = 1 - room / d;
+        for (const c of [e, ...this.spots.filter(c => c.parent === e)]) {
+          c.origin = { x: c.origin.x + dx * f, z: c.origin.z + dz * f }; this._pose(c);
+        }
+        this.landShift = d - room;
+      }
+    }
     this._reroot(e, p);
     this.crossfade(e, FADE_MS, from);
-    this._r = p.length(); this.edge = null;
+    this._over = p.length(); this.edge = null;
     this.prune();
   }
 
@@ -296,7 +350,7 @@ export class World {
   jumpTo(e, p) {
     this._reroot(e, p);
     if (p) p.set(0, 0);
-    this.fade = null; this._r = 0; this.edge = null;
+    this.fade = null; this._over = 0; this.edge = null;
     this.prune();
   }
 
@@ -317,11 +371,14 @@ export class World {
     if (this.fade && this.fading >= 1) this.fade = null;
   }
 
-  // Free every spot but the current one, the one being faded from (normally its parent, so walking back still
-  // works until the next switch) and the current one's placed children. Runs on every re-root.
+  // Free every spot but the current one, the one being faded from, its parent and every placed child of either
+  // (so the player can walk back, and on into any spot already dreamed around here; the server keeps the same
+  // ones). Runs on every re-root.
   prune() {
+    const up = this.current.parent;
     for (const e of [...this.spots]) {
-      if (e === this.current || (this.fade && e === this.fade.from) || e.parent === this.current) continue;
+      if (e === this.current || (this.fade && e === this.fade.from) || e === up || e.parent === this.current
+          || (up && e.parent === up)) continue;
       this.remove(e);
     }
   }

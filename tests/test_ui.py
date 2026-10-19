@@ -16,7 +16,8 @@ from vecworld.roam.service import RoamService
 
 pytestmark = pytest.mark.ui
 
-LIMIT = 0.55 * 4     # web/roam/world.js: the walkable radius
+# 8b: the walkable radius comes from each spot (the server's walk limits), read from the page as roam.rim; with
+# the fake depth it is ~4.5 everywhere (was a fixed LIMIT = 2.2).
 
 
 class UiPainter(FakePainter):
@@ -50,8 +51,10 @@ class RecordingService(RoamService):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.calls: list[tuple[str, object, float]] = []
+        self.walked: list[float | None] = []
         self.hide_next_image = False
         self.hidden = None
+        self.refuse_enter = False   # every /enter answers unknown_spot, as if the spot's files were gone
 
     def _rec(self, name, arg):
         self.calls.append((name, arg, time.monotonic()))
@@ -60,9 +63,10 @@ class RecordingService(RoamService):
         self._rec("start", (place, list(moods)))
         return super().start(sid, place, moods)
 
-    def next(self, sid, exit_heading):
+    def next(self, sid, exit_heading, walked=None):
         self._rec("next", exit_heading)
-        v = super().next(sid, exit_heading)
+        self.walked.append(walked)
+        v = super().next(sid, exit_heading, walked)
         if self.hide_next_image:
             self.hide_next_image = False
             aside = v.image_path.with_suffix(".aside")
@@ -72,6 +76,10 @@ class RecordingService(RoamService):
 
     def enter(self, sid, spot_id):
         self._rec("enter", spot_id)
+        if self.refuse_enter:
+            from vecworld.dream.errors import UnknownSpot
+
+            raise UnknownSpot("That spot has faded from the dream.")
         return super().enter(sid, spot_id)
 
     def heading(self, sid, heading):
@@ -118,6 +126,7 @@ def healthy(server):
     _, _, painter = server
     painter.fail_steps, painter.fail_next, painter.pano_delay = False, False, 0.0
     server[1].hide_next_image = False
+    server[1].refuse_enter = False
     painter.gate.set()
     painter.entered.clear()
     yield
@@ -196,6 +205,11 @@ def key_up(d, key):
 
 def radius(d):
     return js(d, "Math.hypot(roam.pos.x, roam.pos.z)")
+
+
+def rim(d):
+    """The current spot's walkable radius at the player's bearing."""
+    return js(d, "roam.rim")
 
 
 def ang(a, b):
@@ -286,12 +300,15 @@ def test_edge_waits_in_fog_then_continues(server, browser):
         wait(browser, "roam.stepping")
         wait_for(lambda: [h for h, _ in svc.since(n, "next")], timeout=5)
         assert ang(svc.since(n, "next")[0][0], 0) < 5
-        assert radius(browser) < 0.9 * LIMIT          # asked for ahead of the rim
+        assert radius(browser) < rim(browser) - 0.3   # asked for ahead of the rim (by about the coast + LEAD)
         assert painter.entered.wait(10)
         # Coasts to a stop just inside the rim, in the fog, with the feet slowing as the ground speed does.
         wait(browser, "roam.fog && roam.braking && roamDev.hero.speed < 0.02", timeout=10)
         time.sleep(0.5)
-        assert 0.9 * LIMIT <= radius(browser) <= LIMIT + 1e-6
+        edge = rim(browser)
+        assert 0.9 * edge <= radius(browser) <= edge + 1e-6
+        # the walked distance sent is where the player leaves the spot: its rim that way
+        assert svc.walked[-1] == pytest.approx(edge, abs=0.05)
         assert js(browser, "roam.spotId") == first
         wait(browser, "Number(getComputedStyle(document.getElementById('fog')).opacity) > 0.5")
         walk_speed = js(browser, "roamDev.hero.walkSpeed")
@@ -300,7 +317,7 @@ def test_edge_waits_in_fog_then_continues(server, browser):
         wait(browser, f"roam.spotId !== {first!r} && !roam.fog")
         assert js(browser, "roam.built") == 2       # the child placed beside its parent
         # ...and the walk goes on north, past where the old spot's edge held it.
-        wait(browser, f"roam.world.z < {-LIMIT - 0.3}")
+        wait(browser, f"roam.world.z < {-edge - 0.3}")
     finally:
         key_up(browser, "w")
     wait(browser, "Number(getComputedStyle(document.getElementById('fog')).opacity) < 0.05")
@@ -326,17 +343,23 @@ def test_failed_next_keeps_current_spot(server, browser):
         assert js(browser, "roamDev.hero.walk.getEffectiveWeight()") < 0.1
         assert js(browser, "roamDev.hero.speed") < 0.05
         assert not js(browser, "roam.fog")
-        assert radius(browser) <= LIMIT + 1e-6
+        assert radius(browser) <= rim(browser) + 1e-6
     finally:
         key_up(browser, "w")
     assert js(browser, "roam.spotId") == first and js(browser, "roam.built") == 1
     assert not js(browser, "roam.stepping")
     r = radius(browser)
-    hold(browser, "s", 1.2)              # still playable: walk back in, which opens the way again
+    key_down(browser, "s")               # still playable: walk back in, which opens the way again
+    try:
+        wait(browser, "!roam.stuck", timeout=20)
+    finally:
+        key_up(browser, "s")
     assert radius(browser) < r - 0.6
-    wait(browser, "!roam.stuck")
-    hold(browser, "w", 1.6)
-    wait_for(lambda: len(svc.since(n, "next")) == 2)
+    key_down(browser, "w")
+    try:
+        wait_for(lambda: len(svc.since(n, "next")) == 2, timeout=20)
+    finally:
+        key_up(browser, "w")
     assert js(browser, "window.roamErrors") == []
 
 
@@ -450,6 +473,73 @@ def test_back_into_a_spot_after_exploring_three_ways_from_it(server, browser):
     assert js(browser, "window.roamErrors") == []
 
 
+def to_the_middle(d, near=0.4):
+    """Walk to the current spot's centre (re-aiming as it goes)."""
+    for _ in range(60):
+        pos = js(d, "roam.pos")
+        if math.hypot(pos["x"], pos["z"]) < near:
+            return
+        d.execute_script(f"roamDev.look({bearing(pos, {'x': 0, 'z': 0})}, 0.18)")
+        hold(d, "w", 0.15 if math.hypot(pos["x"], pos["z"]) < 1 else 0.4)
+        wait(d, "roamDev.hero.speed < 0.01")
+    raise AssertionError(f"never reached the middle: {js(d, 'roam.pos')}")
+
+
+def test_back_in_a_spot_its_oldest_child_is_walked_into_again(server, browser):
+    """8b: from the first spot out three ways (north, east, west) and back; then north again walks into the very
+    first child (the viewer and the server both still hold it): /enter succeeds, no new /next, no 'faded' toast, no
+    switching back and forth, and it stays."""
+    url, svc, _ = server
+    start(browser, url)
+    first = js(browser, "roam.spotId")
+    here = f"roam.spotId === {first!r} && !roam.entering && roam.inServerSpot"
+    away = f"roam.spotId !== {first!r} && roam.inServerSpot && !roam.stepping"
+    walk(browser, 0, away)
+    north = js(browser, "roam.spotId")
+    walk(browser, 180, here)
+    walk(browser, 90, away)
+    walk(browser, 270, here)
+    walk(browser, 270, away)
+    walk(browser, 90, here)
+    to_the_middle(browser)                           # where a fresh walk north would start from
+    assert js(browser, "roam.spotId") == first
+    assert north in js(browser, "roam.spotIds")
+    n, before = len(svc.calls), js(browser, "roam.switches")
+    walk(browser, 0, f"roam.spotId === {north!r} && !roam.entering && roam.inServerSpot", timeout=30)
+    time.sleep(1.0)
+    assert js(browser, "roam.spotId") == north and js(browser, "roam.inServerSpot")
+    assert [k for k, _ in svc.since(n) if k in ("next", "enter")] == ["enter"]
+    assert svc.since(n, "enter")[0][0] == north
+    assert js(browser, "roam.switches") - before == 1
+    assert "faded" not in (js(browser, "document.getElementById('toast').textContent") or "")
+    assert js(browser, "window.roamErrors") == []
+
+
+def test_a_refused_enter_drops_the_spot_and_does_not_loop(server, browser):
+    """The server no longer holds the spot walked back into (unknown_spot): the viewer says so, drops it, stays
+    in (re-roots on) the server's spot, and asks only once."""
+    url, svc, _ = server
+    start(browser, url)
+    first, second = step_into_a_child(browser, svc)
+    svc.refuse_enter = True
+    n = len(svc.calls)
+    browser.execute_script("roamDev.look(180, 0.18)")
+    key_down(browser, "w")
+    try:
+        wait(browser, TOAST, timeout=30)
+    finally:
+        key_up(browser, "w")
+    assert "faded" in browser.find_element("id", "toast").text
+    wait(browser, f"!roam.spotIds.includes({first!r}) && !roam.entering")
+    # Back on the server's spot: still walking (the coast), the next step goes out from it.
+    assert js(browser, "roam.world && roam.spotIds.includes(" + repr(second) + ")")
+    assert all(st["from"] == second and st["inServerSpot"] for st in js(browser, "roam.steps")[1:])
+    hold(browser, "w", 1.5)                              # on back that way: no retry storm
+    assert [a for a, _ in svc.since(n, "enter")] == [first]
+    assert first not in js(browser, "roam.spotIds")
+    assert js(browser, "window.roamErrors") == []
+
+
 def test_creeping_up_to_the_rim_and_turning_back_commits_nothing(server, browser):
     """The commit point depends on speed: creeping in short taps to well past where a walk would commit, then
     turning back, sends no /next."""
@@ -457,17 +547,28 @@ def test_creeping_up_to_the_rim_and_turning_back_commits_nothing(server, browser
     start(browser, url)
     n = len(svc.calls)
     browser.execute_script("roamDev.look(0, 0.18)")
+    edge = rim(browser)
     hold(browser, "w", 1.0)
-    for _ in range(40):                                 # LIMIT 2.2; walking at full speed commits by r ≈ 1.7
-        if radius(browser) >= 1.85 or js(browser, "roam.steps.length"):
+    # Walking at full speed commits about 1.15 short of the rim (coast + LEAD); creep to within 0.7 of it.
+    for _ in range(120):
+        if radius(browser) >= edge - 0.7 or js(browser, "roam.steps.length"):
             break
-        hold(browser, "w", 0.1)
+        hold(browser, "w", 0.1 if radius(browser) > edge - 1.8 else 0.6)
         wait(browser, "roamDev.hero.speed < 0.01")
-    assert js(browser, "roam.steps") == [] and radius(browser) >= 1.85
+    assert js(browser, "roam.steps") == [] and radius(browser) >= edge - 0.7
     browser.execute_script("roamDev.look(180, 0.18)")
     hold(browser, "w", 1.0)
-    assert radius(browser) < 1.4
+    assert radius(browser) < edge - 1.2
     assert svc.since(n, "next") == [] and js(browser, "roam.steps") == []
+
+
+def back_until_open(d):
+    """Walk backwards (S) until the way out opens again (inside RETRY_FROM of the rim)."""
+    key_down(d, "s")
+    try:
+        wait(d, "!roam.stuck", timeout=20)
+    finally:
+        key_up(d, "s")
 
 
 def fail_a_build_walking_north(d, svc):
@@ -492,8 +593,7 @@ def test_spot_that_failed_to_build_is_built_again_without_a_new_next(server, bro
     assert js(browser, "roam.spotId") == first
     aside, original = svc.hidden
     aside.rename(original)
-    hold(browser, "s", 1.2)
-    wait(browser, "!roam.stuck")
+    back_until_open(browser)
     # Out to the east the way stays closed: the server's next spot lies north.
     browser.execute_script("document.getElementById('toast').hidden = true; roamDev.look(90, 0.18)")
     key_down(browser, "w")
@@ -505,7 +605,7 @@ def test_spot_that_failed_to_build_is_built_again_without_a_new_next(server, bro
     finally:
         key_up(browser, "w")
     assert len(js(browser, "roam.steps")) == 1
-    hold(browser, "s", 1.2)                           # back west, toward the middle
+    hold(browser, "s", 2.5)                           # back west, toward the middle
     browser.execute_script("roamDev.look(0, 0.18)")
     key_down(browser, "w")
     try:
@@ -524,8 +624,7 @@ def test_spot_that_keeps_failing_to_build_is_given_up(server, browser):
     first = js(browser, "roam.spotId")
     n = len(svc.calls)
     fail_a_build_walking_north(browser, svc)           # its panorama never comes back
-    hold(browser, "s", 1.2)
-    wait(browser, "!roam.stuck")
+    back_until_open(browser)
     browser.execute_script("roamDev.look(0, 0.18)")
     key_down(browser, "w")
     try:
