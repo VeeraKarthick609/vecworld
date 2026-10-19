@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dream Roam transition</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; color: #eef1f6; font: 14px system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; cursor: grab; }
+  #hud { position: fixed; left: 12px; top: 10px; background: rgba(10,12,18,.62); padding: 6px 10px; border-radius: 8px; font: 12px ui-monospace, monospace; pointer-events: none; }
+</style>
+<script>
+  // Collected for the tests: any uncaught error or rejection on this page.
+  window.roamErrors = [];
+  addEventListener("error", e => roamErrors.push(String(e.message || e.error)));
+  addEventListener("unhandledrejection", e => roamErrors.push(String(e.reason && e.reason.stack || e.reason)));
+</script>
+<script type="importmap">{"imports":{"three":"../vendor/three.module.min.js","three/addons/":"../vendor/"}}</script>
+</head><body>
+<div id="hud">loading…</div>
+<script type="module">
+// Dev page: the three fixture spots chained by their meta ({heading, scale, distance}, parent-relative), walked
+// across automatically (?auto=0 for manual WASD; ?haze=0.4 dissolves through haze). ?clear=rrggbb sets the clear colour (tests look for it as void).
+import * as THREE from "three";
+import { World, LIMIT, bearingVec } from "./world.js";
+import { Hero, Keys, OrbitCam, bearingOf } from "./hero.js";
+
+const q = new URLSearchParams(location.search);
+const AUTO = q.get("auto") !== "0", N = Number(q.get("spots") || 3), FIX = q.get("fixtures") || "fixtures";
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio)); renderer.setSize(innerWidth, innerHeight);
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene(); scene.background = new THREE.Color("#" + (q.get("clear") || "c9cfc4"));
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 300);
+addEventListener("resize", () => {
+  renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+});
+scene.add(new THREE.HemisphereLight(0xfff3dd, 0x3a4a2a, 2.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4); sun.position.set(-3, 8, 4); scene.add(sun);
+
+const img = src => new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => bad(new Error("load " + src)); i.src = src; });
+const world = new World(scene);
+world.hazeAmt = Number(q.get("haze") || 0);       // the dream-haze dissolve fallback (0 = plain crossfade)
+const [hero, spots] = await Promise.all([
+  Hero.load(scene),
+  Promise.all([...Array(N).keys()].map(async i => {
+    const [pano, depth, meta] = await Promise.all([img(`${FIX}/spot_${i}.jpg`), img(`${FIX}/depth_${i}.png`),
+      fetch(`${FIX}/meta_${i}.json`).then(r => r.json())]);
+    return world.buildSpot(pano, depth, { ...meta, index: i });
+  })),
+]);
+// Chain: spot 0 at the origin facing its heading; each next one placed from its parent by its own meta.
+world.addSpot(spots[0], { x: 0, z: 0 }, spots[0].meta.heading, 1);
+for (let i = 1; i < N; i++) world.placeChild(spots[i - 1], spots[i].meta.heading, spots[i].meta.distance, spots[i].meta.scale, spots[i]);
+
+const keys = new Keys(), cam = new OrbitCam(renderer.domElement);
+cam.yaw = OrbitCam.yawFor(spots[0].meta.heading);
+const p = hero.pos;
+let manual = false, paused = false, frames = 0, frameMs = 0, last = performance.now(), autoDone = false;
+
+// Auto-walk: toward the next spot's origin; past the last one, on along its heading to near the edge.
+function autoInput() {
+  const i = world.current.index, next = spots[i + 1];
+  let tx, tz;
+  if (next) { tx = next.origin.x; tz = next.origin.z; }
+  else { const v = bearingVec(world.current.heading); tx = v.x * 0.8 * LIMIT; tz = v.z * 0.8 * LIMIT; }
+  const dx = tx - p.x, dz = tz - p.y;
+  if (!next && Math.hypot(dx, dz) < 0.1) autoDone = true;
+  if (autoDone) return { fwd: 0, side: 0, run: false };
+  const want = -Math.atan2(dx, -dz);                       // camera yaw looking toward the target
+  let d = want - cam.yaw; d = Math.atan2(Math.sin(d), Math.cos(d)); cam.yaw += d * 0.15;
+  return { fwd: 1, side: 0, run: false };
+}
+
+const hud = document.getElementById("hud");
+function draw() {
+  hero.place(world.k);
+  cam.apply(camera, new THREE.Vector3(world.k * p.x, 0, world.k * p.y));
+  world.render(renderer, scene, camera);
+}
+renderer.setAnimationLoop(t => {
+  const dt = paused ? 0 : Math.min(0.05, (t - last) / 1000); last = t;
+  const t0 = performance.now();
+  if (!paused) {
+    hero.update(dt, AUTO && !manual ? autoInput() : keys.input, cam.yaw, world.k);
+    if (p.length() > LIMIT) p.setLength(LIMIT);           // the current spot is always at the frame origin
+    world.update(p);
+    world.tick(dt);
+  }
+  draw();
+  frames++; frameMs += performance.now() - t0;
+  if (dev.pauseWhen && dev.pauseWhen(roam)) { paused = true; dev.pauseWhen = null; }
+  hud.textContent = `spot ${world.current.index} · pos ${p.x.toFixed(2)}, ${p.y.toFixed(2)} · heading ${hero.heading.toFixed(0)}°` +
+    (world.fade ? ` · fade ${world.fading.toFixed(2)}` : "") + ` · ${(frameMs / frames).toFixed(1)} ms/frame (CPU)`;
+});
+addEventListener("keydown", () => { manual = true; });
+
+// Read-only debug state.
+const roam = Object.freeze(Object.defineProperties({}, {
+  ready: { get: () => true, enumerable: true },
+  spotIndex: { get: () => world.current.index, enumerable: true },
+  pos: { get: () => ({ x: p.x, z: p.y }), enumerable: true },
+  heading: { get: () => hero.heading, enumerable: true },
+  world: { get: () => ({ x: world.abs.x + world.abs.s * p.x, z: world.abs.z + world.abs.s * p.y }), enumerable: true },
+  walked: { get: () => hero.walked, enumerable: true },
+  fading: { get: () => !!world.fade, enumerable: true },
+  fade: { get: () => world.fade ? world.fading : null, enumerable: true },
+  built: { get: () => world.spots.length, enumerable: true },
+  workerBuilt: { get: () => world.workerBuilt, enumerable: true },
+  triangles: { get: () => world.spots.reduce((a, s) => a + s.triangles, 0), enumerable: true },
+  k: { get: () => world.k, enumerable: true },
+  frameMs: { get: () => frames ? frameMs / frames : null, enumerable: true },
+}));
+window.roam = roam;
+
+// Dev hooks for the tests and the screenshot driver (not part of the game).
+const gl = renderer.getContext();
+const dev = window.roamDev = {
+  world, hero,
+  pauseWhen: null,
+  get paused() { return paused; }, set paused(v) { paused = v; last = performance.now(); },
+  resetFrameTime() { frames = 0; frameMs = 0; },
+  goto(i) { world.jumpTo(spots[i], p); cam.yaw = OrbitCam.yawFor(spots[i].heading); autoDone = true; },
+  look(yawDeg, pitch) { if (yawDeg != null) cam.yaw = OrbitCam.yawFor(yawDeg); if (pitch != null) cam.setPitch(pitch); },
+  show(i) { world.override = i == null ? null : spots[i]; },   // render only spot i (null: normal)
+  // Render one frame now (optionally looking along yawDeg at pitch) and count the clear-colour pixels in it.
+  voidPixels(yawDeg, pitch) {
+    if (yawDeg != null) this.look(yawDeg, pitch);
+    draw();
+    const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight, px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const want = scene.background.clone().convertLinearToSRGB();
+    const r = Math.round(want.r * 255), g = Math.round(want.g * 255), b = Math.round(want.b * 255);
+    let n = 0;
+    for (let i = 0; i < px.length; i += 4)
+      if (Math.abs(px[i] - r) <= 2 && Math.abs(px[i + 1] - g) <= 2 && Math.abs(px[i + 2] - b) <= 2) n++;
+    return n;
+  },
+};
+</script>
+</body></html>
