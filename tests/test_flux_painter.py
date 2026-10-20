@@ -143,3 +143,25 @@ def test_step_schedule_puts_the_background_sigma_on_it():
     assert p._step_sigmas(0.25) == ([1.0, 0.75, 0.5, 0.25, 0.0], 3)          # on schnell's grid: unchanged
     assert p._step_sigmas(0.15) == ([1.0, 0.75, 0.5, 0.25, 0.15, 0.0], 4)    # off it: added
     assert p._step_sigmas(0.0) == ([1.0, 0.75, 0.5, 0.25, 0.0], FLUX_STEPS)  # never released
+
+
+def test_read_gguf_matches_diffusers_loader(tmp_path):
+    import gguf
+    import numpy as np
+    from diffusers.models.model_loading_utils import load_gguf_checkpoint
+
+    from vecworld.flux.painter import _read_gguf
+
+    path = str(tmp_path / "t.gguf")
+    w = gguf.GGUFWriter(path, "flux")
+    rng = np.random.default_rng(0)
+    w.add_tensor("a.weight", rng.standard_normal((4, 8)).astype(np.float32))
+    w.add_tensor("b.weight", rng.standard_normal((3, 16)).astype(np.float16))
+    q = gguf.quants.quantize(rng.standard_normal((2, 256)).astype(np.float32), gguf.GGMLQuantizationType.Q8_0)
+    w.add_tensor("c.weight", q, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    mine, ref = _read_gguf(path), load_gguf_checkpoint(path)
+    assert mine.keys() == ref.keys()
+    for k in ref:
+        assert type(mine[k]) is type(ref[k]) and mine[k].dtype == ref[k].dtype and torch.equal(mine[k], ref[k]), k
+        assert getattr(mine[k], "quant_type", None) == getattr(ref[k], "quant_type", None)

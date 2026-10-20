@@ -31,6 +31,57 @@ from vecworld.dream.pano import focus_mask, windows, wrap_cols
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
 
 
+def _read_gguf(path) -> dict:
+    """The GGUF's tensors as diffusers' load_gguf_checkpoint returns them, read with plain reads.
+
+    diffusers copies each tensor out of a memmap of the whole file, so while it loads, the 6.8 GB of mapped file
+    pages and the 6.8 GB of copies are both resident (a 12+ GB peak that pushed the game into swap).
+    """
+    import gguf
+    import torch
+    from diffusers.quantizers.gguf.utils import GGUFParameter
+
+    r = gguf.GGUFReader(path)
+    meta = [(t.name, t.tensor_type, t.data.shape, t.data.dtype, int(t.data_offset), int(t.n_bytes)) for t in r.tensors]
+    del r
+    plain = (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
+    out = {}
+    with open(path, "rb", buffering=0) as f:
+        for name, qt, shape, dtype, off, n in meta:
+            a = np.empty(shape, dtype)
+            f.seek(off)
+            assert f.readinto(memoryview(a).cast("B")) == n == a.nbytes, name
+            w = torch.from_numpy(a)
+            out[name] = w if qt in plain else GGUFParameter(w, quant_type=qt)
+    return out
+
+
+def _pin_in_place(modules) -> int:
+    """Page-lock the CPU parameters and buffers of modules where they already lie (cudaHostRegister); returns bytes.
+
+    diffusers' streamed group offload pins a second copy of each tensor (tensor.pin_memory()) and keeps the
+    original until the first forward, so the 6.7 GB transformer briefly needs ~13.5 GB of RAM, and torch's pinned
+    allocator rounds every block up to a power of two (8.8 GB held for 6.7). A tensor already pinned is returned
+    as is by pin_memory(), so registering them first keeps one copy at its true size. Only modules whose CPU
+    tensors live as long as the process may be passed: a registered buffer freed and reused breaks later copies
+    (the offload group holding the transformer's non-block layers moves them with .to(), freeing the originals).
+    """
+    import torch
+
+    cudart, seen, total = torch.cuda.cudart(), set(), 0
+    for t in [x for m in modules for x in (*m.parameters(), *m.buffers())]:
+        st = t.untyped_storage()
+        ptr, n = st.data_ptr(), st.nbytes()
+        if t.device.type != "cpu" or n == 0 or ptr in seen or t.is_pinned():
+            continue
+        seen.add(ptr)
+        err = cudart.cudaHostRegister(ptr, n, 0)
+        if int(err) != 0:
+            raise RuntimeError(f"cudaHostRegister failed ({err}) after locking {total / 1e9:.1f} GB")
+        total += n
+    return total
+
+
 def _active(wins, cols, k: int, k_bg: int | None) -> list[int]:
     """The windows worth a pass at step k: before k_bg the unmasked part is reset to the noised original at the
     next step, so a window with no masked column would only be thrown away (as TurboPainter). cols: mask > 0."""
@@ -58,8 +109,9 @@ class FluxPainter(Painter):
 
         dev, bf16 = torch.device("cuda"), torch.bfloat16
         tr = FluxTransformer2DModel.from_single_file(
-            str(FLUX_GGUF), quantization_config=GGUFQuantizationConfig(compute_dtype=bf16), torch_dtype=bf16,
-            config=FLUX_BASE, subfolder="transformer")
+            _read_gguf(str(FLUX_GGUF)), quantization_config=GGUFQuantizationConfig(compute_dtype=bf16),
+            torch_dtype=bf16, config=FLUX_BASE, subfolder="transformer")
+        _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
         tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"), offload_type="block_level",
                                 num_blocks_per_group=1, use_stream=True)
         vae = AutoencoderKL.from_pretrained(FLUX_BASE, subfolder="vae", torch_dtype=bf16).to(dev)
