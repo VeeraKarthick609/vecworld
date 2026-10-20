@@ -1,25 +1,25 @@
 {
  "power": "ac",
- "git": "70d2d34",
+ "git": "31c5607",
  "results": {
   "what": "step",
-  "gpu_power": "90.00 2 8",
-  "load_s": 46.7,
-  "rss_after_setup_gb": 8.46,
-  "t5_encode_cold_s": 8.33,
+  "gpu_power": "80.00 1 8",
+  "load_s": 12.4,
+  "rss_after_setup_gb": 7.62,
+  "t5_encode_cold_s": 6.56,
   "mon_t5": {
-   "rss_gb": 9.04,
-   "smi_mib": 1300
+   "rss_gb": 8.16,
+   "smi_mib": 1296
   },
   "step": {
-   "s": 53.7,
+   "s": 54.0,
    "passes": 10,
-   "s_per_pass_median": 6.67,
+   "s_per_pass_median": 6.72,
    "peak_alloc_gb": 1.37,
-   "rss_gb": 9.48,
-   "smi_mib": 1836
+   "rss_gb": 8.66,
+   "smi_mib": 1832
   },
-  "wall_s": 164.2,
+  "wall_s": 128.2,
   "gpu_power_end": "90.00 4 8"
  }
 }
