@@ -1,25 +1,25 @@
 {
  "power": "ac",
- "git": "b05172f-dirty",
+ "git": "60252f7",
  "results": {
   "what": "step",
-  "gpu_power": "90.00 4 8",
-  "load_s": 12.6,
+  "gpu_power": "80.00 1 8",
+  "load_s": 12.7,
   "rss_after_setup_gb": 7.62,
-  "t5_encode_cold_s": 6.59,
+  "t5_encode_cold_s": 6.51,
   "mon_t5": {
    "rss_gb": 8.2,
    "smi_mib": 1296
   },
   "step": {
-   "s": 61.3,
+   "s": 61.4,
    "passes": 10,
-   "s_per_pass_median": 6.67,
+   "s_per_pass_median": 6.7,
    "peak_alloc_gb": 1.37,
    "rss_gb": 8.67,
    "smi_mib": 1832
   },
-  "wall_s": 135.6,
+  "wall_s": 135.4,
   "gpu_power_end": "90.00 4 8"
  }
 }
