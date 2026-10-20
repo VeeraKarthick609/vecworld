@@ -3,122 +3,128 @@
  "results": {
   "tile512": {
    "what": "tile512",
-   "gpu_power": "80.00 1 8",
-   "load_s": 20.5,
-   "rss_after_setup_gb": 8.43,
-   "warmup_512_1step_s": 5.64,
-   "t_512_4step_s": 11.2,
+   "gpu_power": "90.00 2 8",
+   "load_s": 71.5,
+   "rss_after_setup_gb": 6.93,
+   "warmup_512_1step_s": 5.95,
+   "t_512_4step_s": 11.19,
    "peak_alloc_512_gb": 1.24,
    "mon_512": {
-    "rss_gb": 9.17,
+    "rss_gb": 7.68,
     "smi_mib": 2380
    },
-   "t_512_1step_s": 3.01,
-   "s_per_step_512": 2.73,
-   "t_1024x512_4step_s": 16.18,
+   "t_512_1step_s": 2.98,
+   "s_per_step_512": 2.74,
+   "t_1024x512_4step_s": 16.11,
    "peak_alloc_1024x512_gb": 1.72,
    "mon_1024x512": {
-    "rss_gb": 9.19,
+    "rss_gb": 7.74,
     "smi_mib": 3542
    },
-   "wall_s": 60.1
+   "wall_s": 111.1,
+   "gpu_power_end": "90.00 4 8"
   },
   "step": {
    "what": "step",
    "gpu_power": "90.00 2 8",
-   "load_s": 29.6,
-   "rss_after_setup_gb": 9.05,
+   "load_s": 22.9,
+   "rss_after_setup_gb": 8.89,
    "s_per_step_512_runs": [
-    2.75,
-    2.8,
-    2.83
+    2.76,
+    2.78,
+    2.82
    ],
-   "s_per_step_512": 2.8,
-   "wall_s": 82.6
+   "s_per_step_512": 2.78,
+   "wall_s": 75.7,
+   "gpu_power_end": "90.00 4 8"
   },
   "pano": {
    "what": "pano",
-   "gpu_power": "80.00 1 8",
-   "load_s": 39.8,
-   "rss_after_setup_gb": 7.8,
-   "t_2windows_seq_s": 22.55,
-   "pano_8win_seq_s_est": 90.2,
+   "gpu_power": "90.00 2 8",
+   "load_s": 39.1,
+   "rss_after_setup_gb": 9.62,
+   "t_2windows_seq_s": 22.67,
+   "pano_8win_seq_s_est": 90.7,
    "pano_8win_bs2_chunks_s": [
-    16.91,
-    17.03,
-    17.1,
+    16.93,
+    17.01,
+    17.14,
     17.19
    ],
-   "pano_8win_bs2_s": 68.2,
-   "s_per_step_bs2": 4.28,
+   "pano_8win_bs2_s": 68.3,
+   "s_per_step_bs2": 4.29,
    "peak_alloc_bs2_gb": 1.52,
    "pano_8win_bs4_chunks_s": [
-    28.09,
-    28.23
+    28.07,
+    28.21
    ],
    "pano_8win_bs4_s": 56.3,
-   "s_per_step_bs4": 7.06,
+   "s_per_step_bs4": 7.05,
    "peak_alloc_bs4_gb": 2.59,
    "mon_pano": {
-    "rss_gb": 8.54,
+    "rss_gb": 10.33,
     "smi_mib": 3666
    },
-   "wall_s": 196.3
+   "wall_s": 195.2,
+   "gpu_power_end": "90.00 4 8"
   },
   "blocks": {
    "what": "blocks",
-   "gpu_power": "80.00 1 8",
-   "bf16_matmul_tflops": 19.13,
+   "gpu_power": "90.00 4 8",
+   "bf16_matmul_tflops": 19.11,
    "512x512": {
     "double_block_ms": 61.9,
     "single_block_ms": 37.1,
     "double_dequant_ms": 31.1,
-    "single_dequant_ms": 12.9,
-    "sdpa_ms_per_block": 1.13,
+    "single_dequant_ms": 13.0,
+    "sdpa_ms_per_block": 1.14,
     "resident_step_s": 2.59,
     "dequant_s": 1.08,
-    "dequant_share": 0.418,
+    "dequant_share": 0.419,
     "attention_s": 0.06,
     "attention_share": 0.025,
     "gemm_glue_s": 1.44,
-    "gemm_glue_share": 0.557,
+    "gemm_glue_share": 0.556,
     "gemm_flops_floor_s": 1.59
    },
    "1024x512": {
     "double_block_ms": 80.6,
     "single_block_ms": 55.7,
-    "double_dequant_ms": 31.1,
+    "double_dequant_ms": 31.2,
     "single_dequant_ms": 13.0,
     "sdpa_ms_per_block": 3.7,
     "resident_step_s": 3.65,
-    "dequant_s": 1.08,
-    "dequant_share": 0.297,
+    "dequant_s": 1.09,
+    "dequant_share": 0.298,
     "attention_s": 0.21,
     "attention_share": 0.058,
     "gemm_glue_s": 2.35,
-    "gemm_glue_share": 0.645,
+    "gemm_glue_share": 0.644,
     "gemm_flops_floor_s": 2.87
    },
-   "wall_s": 13.4
+   "wall_s": 17.2,
+   "gpu_power_end": "90.00 4 8"
   },
   "bw": {
    "what": "bw",
-   "gpu_power": "[N/A] 1 8",
-   "pcie_link": "1 8 [N/A]",
-   "h2d_pageable_gbps_median": 11.08,
-   "h2d_pageable_gbps_best": 11.14,
+   "gpu_power": "80.00 1 8",
+   "pcie_link": "1 8",
+   "h2d_pageable_gbps_median": 10.69,
+   "h2d_pageable_gbps_best": 10.87,
    "h2d_pageable_link": "4 8",
    "h2d_pinned_gbps_median": 13.46,
    "h2d_pinned_gbps_best": 13.46,
    "h2d_pinned_link": "4 8",
-   "overlap_compute_s": 0.286,
+   "overlap_compute_s": 0.287,
    "overlap_copy_1gb_s": 0.08,
-   "overlap_both_s": 0.287,
-   "ssd_odirect_gbps": 2.96,
+   "overlap_both_s": 0.288,
+   "ssd_odirect_gbps": 2.0,
    "ssd_bytes_read_gb": 6.78,
-   "ssd_pagecache_gbps": 2.8,
-   "wall_s": 8.2
+   "ssd_buffered_first_gbps": 1.85,
+   "ssd_pagecache_warm_gbps": 4.4,
+   "wall_s": 12.1,
+   "gpu_power_end": "90.00 4 8"
   }
  },
- "git": "df03c71"
+ "git": "895c75e"
 }
