@@ -21,7 +21,9 @@ def power():
 
 def git_sha():
     try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        return sha + ("-dirty" if dirty else "")
     except Exception:
         return "unknown"
 
@@ -210,7 +212,7 @@ def do_blocks(R, mon):
 
 def do_bw(R, mon):
     import torch
-    R["pcie_link"] = " ".join(smi("pcie.link.gen.current,pcie.link.width.current,enforced.power.limit"))
+    R["pcie_link"] = " ".join(smi("pcie.link.gen.current,pcie.link.width.current"))
     n = 256 * 1024 * 1024
     dbuf = torch.empty(n, dtype=torch.uint8, device="cuda")
     a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
@@ -255,14 +257,15 @@ def do_bw(R, mon):
         os.close(fd)
     R["ssd_odirect_gbps"] = round(total / dt / 1e9, 2)
     R["ssd_bytes_read_gb"] = round(total / 1e9, 2)
-    # page-cache-warm read for reference
-    t = time.perf_counter(); total = 0
-    with open(gp, "rb", buffering=0) as f:
-        while True:
-            b = f.read(chunk)
-            if not b: break
-            total += len(b)
-    R["ssd_pagecache_gbps"] = round(total / (time.perf_counter() - t) / 1e9, 2)
+    # buffered read twice; the second pass is served from the page cache (warm)
+    for key in ("ssd_buffered_first_gbps", "ssd_pagecache_warm_gbps"):
+        t = time.perf_counter(); total = 0
+        with open(gp, "rb", buffering=0) as f:
+            while True:
+                b = f.read(chunk)
+                if not b: break
+                total += len(b)
+        R[key] = round(total / (time.perf_counter() - t) / 1e9, 2)
 
 
 WHATS = dict(tile512=do_tile512, pano=do_pano, step=do_step, blocks=do_blocks, bw=do_bw)
@@ -286,6 +289,7 @@ def main():
     WHATS[a.what](R, mon)
     R["wall_s"] = round(time.time() - t0, 1)
     mon.stop = True
+    R["gpu_power_end"] = " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))
     out = {"power": power(), "git": git_sha(), "results": R}
     if out["power"] != "ac":
         sys.exit("power dropped to battery during the run; discarding")
