@@ -76,4 +76,10 @@ FLUX_STRIDE = 16           # 8 windows round the cylinder, each column covered t
 FLUX_STEPS = 4
 FLUX_BATCH = 4             # windows per transformer pass (peak 1.4 GB allocated on AC; Task 6 re-batches)
 FLUX_BG_STRENGTH = 0.15    # a walk step releases its background at this sigma (0.25: SSIM 0.58 outside the focus, 0.15: 0.67)
+# Behind the camera (from a quarter turn off the walking direction, feathered over FLUX_BACK_FEATHER) the dolly
+# shrank the view and mirrored rows in at the top and bottom edges; there the background is released at
+# FLUX_BACK_STRENGTH instead, so the mirror images (upside-down tree tops) are repainted.
+FLUX_BACK_FROM = 0.25
+FLUX_BACK_FEATHER = 0.1
+FLUX_BACK_STRENGTH = 0.5
 FLUX_STYLE = "dreamlike landscape painting, soft atmospheric light, wordless scenery"   # "wordless": short prompts drew title lettering

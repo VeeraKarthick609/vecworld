@@ -3,6 +3,7 @@ import math
 import threading
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -86,11 +87,12 @@ def test_progress_counts_only_active_windows_in_a_step():
     tr = FakeTransformer()
     p = fake_painter(tr, progress=lambda k, total: got.append((k, total)))
     prev = Image.new("RGB", (PANO_W, PANO_H), (90, 120, 60))
-    p.step(prev, [("a forest", 1.0)], None, 0.5, seed=4)
+    p.step(prev, [("a forest", 1.0)], None, 0.5, seed=4, bg_strength=0.15)
     total = got[-1][1]
     assert got == [(k, total) for k in range(1, total + 1)]
     assert len(tr.calls) == total
-    assert sum(len(c) for c in tr.calls) < FLUX_STEPS * N_WIN          # background windows skipped early
+    sig, _ = p._reset_weights(np.zeros(GW, np.float32), 0.5, 0.15)
+    assert sum(len(c) for c in tr.calls) < (len(sig) - 1) * N_WIN     # background windows skipped early
 
 
 def test_check_stop_between_steps():
@@ -128,21 +130,51 @@ def test_pack_roundtrip():
     assert g[0, 5 * 4 + 1 * 2 + 0, 3, 7] == lat[0, 5, 7, 14]
 
 
-def test_step_strength_zero_keeps_the_background_exactly():
-    import numpy as np
-
+def test_step_strength_zero_keeps_the_sides_exactly():
+    """Strength 0 never releases the sides (between the focus band and the band behind the camera, which is
+    always repainted at FLUX_BACK_STRENGTH), so they come back as the original."""
     p = fake_painter()
     prev = Image.new("RGB", (PANO_W, PANO_H), (128, 128, 128))
     out = np.asarray(p.step(prev, [("a forest", 1.0)], None, 0.5, seed=5, bg_strength=0.0), np.float64)
     ref = np.asarray(p._decode(p._encode(prev)), np.float64)
-    assert np.abs(out[:, :PANO_W // 4] - ref[:, :PANO_W // 4]).max() <= 1
+    side = slice(round(PANO_W * 0.27), round(PANO_W * 0.33))       # 0.17-0.23 of a turn from the focus at 0.5
+    assert np.abs(out[:, side] - ref[:, side]).max() <= 1
 
 
-def test_step_schedule_puts_the_background_sigma_on_it():
+def test_step_schedule_puts_the_background_sigmas_on_it():
     p = fake_painter()
-    assert p._step_sigmas(0.25) == ([1.0, 0.75, 0.5, 0.25, 0.0], 3)          # on schnell's grid: unchanged
-    assert p._step_sigmas(0.15) == ([1.0, 0.75, 0.5, 0.25, 0.15, 0.0], 4)    # off it: added
-    assert p._step_sigmas(0.0) == ([1.0, 0.75, 0.5, 0.25, 0.0], FLUX_STEPS)  # never released
+    assert p._step_sigmas(0.25) == ([1.0, 0.75, 0.5, 0.25, 0.0], [3])           # on schnell's grid: unchanged
+    assert p._step_sigmas(0.15, 0.5) == ([1.0, 0.75, 0.5, 0.25, 0.15, 0.0], [4, 2])   # off it: added
+    assert p._step_sigmas(0.0) == ([1.0, 0.75, 0.5, 0.25, 0.0], [FLUX_STEPS])   # 0: never released
+
+
+def test_step_releases_the_band_behind_the_camera_earlier():
+    """Behind the camera the dolly shrank the view and mirrored rows in at the top and bottom: those columns are
+    released at FLUX_BACK_STRENGTH (repainted harder), the sides at the step's background strength."""
+    from vecworld.config import FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BG_STRENGTH
+
+    p = fake_painter()
+    m = np.zeros(GW, np.float32)                                  # no focus band: background only
+    sig, rw = p._reset_weights(m, 0.5, FLUX_BG_STRENGTH)
+    rw = np.stack([r.reshape(-1).cpu().numpy() for r in rw])     # [step, column]: weight of the reset to orig
+    d = np.abs((np.arange(GW) + 0.5) / GW - 0.5)
+    back = d >= FLUX_BACK_FROM + FLUX_BACK_FEATHER
+    sides = d <= FLUX_BACK_FROM
+    k_back, k_side = sig.index(FLUX_BACK_STRENGTH), sig.index(FLUX_BG_STRENGTH)
+    assert k_back < k_side
+    assert (rw[:k_back + 1] == 1).all()                           # everything held to the original up to there
+    assert (rw[k_back + 1:, back] == 0).all()                     # behind: released at FLUX_BACK_STRENGTH
+    assert (rw[:k_side + 1, sides] == 1).all() and (rw[k_side + 1:, sides] == 0).all()
+    between = ~back & ~sides
+    assert ((rw[k_back + 1:k_side + 1, between] > 0) & (rw[k_back + 1:k_side + 1, between] < 1)).all()   # feathered
+
+
+def test_a_stronger_step_is_stronger_everywhere():
+    """A mood change asks for 0.8: the band behind is never released later than the sides."""
+    p = fake_painter()
+    sig, rw = p._reset_weights(np.zeros(GW, np.float32), 0.5, 0.8)
+    k = sig.index(0.8)
+    assert all((r == 0).all() for r in rw[k + 1:]) and all((r == 1).all() for r in rw[:k + 1])
 
 
 def test_read_gguf_matches_diffusers_loader(tmp_path):

@@ -106,16 +106,30 @@ def timed(fn, passes, mon):
                      peak_alloc_gb=round(torch.cuda.max_memory_allocated() / 1e9, 2), **mon.report())
 
 
-def do_tile512(R, mon):
-    """One 512x512 window, FLUX_STEPS steps, through the painter's MultiDiffusion loop."""
+def run_tile512(p, e, steps, seed=0):
+    """One 512x512 window (a token grid FLUX_WIN square, no wrap-around), `steps` Euler steps of one transformer
+    pass each. (_denoise can't do this: its windows wrap, so a grid one window wide gets two.)"""
     import torch
-    from vecworld.config import FLUX_STEPS, FLUX_WIN
+    from vecworld.config import FLUX_WIN
+    g = torch.randn(1, 64, FLUX_WIN, FLUX_WIN, device=p._dev,
+                    generator=torch.Generator(p._dev).manual_seed(seed))
+    sig = p._sigmas(steps)
+    for k in range(steps):
+        g = g + (sig[k + 1] - sig[k]) * p._forward(g, [e], sig[k])
+        if p.progress is not None:
+            p.progress(k + 1, steps)
+    return g
+
+
+def do_tile512(R, mon):
+    """One 512x512 window, FLUX_STEPS steps (one transformer pass per step)."""
+    import torch
+    from vecworld.config import FLUX_STEPS
     p, prompt, passes = load_painter(R, mon)
     with torch.inference_mode():
         e = p._embed(prompt)
-        g = torch.randn(1, 64, FLUX_WIN, FLUX_WIN, device="cuda")
-        p._denoise(g, p._sigmas(1), [e])                                    # warm-up
-        _, R["tile512"] = timed(lambda: p._denoise(g, p._sigmas(FLUX_STEPS), [e]), passes, mon)
+        run_tile512(p, e, 1)                                                 # warm-up
+        _, R["tile512"] = timed(lambda: run_tile512(p, e, FLUX_STEPS), passes, mon)
 
 
 def do_pano(R, mon):

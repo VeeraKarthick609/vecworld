@@ -62,30 +62,77 @@ def test_flux_panorama_seamless(pano):
     assert peak < 3.6e9
 
 
-@pytest.mark.gpu
-def test_flux_step_keeps_background(painter, pano):
+Z = 1.6
+
+
+@pytest.fixture(scope="module")
+def stepped(painter, pano):
+    """A walk step as next_spot makes it: the panorama dollied by Z, the band it magnified repainted."""
     import torch
 
     from vecworld.roam.spot import focus_half
 
-    z = 1.6
-    prev = dolly(pano[0], z)
-    half = focus_half(z)                                  # as next_spot calls it: the band the dolly magnified
+    prev = dolly(pano[0], Z)
+    half = focus_half(Z)
     torch.cuda.reset_peak_memory_stats()
     t = time.time()
     out = painter.step(prev, BASE, None, 0.5, seed=22, focus_half=half)
     took = time.time() - t
     prev.save("/tmp/flux_prev.png")
     out.save("/tmp/flux_step.png")
+    print(f"\nstep {took:.1f}s peak {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+    return prev, out, half, torch.cuda.max_memory_allocated()
+
+
+def wrap_dist_cols(w: int, at: float = 0.5) -> np.ndarray:
+    d = np.abs((np.arange(w) + 0.5) / w - at) % 1.0
+    return np.minimum(d, 1 - d)
+
+
+def mirror_score(img, z: float = Z, back: float = 0.4, k: int = 24) -> float:
+    """How much the rows above dolly()'s top mirror line look like their reflection below it, in the columns at
+    least `back` behind the camera: ~0.7 on a dollied view, ~0 on a painted panorama. High-passed first (minus a
+    9x9 mean), since smooth sky and haze correlate with anything and detail only with its mirror image."""
+    a = grey(img)
+    h, w = a.shape
+    a = a - _box(a, 4)
+    u = (np.arange(w) + 0.5) / w
+    mag = 1 / (1 - (1 - 1 / z) * np.cos(2 * np.pi * (u - 0.5)))
+    ym = np.round(h / 2 - mag * h / 2).astype(int)                 # the output row dolly() sampled source row 0 into
+    xs, ys = [], []
+    for c in np.where(wrap_dist_cols(w) >= back)[0]:
+        n = min(k, ym[c])
+        xs.append(a[ym[c] - n:ym[c], c][::-1])
+        ys.append(a[ym[c]:ym[c] + n, c])
+    return float(np.corrcoef(np.concatenate(xs), np.concatenate(ys))[0, 1])
+
+
+@pytest.mark.gpu
+def test_flux_step_keeps_background(stepped):
+    """Outside the band ahead and outside the band behind the camera (where the dolly shrank the view and the
+    background is repainted harder), the step keeps the scene."""
+    from vecworld.config import FLUX_BACK_FROM
+
+    prev, out, half, peak = stepped
     w = prev.width
-    reach = half + FOCUS_FEATHER                          # the mask is 0 beyond this from the centre
-    lo, hi = round((0.5 - reach) * w) - 64, round((0.5 + reach) * w) + 64
+    d = wrap_dist_cols(w)
+    reach = half + FOCUS_FEATHER + 64 / w                 # the focus mask is 0 beyond half + feather
+    side = np.where((d > reach) & (d < FLUX_BACK_FROM))[0]
+    ahead = np.where(d < half)[0]
     a, b = grey(prev), grey(out)
-    outside = np.concatenate([np.arange(0, lo), np.arange(hi, w)])
-    s_out = ssim(a[:, outside], b[:, outside])
-    s_in = ssim(a[:, lo:hi], b[:, lo:hi])
-    print(f"\nstep {took:.1f}s ssim outside {s_out:.3f} inside {s_in:.3f} "
-          f"peak {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
-    assert s_out > 0.6
-    assert s_in < s_out                                   # the band ahead was repainted
-    assert torch.cuda.max_memory_allocated() < 3.6e9
+    s_side, s_ahead = ssim(a[:, side], b[:, side]), ssim(a[:, ahead], b[:, ahead])
+    print(f"ssim sides {s_side:.3f} ({len(side)} columns) ahead {s_ahead:.3f}")
+    assert s_side > 0.6
+    assert s_ahead < s_side                               # the band ahead was repainted
+    assert peak < 3.6e9
+
+
+@pytest.mark.gpu
+def test_flux_step_repaints_the_mirrored_rows_behind(stepped):
+    """dolly() fills the top and bottom rows behind the camera with a mirror image of the rows next to them
+    (upside-down tree tops); the step must paint over them."""
+    prev, out, _, _ = stepped
+    before, after = mirror_score(prev), mirror_score(out)
+    print(f"mirror score behind: dollied {before:.3f} step {after:.3f}")
+    assert before > 0.5                                   # the measure sees the mirror
+    assert after < 0.2

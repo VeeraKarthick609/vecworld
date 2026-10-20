@@ -22,7 +22,8 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 
-from vecworld.config import (FLUX_BASE, FLUX_BATCH, FLUX_BG_STRENGTH, FLUX_GGUF, FLUX_STEPS, FLUX_STRIDE, FLUX_STYLE,
+from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
+                             FLUX_BG_STRENGTH, FLUX_GGUF, FLUX_STEPS, FLUX_STRIDE, FLUX_STYLE,
                              FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, VAE_TILE)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
@@ -82,12 +83,18 @@ def _pin_in_place(modules) -> int:
     return total
 
 
-def _active(wins, cols, k: int, k_bg: int | None) -> list[int]:
-    """The windows worth a pass at step k: before k_bg the unmasked part is reset to the noised original at the
-    next step, so a window with no masked column would only be thrown away (as TurboPainter). cols: mask > 0."""
-    if k_bg is None or k >= k_bg or cols is None:
+def _wrap_dist(w: int, at: float) -> np.ndarray:
+    """Per column (centre), the distance round the cylinder to fraction `at`, in fractions of a turn (0..0.5)."""
+    d = np.abs((np.arange(w) + 0.5) / w - at) % 1.0
+    return np.minimum(d, 1.0 - d)
+
+
+def _active(wins, reset_next) -> list[int]:
+    """The windows worth a pass at a step: a window all of whose columns are fully reset to the noised original
+    at the next step would only be thrown away (as TurboPainter skips them). reset_next: bool per column, or None."""
+    if reset_next is None:
         return list(range(len(wins)))
-    return [i for i, (_, x) in enumerate(wins) if cols[wrap_cols(x, FLUX_WIN, len(cols))].any()]
+    return [i for i, (_, x) in enumerate(wins) if not reset_next[wrap_cols(x, FLUX_WIN, len(reset_next))].all()]
 
 
 class FluxPainter(Painter):
@@ -180,15 +187,34 @@ class FluxPainter(Painter):
         """Schnell's schedule: steps even sigmas from 1 down, then 0 (shift 1, no dynamic shifting)."""
         return [1 - k / steps for k in range(steps)] + [0.0]
 
-    def _step_sigmas(self, bg_strength: float) -> tuple[list[float], int]:
-        """(sigmas, k_bg): schnell's schedule with bg_strength on it, and the step where the background is
-        released (len - 1, i.e. never, at strength 0)."""
-        grid = self._sigmas(FLUX_STEPS)[:-1]
-        if bg_strength <= 0:
-            return grid + [0.0], FLUX_STEPS
-        s = min(bg_strength, 1.0)
-        sig = sorted({round(x, 6) for x in grid} | {round(s, 6)}, reverse=True) + [0.0]
-        return sig, sig.index(round(s, 6))
+    def _step_sigmas(self, *strengths: float) -> tuple[list[float], list[int]]:
+        """(sigmas, ks): schnell's schedule with each strength put on it (as a sigma), and for each strength the
+        last step at which a column released at it is still reset (the index of its sigma; strength 0: the final
+        sigma 0, i.e. never released)."""
+        r = [round(min(max(s, 0.0), 1.0), 6) for s in strengths]
+        sig = sorted({round(x, 6) for x in self._sigmas(FLUX_STEPS)[:-1]} | {s for s in r if s > 0},
+                     reverse=True) + [0.0]
+        return sig, [sig.index(s) for s in r]
+
+    def _reset_weights(self, m: np.ndarray, focus_at: float | None, bg_strength: float):
+        """(sigmas, rw): rw[k] is, per token column, how much of the step-k latent is reset to the original noised
+        to sigmas[k] (rw[-1], at sigma 0, pastes the original back). m: the focus mask (never reset).
+
+        The sides are released at bg_strength. Behind the camera, from FLUX_BACK_FROM (a quarter turn, where the
+        dolly starts shrinking the view) feathered over FLUX_BACK_FEATHER, the release is FLUX_BACK_STRENGTH:
+        there dolly() shrank the view and mirrored the rows next to the top and bottom edges in (upside-down tree
+        tops), which a light img2img keeps. Without a focus direction everything is a side.
+        """
+        torch = self._torch
+        w = len(m)
+        back = (np.zeros(w, np.float32) if focus_at is None else
+                np.clip((_wrap_dist(w, focus_at) - FLUX_BACK_FROM) / FLUX_BACK_FEATHER, 0.0, 1.0).astype(np.float32))
+        sig, (k_side, k_back) = self._step_sigmas(bg_strength, max(bg_strength, FLUX_BACK_STRENGTH))
+        rw = []
+        for k in range(len(sig)):
+            hold = back * (k <= k_back) + (1 - back) * (k <= k_side)
+            rw.append(torch.from_numpy(((1 - m) * hold).astype(np.float32)).to(self._dev)[None, None, None, :])
+        return sig, rw
 
     # --- VAE, tiled along the wrapping width (TurboPainter's crossfaded tiles) -------------------------------
     # TurboPainter decodes vae.decode(lat / sf) and encodes mean * sf; FLUX's VAE adds a shift factor:
@@ -205,6 +231,18 @@ class FluxPainter(Painter):
 
     # --- MultiDiffusion --------------------------------------------------------------------------------
 
+    def _forward(self, tiles, embs, s: float):
+        """The transformer's velocity for a batch of token-grid windows [n, 64, FLUX_WIN, FLUX_WIN] at sigma s;
+        embs: one (t5, pooled) per window."""
+        torch, n = self._torch, tiles.shape[0]
+        out = self.transformer(
+            hidden_states=tiles.flatten(2).transpose(1, 2).to(self._dtype),
+            encoder_hidden_states=torch.cat([e[0] for e in embs]),
+            pooled_projections=torch.cat([e[1] for e in embs]),
+            timestep=torch.full((n,), s, device=self._dev, dtype=self._dtype),
+            img_ids=self._img_ids, txt_ids=self._txt_ids, guidance=None, return_dict=False)[0]
+        return out.float().transpose(1, 2).reshape(n, -1, FLUX_WIN, FLUX_WIN)
+
     def _denoise(self, grid, sigmas, embs, keep=None):
         """Euler-integrate a wrap-around token grid, averaging each step's velocity over windows.
 
@@ -213,23 +251,24 @@ class FluxPainter(Painter):
         a column changes, and FLUX's windows disagree enough (each settles its own exposure, worst in haze) for
         that to show as a hard vertical line every FLUX_STRIDE.
 
-        embs[i] = (t5, pooled) for window i. keep = (orig, noise, mask, k_bg): up to and including step k_bg
-        the unmasked part is reset to orig noised to the current sigma (differential diffusion), so it only
-        denoises sigmas[k_bg:], like img2img; before k_bg windows with no masked column are skipped (_active).
+        embs[i] = (t5, pooled) for window i. keep = (orig, noise, rw): at step k, rw[k] (per column) of the latent
+        is reset to orig noised to sigmas[k] (differential diffusion), so a column held up to its release step
+        denoises only from there, like img2img; rw[-1] pastes orig back after the last step (strength 0). Windows
+        whose columns are all fully reset at the next step are skipped (_active).
         """
         torch = self._torch
         h, w = grid.shape[-2:]
         wins = windows(h, w, FLUX_WIN, FLUX_STRIDE)
-        masked = None if keep is None else (keep[2].reshape(-1) > 0).cpu().numpy()
-        k_bg = None if keep is None else keep[3]
-        acts = [_active(wins, masked, k, k_bg) for k in range(len(sigmas) - 1)]
+        n_steps = len(sigmas) - 1
+        full = None if keep is None else [(r.reshape(-1) >= 1).cpu().numpy() for r in keep[2]]
+        acts = [_active(wins, None if full is None or k + 1 >= n_steps else full[k + 1]) for k in range(n_steps)]
         total, done = sum(math.ceil(len(a) / FLUX_BATCH) for a in acts), 0
         wt = torch.from_numpy(ramp(FLUX_WIN, FLUX_WIN // 2)).to(grid.device)
         for k, act in enumerate(acts):
             s = sigmas[k]
-            if keep is not None and k <= k_bg:
-                orig, noise, mask, _ = keep
-                grid = mask * grid + (1 - mask) * ((1 - s) * orig + s * noise)
+            if keep is not None:
+                orig, noise, rw = keep
+                grid = (1 - rw[k]) * grid + rw[k] * ((1 - s) * orig + s * noise)
             vel, cnt = torch.zeros_like(grid), torch.zeros_like(grid[:, :1])
             for b in range(0, len(act), FLUX_BATCH):
                 check_stop()
@@ -237,14 +276,7 @@ class FluxPainter(Painter):
                 cols = [wrap_cols(wins[i][1], FLUX_WIN, w) for i in idx]
                 tiles = torch.cat([grid[..., y:y + FLUX_WIN, :][..., c] for (y, _), c in
                                    zip((wins[i] for i in idx), cols)])
-                n = len(idx)
-                out = self.transformer(
-                    hidden_states=tiles.flatten(2).transpose(1, 2).to(self._dtype),
-                    encoder_hidden_states=torch.cat([embs[i][0] for i in idx]),
-                    pooled_projections=torch.cat([embs[i][1] for i in idx]),
-                    timestep=torch.full((n,), s, device=self._dev, dtype=self._dtype),
-                    img_ids=self._img_ids, txt_ids=self._txt_ids, guidance=None, return_dict=False)[0]
-                out = out.float().transpose(1, 2).reshape(n, -1, FLUX_WIN, FLUX_WIN)
+                out = self._forward(tiles, [embs[i] for i in idx], s)
                 for i, ((y, _), c) in enumerate(zip((wins[j] for j in idx), cols)):
                     vel[..., y:y + FLUX_WIN, c] += out[i:i + 1] * wt
                     cnt[..., y:y + FLUX_WIN, c] += wt
@@ -253,9 +285,8 @@ class FluxPainter(Painter):
                     self.progress(done, total)
             # columns no window covered this step (skipped background) move by 0: they are reset next step
             grid = grid + (sigmas[k + 1] - s) * vel / cnt.clamp(min=1e-6)
-        if keep is not None and k_bg >= len(acts):     # strength 0: the background is never released, keep it
-            orig, _, mask, _ = keep
-            grid = mask * grid + (1 - mask) * orig
+        if keep is not None and keep[2][-1].any():      # strength 0: a background never released is kept as is
+            grid = (1 - keep[2][-1]) * grid + keep[2][-1] * keep[0]
         return grid
 
     def panorama(self, base: Prompt, seed: int) -> Image.Image:
@@ -278,16 +309,16 @@ class FluxPainter(Painter):
             e_focus = self._embed(focus) if focus is not None else e_base
             wins = windows(h, w, FLUX_WIN, FLUX_STRIDE)
             embs = [e_focus if m[(x + FLUX_WIN // 2) % w] > 0 else e_base for _, x in wins]
-            # The background is released at sigma bg_strength and denoises from there, as img2img would. Schnell's
-            # 4-step grid only offers 0.25 / 0.5 / 0.75, so the background's sigma is added to it when off the grid
-            # (one more Euler point for the band ahead, which is cheap: only its windows run before k_bg).
-            sig, k_bg = self._step_sigmas(bg_strength)
-            # Nothing to regenerate: every step before k_bg would be overwritten, so start there (plain img2img).
-            start = k_bg if not m.any() else 0
+            # The background is released at sigma bg_strength (the band behind the camera earlier, _reset_weights)
+            # and denoises from there, as img2img would. Schnell's 4-step grid only offers 0.25 / 0.5 / 0.75, so a
+            # strength off it is added to it (one more Euler point for the band ahead: cheap, since only windows
+            # with a column not held to the original run before the release).
+            sig, rw = self._reset_weights(m, focus_at, bg_strength)
+            # Nothing to regenerate: every step before the first release is overwritten, so start there (img2img).
+            start = 0 if m.any() else next(k for k, r in enumerate(rw) if (r < 1).any() or k == len(sig) - 1)
             shift = seed % VAE_TILE
             noise, orig = self._noise(seed), self._encode(prev, shift)
-            mask = torch.from_numpy(m).to(self._dev, torch.float32)[None, None, None, :]
             s0 = sig[start]
             grid = (1 - s0) * orig + s0 * noise
-            out = self._denoise(grid, sig[start:], embs, keep=(orig, noise, mask, k_bg - start))
+            out = self._denoise(grid, sig[start:], embs, keep=(orig, noise, rw[start:]))
             return self._decode(out, shift)
