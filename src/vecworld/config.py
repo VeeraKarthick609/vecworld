@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 # A walk step schedules STEP_STEPS timesteps; the background is plain img2img at BG_STRENGTH of them.
@@ -60,3 +61,19 @@ WALK_Z_MAX = 2.5
 # magnifies less than FOCUS_MAG (beyond it img2img at BG_STRENGTH keeps it sharp), up to FOCUS_HALF_MAX.
 FOCUS_MAG = 1.3
 FOCUS_HALF_MAX = 0.2
+
+# FLUX.1-schnell painter (vecworld.flux): 4-bit GGUF transformer, 16-channel VAE latents packed 2x2 into tokens.
+# A PANO_W x PANO_H panorama is a (PANO_H // 16) x (PANO_W // 16) grid of packed tokens.
+FLUX_BASE = "unsloth/FLUX.1-schnell"     # VAE, CLIP-L, tokenizers and configs (ungated mirror)
+_HF_HUB = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
+FLUX_GGUF = _HF_HUB / ("models--city96--FLUX.1-schnell-gguf/snapshots/f495746ed9c5efcf4661f53ef05401dceadc17d2/"
+                       "flux1-schnell-Q4_K_S.gguf")
+FLUX_T5_GGUF = _HF_HUB / ("models--city96--t5-v1_1-xxl-encoder-gguf/snapshots/"
+                          "005a6ea51a7d0b84d677b3e633bb52a8c85a83d9/t5-v1_1-xxl-encoder-Q5_K_M.gguf")
+FLUX_TEXT_LEN = 256        # T5 tokens (schnell's max_sequence_length)
+FLUX_WIN = 32              # window size in packed tokens (512 px), the full panorama height
+FLUX_STRIDE = 16           # 8 windows round the cylinder, each column covered twice
+FLUX_STEPS = 4
+FLUX_BATCH = 4             # windows per transformer pass (peak 1.4 GB allocated on AC; Task 6 re-batches)
+FLUX_BG_STRENGTH = 0.15    # a walk step releases its background at this sigma (0.25: SSIM 0.58 outside the focus, 0.15: 0.67)
+FLUX_STYLE = "dreamlike digital painting, soft atmospheric light"

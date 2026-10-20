@@ -575,10 +575,10 @@ class RoamService:
             torch.cuda.empty_cache()
             raise GpuUnavailable("The GPU is out of memory, try again in a moment.")
 
-    @staticmethod
-    def _text(name: str, scenery: str, moods) -> str:
-        """{place}, {in-between scenery if drifting}, {mood words}, {STYLE}."""
-        return ", ".join([name, *([scenery] if scenery else []), *(MOOD_WORDS[m] for m in moods), STYLE])
+    def _text(self, name: str, scenery: str, moods) -> str:
+        """{place}, {in-between scenery if drifting}, {mood words}, {the painter's style, else STYLE}."""
+        style = getattr(self.painter, "style", STYLE)
+        return ", ".join([name, *([scenery] if scenery else []), *(MOOD_WORDS[m] for m in moods), style])
 
     def _paths(self, spot: Spot) -> tuple[Path, Path]:
         return self.scene_dir / f"{spot.id}.jpg", self.scene_dir / f"{spot.id}.png"

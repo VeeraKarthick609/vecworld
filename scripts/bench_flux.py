@@ -1,17 +1,16 @@
-"""FLUX bench harness (Task 0). Loads FLUX the spike's way: diffusers + GGUF + group offload.
+"""FLUX bench harness. --painter reference benches the game's FluxPainter (diffusers + GGUF + group offload).
 
-  uv run python scripts/bench_flux.py --painter reference --what tile512 --out bench/x.json
+  uv run python scripts/bench_flux.py --painter reference --what pano --out bench/x.json
 
-Speed numbers are only valid on AC power; on battery this exits without touching the GPU.
-Embeddings come from the spike's cache (~/spikes/flux/embeds.pt) so T5 is never loaded.
+tile512, pano and step run the real painter (its T5 and CLIP included; T5 is encoded once, before timing, and
+its cold encode is recorded). blocks and bw measure the bare transformer and the machine. Speed numbers are only
+valid on AC power; on battery this exits without touching the GPU.
 """
 import argparse, glob, json, mmap, os, subprocess, sys, threading, time
 from pathlib import Path
 
-BASE = "unsloth/FLUX.1-schnell"
-GGUF_REPO, GGUF_FILE = "city96/FLUX.1-schnell-gguf", "flux1-schnell-Q4_K_S.gguf"
-EMBEDS = Path(os.environ.get("FLUX_EMBEDS", "~/spikes/flux/embeds.pt")).expanduser()
 ROOT = Path(__file__).resolve().parent.parent
+PROMPT = "a dirt path through a sunlit old forest clearing, open ground in the foreground, big trees, ferns"
 
 
 def power():
@@ -75,92 +74,64 @@ def bench(fn, n=5):
 
 def load_transformer():
     import torch
-    from huggingface_hub import hf_hub_download
     from diffusers import FluxTransformer2DModel, GGUFQuantizationConfig
-    gp = hf_hub_download(GGUF_REPO, GGUF_FILE)
+    from vecworld.config import FLUX_BASE, FLUX_GGUF
     return FluxTransformer2DModel.from_single_file(
-        gp, quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
-        torch_dtype=torch.bfloat16, config=BASE, subfolder="transformer"), gp
+        str(FLUX_GGUF), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+        torch_dtype=torch.bfloat16, config=FLUX_BASE, subfolder="transformer"), str(FLUX_GGUF)
 
 
-def load_pipe(R):
-    import torch
-    from diffusers import FluxPipeline
+def load_painter(R, mon):
+    """The game's FluxPainter, with its prompt's T5 encoded (cold) before anything is timed."""
+    from vecworld.config import FLUX_STYLE
+    from vecworld.flux.painter import FluxPainter
+    passes = []
     t0 = time.time()
-    tr, _ = load_transformer()
-    pipe = FluxPipeline.from_pretrained(BASE, transformer=tr, text_encoder_2=None, tokenizer_2=None, torch_dtype=torch.bfloat16)
-    dev = torch.device("cuda")
-    tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"),
-                            offload_type="block_level", num_blocks_per_group=1, use_stream=True)
-    pipe.vae.to(dev); pipe.text_encoder.to(dev)
+    p = FluxPainter(progress=lambda k, n: passes.append(time.time()))
     R["load_s"] = round(time.time() - t0, 1)
     R["rss_after_setup_gb"] = round(rss_gb(), 2)
-    return pipe, dev
+    prompt = [(f"{PROMPT}, {FLUX_STYLE}", 1.0)]
+    mon.reset()
+    t = time.time(); p.t5.encode(prompt[0][0]); R["t5_encode_cold_s"] = round(time.time() - t, 2)
+    R["mon_t5"] = mon.report()
+    return p, prompt, passes
 
 
-def make_gen(pipe, dev):
+def timed(fn, passes, mon):
     import torch
-    E = torch.load(EMBEDS)
-    pe0, pp0 = E["forest"]
-
-    def gen(w=512, h=512, steps=4, seed=0, bs=1):
-        pe = pe0.repeat(bs, 1, 1).to(dev); pp = pp0.repeat(bs, 1).to(dev)
-        torch.cuda.synchronize(); t = time.time()
-        img = pipe(prompt_embeds=pe, pooled_prompt_embeds=pp, width=w, height=h, num_inference_steps=steps,
-                   guidance_scale=0.0, max_sequence_length=256, generator=torch.Generator("cpu").manual_seed(seed)).images
-        torch.cuda.synchronize()
-        return img, time.time() - t
-    return gen
+    torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); mon.reset(); passes.clear()
+    t = time.time(); out = fn(); torch.cuda.synchronize(); dt = time.time() - t
+    gaps = [b - a for a, b in zip([t] + passes[:-1], passes)]
+    return out, dict(s=round(dt, 1), passes=len(passes), s_per_pass_median=round(sorted(gaps)[len(gaps) // 2], 2),
+                     peak_alloc_gb=round(torch.cuda.max_memory_allocated() / 1e9, 2), **mon.report())
 
 
 def do_tile512(R, mon):
+    """One 512x512 window, FLUX_STEPS steps, through the painter's MultiDiffusion loop."""
     import torch
-    pipe, dev = load_pipe(R); gen = make_gen(pipe, dev)
-    R["warmup_512_1step_s"] = round(gen(steps=1)[1], 2)
-    torch.cuda.reset_peak_memory_stats(); mon.reset()
-    _, t4 = gen(steps=4)
-    R["t_512_4step_s"] = round(t4, 2)
-    R["peak_alloc_512_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
-    R["mon_512"] = mon.report()
-    _, t1 = gen(steps=1)
-    R["t_512_1step_s"] = round(t1, 2)
-    R["s_per_step_512"] = round((t4 - t1) / 3, 2)
-    torch.cuda.reset_peak_memory_stats(); mon.reset()
-    _, t = gen(w=1024, h=512)
-    R["t_1024x512_4step_s"] = round(t, 2)
-    R["peak_alloc_1024x512_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
-    R["mon_1024x512"] = mon.report()
-
-
-def do_step(R, mon):
-    """Per-step cost at 512 from (4-step - 1-step)/3, three repeats."""
-    pipe, dev = load_pipe(R); gen = make_gen(pipe, dev)
-    gen(steps=1)
-    vals = []
-    for i in range(3):
-        t4 = gen(steps=4, seed=i)[1]; t1 = gen(steps=1, seed=i)[1]
-        vals.append(round((t4 - t1) / 3, 2))
-    R["s_per_step_512_runs"] = vals
-    R["s_per_step_512"] = sorted(vals)[1]
+    from vecworld.config import FLUX_STEPS, FLUX_WIN
+    p, prompt, passes = load_painter(R, mon)
+    with torch.inference_mode():
+        e = p._embed(prompt)
+        g = torch.randn(1, 64, FLUX_WIN, FLUX_WIN, device="cuda")
+        p._denoise(g, p._sigmas(1), [e])                                    # warm-up
+        _, R["tile512"] = timed(lambda: p._denoise(g, p._sigmas(FLUX_STEPS), [e]), passes, mon)
 
 
 def do_pano(R, mon):
-    import torch
-    pipe, dev = load_pipe(R); gen = make_gen(pipe, dev)
-    gen(steps=1)
-    n = 8
-    torch.cuda.reset_peak_memory_stats(); mon.reset()
-    ts = [gen(seed=s)[1] for s in (1, 2)]
-    R["t_2windows_seq_s"] = round(sum(ts), 2)
-    R["pano_8win_seq_s_est"] = round(sum(ts) * n / 2, 1)
-    for bs in (2, 4):
-        torch.cuda.reset_peak_memory_stats()
-        chunks = [gen(bs=bs, seed=10 + i)[1] for i in range(n // bs)]
-        R[f"pano_8win_bs{bs}_chunks_s"] = [round(c, 2) for c in chunks]
-        R[f"pano_8win_bs{bs}_s"] = round(sum(chunks), 1)  # measured, all 8 windows
-        R[f"s_per_step_bs{bs}"] = round(sorted(chunks)[len(chunks) // 2] / 4, 2)
-        R[f"peak_alloc_bs{bs}_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
-    R["mon_pano"] = mon.report()
+    p, prompt, passes = load_painter(R, mon)
+    img, R["pano"] = timed(lambda: p.panorama(prompt, seed=21), passes, mon)
+    (ROOT / "bench").mkdir(exist_ok=True); img.save(ROOT / "bench/last_pano.png")
+
+
+def do_step(R, mon):
+    """A walk step as next_spot makes it: the panorama dollied by 1.6, the band it magnified repainted."""
+    from vecworld.dream.pano import dolly
+    from vecworld.roam.spot import focus_half
+    p, prompt, passes = load_painter(R, mon)
+    prev = dolly(p.panorama(prompt, seed=21), 1.6)
+    img, R["step"] = timed(lambda: p.step(prev, prompt, None, 0.5, seed=22, focus_half=focus_half(1.6)), passes, mon)
+    (ROOT / "bench").mkdir(exist_ok=True); img.save(ROOT / "bench/last_step.png")
 
 
 def do_blocks(R, mon):
@@ -241,8 +212,8 @@ def do_bw(R, mon):
     torch.cuda.synchronize(); tb = time.perf_counter() - t
     R["overlap_compute_s"], R["overlap_copy_1gb_s"], R["overlap_both_s"] = round(tc, 3), round(tm, 3), round(tb, 3)
     # SSD O_DIRECT sequential read of the transformer GGUF (page cache bypassed)
-    from huggingface_hub import hf_hub_download
-    gp = hf_hub_download(GGUF_REPO, GGUF_FILE)
+    from vecworld.config import FLUX_GGUF
+    gp = str(FLUX_GGUF)
     chunk = 16 * 1024 * 1024
     buf = mmap.mmap(-1, chunk)  # page-aligned, as O_DIRECT requires
     fd = os.open(gp, os.O_RDONLY | os.O_DIRECT)
@@ -278,7 +249,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     if a.painter == "engine":
-        sys.exit("painter 'engine' is not built yet (Task 1 rewires this bench to FluxPainter)")
+        sys.exit("painter 'engine' is not built yet")
     pw = power()
     if pw != "ac":
         sys.exit("on battery: speed numbers are invalid; plug in and rerun")

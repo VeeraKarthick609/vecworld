@@ -135,6 +135,13 @@ def key_heading(k):
 
 # --- start ---------------------------------------------------------------------------
 
+def test_prompts_end_with_the_painters_own_style(svc):
+    svc.painter.style = "smooth digital painting"
+    s = svc.new_session()
+    svc.start(s.id, "forest", [])
+    assert svc.painter.calls[0][1]["base"][0][0] == "forest, open ground in the foreground, smooth digital painting"
+
+
 def test_start_paints_a_first_spot_and_files(svc):
     s = svc.new_session()
     v = svc.start(s.id, "  forest ", ["night", "disco"])
