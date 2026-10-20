@@ -1,25 +1,25 @@
 {
  "power": "ac",
- "git": "b05172f",
+ "git": "a47474a",
  "results": {
   "what": "tile512",
   "gpu_power": "80.00 1 8",
-  "load_s": 58.0,
+  "load_s": 12.7,
   "rss_after_setup_gb": 7.62,
-  "t5_encode_cold_s": 6.13,
+  "t5_encode_cold_s": 6.57,
   "mon_t5": {
    "rss_gb": 8.2,
    "smi_mib": 1296
   },
   "tile512": {
-   "s": 11.0,
+   "s": 11.1,
    "passes": 4,
-   "s_per_pass_median": 2.75,
+   "s_per_pass_median": 2.79,
    "peak_alloc_gb": 1.23,
-   "rss_gb": 8.21,
+   "rss_gb": 8.25,
    "smi_mib": 1444
   },
-  "wall_s": 78.4,
+  "wall_s": 33.7,
   "gpu_power_end": "90.00 4 8"
  }
 }
