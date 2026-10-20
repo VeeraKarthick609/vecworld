@@ -165,3 +165,20 @@ def test_read_gguf_matches_diffusers_loader(tmp_path):
     for k in ref:
         assert type(mine[k]) is type(ref[k]) and mine[k].dtype == ref[k].dtype and torch.equal(mine[k], ref[k]), k
         assert getattr(mine[k], "quant_type", None) == getattr(ref[k], "quant_type", None)
+
+
+def test_windows_crossfade_without_steps_at_their_edges():
+    """Windows that disagree (as FLUX's do in haze, each with its own exposure) must blend smoothly: a box average
+    jumps wherever the pair of windows covering a column changes, a hard vertical line every FLUX_STRIDE."""
+    def velocity(hidden_states, **kw):
+        x0 = hidden_states[:, 0, 0].round().long()              # channel 0 of the first token = the window's column
+        v = torch.cos(2 * math.pi * (x0 // FLUX_STRIDE).float() / N_WIN)
+        return (v[:, None, None].expand_as(hidden_states).clone(),)
+
+    p = fake_painter(transformer=lambda **kw: velocity(**kw))
+    grid = torch.zeros(1, 64, GH, GW)
+    grid[:, 0] = torch.arange(GW, dtype=torch.float32)
+    out = p._denoise(grid.clone(), [1.0, 0.0], [p._embed([("x", 1.0)])] * N_WIN)
+    v = (out - grid)[0, 1, 0]                                    # a channel the fake didn't seed, one row
+    jumps = (torch.roll(v, -1) - v).abs()
+    assert jumps.max() < 0.15, f"step {jumps.max():.2f} at column {int(jumps.argmax())}"

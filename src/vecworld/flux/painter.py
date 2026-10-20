@@ -26,7 +26,7 @@ from vecworld.config import (FLUX_BASE, FLUX_BATCH, FLUX_BG_STRENGTH, FLUX_GGUF,
                              FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, VAE_TILE)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
-from vecworld.dream.pano import focus_mask, windows, wrap_cols
+from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
 
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
 
@@ -208,6 +208,11 @@ class FluxPainter(Painter):
     def _denoise(self, grid, sigmas, embs, keep=None):
         """Euler-integrate a wrap-around token grid, averaging each step's velocity over windows.
 
+        Each window's velocity is weighted by a ramp across its width (rising over its first half, falling over
+        its second), so neighbouring windows crossfade. A plain average jumps wherever the pair of windows covering
+        a column changes, and FLUX's windows disagree enough (each settles its own exposure, worst in haze) for
+        that to show as a hard vertical line every FLUX_STRIDE.
+
         embs[i] = (t5, pooled) for window i. keep = (orig, noise, mask, k_bg): up to and including step k_bg
         the unmasked part is reset to orig noised to the current sigma (differential diffusion), so it only
         denoises sigmas[k_bg:], like img2img; before k_bg windows with no masked column are skipped (_active).
@@ -219,6 +224,7 @@ class FluxPainter(Painter):
         k_bg = None if keep is None else keep[3]
         acts = [_active(wins, masked, k, k_bg) for k in range(len(sigmas) - 1)]
         total, done = sum(math.ceil(len(a) / FLUX_BATCH) for a in acts), 0
+        wt = torch.from_numpy(ramp(FLUX_WIN, FLUX_WIN // 2)).to(grid.device)
         for k, act in enumerate(acts):
             s = sigmas[k]
             if keep is not None and k <= k_bg:
@@ -240,13 +246,13 @@ class FluxPainter(Painter):
                     img_ids=self._img_ids, txt_ids=self._txt_ids, guidance=None, return_dict=False)[0]
                 out = out.float().transpose(1, 2).reshape(n, -1, FLUX_WIN, FLUX_WIN)
                 for i, ((y, _), c) in enumerate(zip((wins[j] for j in idx), cols)):
-                    vel[..., y:y + FLUX_WIN, c] += out[i:i + 1]
-                    cnt[..., y:y + FLUX_WIN, c] += 1
+                    vel[..., y:y + FLUX_WIN, c] += out[i:i + 1] * wt
+                    cnt[..., y:y + FLUX_WIN, c] += wt
                 done += 1
                 if self.progress is not None:
                     self.progress(done, total)
             # columns no window covered this step (skipped background) move by 0: they are reset next step
-            grid = grid + (sigmas[k + 1] - s) * vel / cnt.clamp(min=1)
+            grid = grid + (sigmas[k + 1] - s) * vel / cnt.clamp(min=1e-6)
         if keep is not None and k_bg >= len(acts):     # strength 0: the background is never released, keep it
             orig, _, mask, _ = keep
             grid = mask * grid + (1 - mask) * orig
