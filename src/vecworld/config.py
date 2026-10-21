@@ -93,9 +93,10 @@ FLUX_BACK_FROM = 0.25
 FLUX_BACK_FEATHER = 0.1
 FLUX_BACK_STRENGTH = 0.5
 # How a FLUX walk step repaints the dollied view (FluxPainter.recipe; the user picks by eye, Task 2b A/B sheets).
-#   release "linear": Task 1's step. The band ahead (focus mask, FOCUS_FEATHER) is painted from scratch while the
+#   release "linear": Task 1's step. The band ahead (focus mask, `feather`) is painted from scratch while the
 #     rest is held to the original until `side` (behind the camera `back`); a feather column is held at (1 - mask)
-#     throughout, so the feather is a crossfade of the new band and the old view.
+#     throughout, so the feather is a crossfade of the new band and the old view. Its focus is always from scratch,
+#     so `focus` must be 1.0.
 #   release "graded": every column is released once at its own strength (focus / side / back, mixed by the masks'
 #     weights; the focus mask feathered over `feather` of a turn) and from then on denoises with its neighbours.
 #   release "fresh": a new panorama from the step's prompt and seed; only the prompt blend carries the walk on.
@@ -105,8 +106,37 @@ FLUX_STEP_RECIPES = {
     "repaint": {"release": "graded", "side": 0.5, "back": 0.5, "focus": 1.0, "feather": 0.15},
     "carry": {"release": "graded", "side": 0.5, "back": 0.75, "focus": 0.75, "feather": 0.15},
     "renew": {"release": "graded", "side": 0.5, "back": 0.9, "focus": 0.9, "feather": 0.15},
-    "sharp": {"release": "graded", "side": 0.5, "back": 0.9, "focus": 1.0, "feather": 0.15},
+    # sharp was side 0.5 / feather 0.15 until Task 2b's fix round. Between the band painted from scratch and a kept
+    # view of another exposure, columns released at 0.6-0.85 came out as a featureless haze ending in a hard
+    # full-height edge (walk spots 2, 4 and 5). A 0.25 feather removed the hard edges of spot 4 (walk_sheet seam score
+    # 1.41 -> 0.64, same step) but left haze bands at the focus edge (1.33 / 1.31 on the new walk's spots 2-3);
+    # releasing the sides at 0.75 too lets them follow the new band (0.82 / 0.80 on those steps) and is faster.
+    "sharp": {"release": "graded", "side": 0.75, "back": 0.9, "focus": 1.0, "feather": 0.25},
     "fresh": {"release": "fresh"},
 }
-FLUX_STEP_RECIPE = "sharp"   # Task 2b recommendation; the A/B sheet is the user's to judge
+FLUX_STEP_RECIPE = "sharp"   # Task 2b recommendation; the A/B sheets are the user's to judge
+
+
+def check_recipe(name: str) -> dict:
+    """The recipe called `name`, checked: an unknown name or a malformed recipe raises ValueError (at import for
+    FLUX_STEP_RECIPE, so a typo stops the game at startup, not at its first walk step)."""
+    if name not in FLUX_STEP_RECIPES:
+        raise ValueError(f"unknown FLUX step recipe {name!r}; known: {', '.join(FLUX_STEP_RECIPES)}")
+    rec = FLUX_STEP_RECIPES[name]
+    release = rec.get("release")
+    if release == "fresh":
+        return rec
+    if release not in ("linear", "graded"):
+        raise ValueError(f"FLUX step recipe {name!r}: release {release!r} is not linear, graded or fresh")
+    missing = {"side", "back", "focus", "feather"} - set(rec)
+    if missing:
+        raise ValueError(f"FLUX step recipe {name!r} lacks {', '.join(sorted(missing))}")
+    if not all(0.0 <= rec[k] <= 1.0 for k in ("side", "back", "focus")) or not 0.0 < rec["feather"] < 0.5:
+        raise ValueError(f"FLUX step recipe {name!r}: strengths must lie in 0..1 and the feather in (0, 0.5)")
+    if release == "linear" and rec["focus"] != 1.0:
+        raise ValueError(f"FLUX step recipe {name!r}: a linear release paints its focus from scratch (focus 1.0)")
+    return rec
+
+
+check_recipe(FLUX_STEP_RECIPE)
 FLUX_STYLE = "dreamlike landscape painting, soft atmospheric light, wordless scenery"   # "wordless": short prompts drew title lettering

@@ -23,7 +23,7 @@ import numpy as np
 from PIL import Image
 
 from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
-                             FLUX_GGUF, FLUX_STEP_RECIPE, FLUX_STEP_RECIPES, FLUX_STEPS, FLUX_STRIDE,
+                             FLUX_GGUF, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
                              FLUX_STYLE, FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
@@ -101,6 +101,17 @@ def _wrap_dist(w: int, at: float) -> np.ndarray:
     return np.minimum(d, 1.0 - d)
 
 
+def release_strengths(m: np.ndarray, focus_at: float | None, side: float, back: float, focus: float) -> np.ndarray:
+    """Per column, the strength a graded step releases it at: `side`, rising to `back` behind the camera (from
+    FLUX_BACK_FROM over FLUX_BACK_FEATHER), mixed toward `focus` by the focus mask m. (A linear step paints the
+    focus from scratch and holds the rest to `side` / `back` the same way.)"""
+    w = len(m)
+    b = (np.zeros(w) if focus_at is None else
+         np.clip((_wrap_dist(w, focus_at) - FLUX_BACK_FROM) / FLUX_BACK_FEATHER, 0.0, 1.0))
+    bg = side + b * (back - side)
+    return bg + m * (focus - bg)
+
+
 def _active(wins, reset_next) -> list[int]:
     """The windows worth a pass at a step: a window all of whose columns are fully reset to the noised original
     at the next step would only be thrown away (as TurboPainter skips them). reset_next: bool per column, or None."""
@@ -155,7 +166,7 @@ class FluxPainter(Painter):
         self.transformer, self.vae = transformer, vae
         self._encode_text, self.progress = encode_text, progress
         self.stage: Callable[[str], None] | None = None
-        self.recipe = FLUX_STEP_RECIPE          # how step() repaints (a key of FLUX_STEP_RECIPES)
+        self.recipe = FLUX_STEP_RECIPE
         self._pinned: list[int] = getattr(self, "_pinned", [])
         self._closed = False
         self._dev, self._dtype = dev, dtype
@@ -164,6 +175,16 @@ class FluxPainter(Painter):
         i, j = torch.meshgrid(torch.arange(FLUX_WIN), torch.arange(FLUX_WIN), indexing="ij")
         self._img_ids = torch.stack([torch.zeros_like(i), i, j], -1).reshape(-1, 3).to(dev, dtype)
         self._txt_ids = torch.zeros(FLUX_TEXT_LEN, 3, device=dev, dtype=dtype)
+
+    @property
+    def recipe(self) -> str:
+        """How step() repaints: a key of config.FLUX_STEP_RECIPES, checked when set (a typo fails here)."""
+        return self._recipe
+
+    @recipe.setter
+    def recipe(self, name: str) -> None:
+        check_recipe(name)
+        self._recipe = name
 
     def close(self) -> None:
         """Unregister the page-locked weights (safe twice). The painter can't paint after it."""
@@ -238,7 +259,8 @@ class FluxPainter(Painter):
                      reverse=True) + [0.0]
         return sig, [sig.index(s) for s in r]
 
-    def _reset_weights(self, m: np.ndarray, focus_at: float | None, bg_strength: float):
+    def _reset_weights(self, m: np.ndarray, focus_at: float | None, bg_strength: float,
+                       back_strength: float = FLUX_BACK_STRENGTH):
         """(sigmas, rw): rw[k] is, per token column, how much of the step-k latent is reset to the original noised
         to sigmas[k] (rw[-1], at sigma 0, pastes the original back). m: the focus mask (never reset).
 
@@ -251,7 +273,7 @@ class FluxPainter(Painter):
         w = len(m)
         back = (np.zeros(w, np.float32) if focus_at is None else
                 np.clip((_wrap_dist(w, focus_at) - FLUX_BACK_FROM) / FLUX_BACK_FEATHER, 0.0, 1.0).astype(np.float32))
-        sig, (k_side, k_back) = self._step_sigmas(bg_strength, max(bg_strength, FLUX_BACK_STRENGTH))
+        sig, (k_side, k_back) = self._step_sigmas(bg_strength, max(bg_strength, back_strength))
         rw = []
         for k in range(len(sig)):
             hold = back * (k <= k_back) + (1 - back) * (k <= k_side)
@@ -270,11 +292,7 @@ class FluxPainter(Painter):
         denoises jointly with its neighbours from its release on.
         """
         torch = self._torch
-        w = len(m)
-        b = (np.zeros(w) if focus_at is None else
-             np.clip((_wrap_dist(w, focus_at) - FLUX_BACK_FROM) / FLUX_BACK_FEATHER, 0.0, 1.0))
-        bg = side + b * (back - side)
-        r = bg + m * (focus - bg)                                     # per column: the strength it is released at
+        r = release_strengths(m, focus_at, side, back, focus)
         sig, _ = self._step_sigmas(side, back, focus)
         f = np.interp(-r, -np.asarray(sig), np.arange(len(sig)))       # its (fractional) release step
         rw = [torch.from_numpy(np.clip(f - k + 1, 0.0, 1.0).astype(np.float32)).to(self._dev)[None, None, None, :]
@@ -371,7 +389,7 @@ class FluxPainter(Painter):
         the rest at its side and back strengths (bg_strength, if given, replaces the side strength and is the
         least any column gets)."""
         torch = self._torch
-        rec = FLUX_STEP_RECIPES[self.recipe]
+        rec = check_recipe(self.recipe)
         if rec["release"] == "fresh":
             return self.panorama(base, seed)
         side = rec["side"] if bg_strength is None else bg_strength
@@ -389,7 +407,7 @@ class FluxPainter(Painter):
             # strength off it is added to it (one more Euler point for the band ahead: cheap, since only windows
             # with a column not held to the original run before the release).
             if rec["release"] == "linear":
-                sig, rw = self._reset_weights(m, focus_at, side)
+                sig, rw = self._reset_weights(m, focus_at, side, rec["back"])     # focus: from scratch (1.0)
             else:
                 sig, rw = self._graded_weights(m, focus_at, side, max(side, rec["back"]), max(side, rec["focus"]))
             # Every step up to the first release resets the whole grid to the original noised to its sigma, so

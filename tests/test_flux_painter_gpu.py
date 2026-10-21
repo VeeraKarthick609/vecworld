@@ -65,26 +65,39 @@ def test_flux_panorama_seamless(pano):
 
 
 Z = 1.6
-SSIM_DIP = 0.25     # "sharp" measured 0.35 there (ahead 0.09) on 2026-10-21
+CONTINUOUS = [n for n, r in FLUX_STEP_RECIPES.items() if r["release"] != "fresh"]
+# Continuity bar per recipe: SSIM between the dollied view and the step over the columns it keeps most (released
+# within 0.1 of its lowest strength). Each is ~70% of what the recipe measured on 2026-10-21 (in the comments), so a
+# change that repaints the kept view much harder fails. A band repainted from scratch scores ~0.08 here, so sharp's
+# bar says little more than "keeps more than a fresh paint": at Z 1.6 its 0.25 feather and 0.75 sides release every
+# column at 0.89 or more. "fresh" paints a new panorama and is exempt (test_flux_fresh_step_is_exempt_from_continuity).
+SSIM_KEPT = {"t1": 0.49,         # 0.699 at strength 0.15
+             "repaint": 0.28,    # 0.396 at 0.5
+             "carry": 0.25,      # 0.363 at 0.5-0.6
+             "renew": 0.23,      # 0.331 at 0.5-0.6
+             "sharp": 0.12}      # 0.177 at 0.89-0.99
 
 
-@pytest.fixture(scope="module")
-def stepped(painter, pano):
-    """A walk step as next_spot makes it: the panorama dollied by Z, the band it magnified repainted."""
+@pytest.fixture(scope="module", params=CONTINUOUS)
+def stepped(request, painter, pano):
+    """A walk step as next_spot makes it, by each continuous recipe: the panorama dollied by Z, then stepped."""
     import torch
 
     from vecworld.roam.spot import focus_half
 
     prev = dolly(pano[0], Z)
     half = focus_half(Z)
+    painter.recipe = request.param
     torch.cuda.reset_peak_memory_stats()
     t = time.time()
-    out = painter.step(prev, BASE, None, 0.5, seed=22, focus_half=half)
+    try:
+        out = painter.step(prev, BASE, None, 0.5, seed=22, focus_half=half)
+    finally:
+        painter.recipe = FLUX_STEP_RECIPE
     took = time.time() - t
-    prev.save("/tmp/flux_prev.png")
-    out.save("/tmp/flux_step.png")
-    print(f"\nstep {took:.1f}s peak {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
-    return prev, out, half, torch.cuda.max_memory_allocated()
+    out.save(f"/tmp/flux_step_{request.param}.png")
+    print(f"\n{request.param} step {took:.1f}s peak {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+    return request.param, prev, out, half, torch.cuda.max_memory_allocated()
 
 
 def wrap_dist_cols(w: int, at: float = 0.5) -> np.ndarray:
@@ -112,33 +125,39 @@ def mirror_score(img, z: float = Z, back: float = 0.4, k: int = 24) -> float:
 
 @pytest.mark.gpu
 def test_flux_step_keeps_background(stepped):
-    """Where the configured recipe releases the view latest (between the focus band's feather and the band behind
-    the camera: strength at most ~0.75), the step keeps the scene, and it keeps more there than ahead. Task 1's
-    recipe kept SSIM 0.67 at 0.15; "sharp" grades from 1.0 ahead through 0.5 to 0.9 behind, so its dip is narrow."""
-    from vecworld.config import FLUX_BACK_FEATHER, FLUX_BACK_FROM
+    """Each continuous recipe keeps the scene where it releases the view latest (the columns within 0.1 of its
+    lowest release strength), and keeps more there than ahead, where it repaints."""
     from vecworld.dream.pano import focus_mask
+    from vecworld.flux.painter import release_strengths
 
-    prev, out, half, peak = stepped
+    name, prev, out, half, peak = stepped
+    rec = FLUX_STEP_RECIPES[name]
     w = prev.width
-    d = wrap_dist_cols(w)
-    m = focus_mask(w, 0.5, half, FLUX_STEP_RECIPES[FLUX_STEP_RECIPE].get("feather", 0.06))
-    dip = np.where((m < 0.35) & (d < FLUX_BACK_FROM + 0.25 * FLUX_BACK_FEATHER))[0]
-    ahead = np.where(d < half)[0]
+    m = focus_mask(w, 0.5, half, rec["feather"])
+    r = release_strengths(m, 0.5, rec["side"], max(rec["side"], rec["back"]), rec["focus"])
+    kept = np.where(r <= r.min() + 0.1)[0]
+    ahead = np.where(wrap_dist_cols(w) < half)[0]
     a, b = grey(prev), grey(out)
-    s_dip, s_ahead = ssim(a[:, dip], b[:, dip]), ssim(a[:, ahead], b[:, ahead])
-    print(f"ssim dip {s_dip:.3f} ({len(dip)} columns) ahead {s_ahead:.3f}")
-    assert len(dip) >= 64
-    assert s_dip > SSIM_DIP
-    assert s_ahead < s_dip                                # the band ahead was repainted
+    s_kept, s_ahead = ssim(a[:, kept], b[:, kept]), ssim(a[:, ahead], b[:, ahead])
+    print(f"{name}: ssim kept {s_kept:.3f} ({len(kept)} columns at strength <= {r.min() + 0.1:.2f}) "
+          f"ahead {s_ahead:.3f}")
+    assert len(kept) >= 64
+    assert s_kept > SSIM_KEPT[name]                       # KeyError: a new continuous recipe needs its bar
+    assert s_ahead < s_kept                               # the band ahead was repainted
     assert peak < 3.6e9
+
+
+def test_flux_fresh_step_is_exempt_from_continuity():
+    """"fresh" is exempt from the continuity gate by design: its step is a new panorama (tested on CPU)."""
+    assert FLUX_STEP_RECIPES["fresh"]["release"] == "fresh" and "fresh" not in CONTINUOUS
 
 
 @pytest.mark.gpu
 def test_flux_step_repaints_the_mirrored_rows_behind(stepped):
     """dolly() fills the top and bottom rows behind the camera with a mirror image of the rows next to them
     (upside-down tree tops); the step must paint over them."""
-    prev, out, _, _ = stepped
+    name, prev, out, _, _ = stepped
     before, after = mirror_score(prev), mirror_score(out)
-    print(f"mirror score behind: dollied {before:.3f} step {after:.3f}")
+    print(f"{name}: mirror score behind: dollied {before:.3f} step {after:.3f}")
     assert before > 0.5                                   # the measure sees the mirror
     assert after < 0.2

@@ -328,3 +328,53 @@ def test_every_recipe_steps(monkeypatch):
     for name in FLUX_STEP_RECIPES:
         assert fake_painter(recipe=name).step(prev, [("a", 1.0)], None, 0.5, seed=1, focus_half=0.18).size == \
             (PANO_W, PANO_H)
+
+
+def test_a_recipe_name_is_checked_when_set():
+    from vecworld.config import check_recipe
+
+    with pytest.raises(ValueError, match="unknown FLUX step recipe 'sharpp'"):
+        check_recipe("sharpp")
+    p = fake_painter()
+    with pytest.raises(ValueError):
+        p.recipe = "sharpp"                     # fails here, not at the first step
+    assert p.recipe == "t1"
+
+
+def test_config_checks_the_configured_recipe_at_import(tmp_path):
+    """A typo in FLUX_STEP_RECIPE stops the game when config is imported (startup), not at its first walk step."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import vecworld.config as cfg
+
+    src = Path(cfg.__file__).read_text().replace('FLUX_STEP_RECIPE = "', 'FLUX_STEP_RECIPE = "x', 1)
+    (tmp_path / "config.py").write_text(src)
+    r = subprocess.run([sys.executable, str(tmp_path / "config.py")], capture_output=True, text=True)
+    assert r.returncode != 0 and "unknown FLUX step recipe" in r.stderr
+
+
+@pytest.mark.parametrize("bad", [{"release": "stepped", "side": 0.5, "back": 0.5, "focus": 1.0, "feather": 0.1},
+                                 {"release": "graded", "side": 0.5, "back": 0.5, "focus": 1.0},
+                                 {"release": "linear", "side": 0.15, "back": 0.5, "focus": 0.9, "feather": 0.06},
+                                 {"release": "graded", "side": 1.5, "back": 0.5, "focus": 1.0, "feather": 0.1}])
+def test_malformed_recipes_are_refused(monkeypatch, bad):
+    from vecworld import config
+
+    monkeypatch.setitem(config.FLUX_STEP_RECIPES, "bad", bad)
+    with pytest.raises(ValueError):
+        config.check_recipe("bad")
+
+
+def test_a_linear_recipe_releases_behind_at_its_own_back_strength(monkeypatch):
+    """The linear path used the global FLUX_BACK_STRENGTH whatever the recipe said."""
+    from vecworld import config
+
+    monkeypatch.setitem(config.FLUX_STEP_RECIPES, "t1b",
+                        {**config.FLUX_STEP_RECIPES["t1"], "back": 0.6})
+    tr = TimedTransformer()
+    p = fake_painter(tr, recipe="t1b")
+    prev = Image.new("RGB", (PANO_W, PANO_H), (90, 120, 60))
+    p.step(prev, [("a forest", 1.0)], None, 0.5, seed=4, focus_half=0.15)
+    assert 0.6 in tr.sigmas
