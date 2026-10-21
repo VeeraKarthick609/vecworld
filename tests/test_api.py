@@ -219,3 +219,77 @@ def test_bad_walked_is_422(client, walked):
     sid, _ = started(client)
     r = client.post(f"/api/session/{sid}/next", json={"exit_heading": 0, "walked": walked})
     assert r.status_code == 422 and r.json()["error"] == "bad_input"
+
+
+class OomTransformer:
+    """FluxPainter's transformer on fakes (zero velocity); .boom makes its next call a CUDA out-of-memory."""
+
+    def __init__(self):
+        from test_flux_painter import FakeTransformer
+
+        self.inner, self.boom = FakeTransformer(), False
+
+    def __call__(self, **kw):
+        if self.boom:
+            import torch
+
+            self.boom = False
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        return self.inner(**kw)
+
+
+def flux_client(tmp_path):
+    from test_flux_painter import fake_painter
+
+    tr = OomTransformer()
+    painter = fake_painter(tr)
+    web = tmp_path / "web"
+    web.mkdir(exist_ok=True)
+    (web / "index.html").write_text("<html></html>")
+    svc = RoamService(painter, FakeDepth(), FakeDreamer(), tmp_path / "scenes", spawn=lambda fn: None)
+    return TestClient(create_app(svc, web)), svc, tr
+
+
+def test_flux_oom_returns_503_then_recovers(tmp_path, monkeypatch):
+    import torch
+
+    emptied = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(1))
+    c, svc, tr = flux_client(tmp_path)
+    sid = new(c)
+    tr.boom = True                                    # out of memory mid-panorama
+    r = c.post(f"/api/session/{sid}/start", json={"place": "forest", "moods": []})
+    assert r.status_code == 503 and r.json()["error"] == "gpu_unavailable" and emptied
+    assert c.get(f"/api/session/{sid}/progress").json() == {}
+    r = c.post(f"/api/session/{sid}/start", json={"place": "forest", "moods": []})
+    assert r.status_code == 200, r.text
+    s = svc.get(sid)
+    assert [e.heading for e in s.prefetch.values()] == [0]         # FLUX pre-dreams one way only
+    for e in s.prefetch.values():
+        e.future.result(timeout=30)
+    tr.boom = True                                    # out of memory mid-step, building on demand
+    r = c.post(f"/api/session/{sid}/next", json={"exit_heading": 180})
+    assert r.status_code == 503 and r.json()["error"] == "gpu_unavailable"
+    assert s.busy is False and s.steps == 0
+    r = c.post(f"/api/session/{sid}/next", json={"exit_heading": 180})
+    assert r.status_code == 200, r.text
+    assert r.json()["served"] == "demand" and s.steps == 1
+
+
+def test_progress_endpoint(tmp_path):
+    c = make_client(tmp_path)
+    sid, _ = started(c)
+    assert c.get(f"/api/session/{sid}/progress").json() == {}      # a painter without progress
+    assert c.get("/api/session/nope/progress").status_code == 404
+
+
+def test_progress_endpoint_reports_the_painting(tmp_path, monkeypatch):
+    painter = FakePainter()
+    c = make_client(tmp_path, painter)
+    sid, _ = started(c)
+    seen = {"done": 3, "total": 8}
+    from vecworld.roam.service import RoamService as RS
+
+    monkeypatch.setattr(RS, "progress", lambda self, s: seen if s == sid else None)
+    r = c.get(f"/api/session/{sid}/progress")
+    assert r.status_code == 200 and r.json() == seen

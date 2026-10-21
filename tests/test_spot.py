@@ -203,6 +203,18 @@ def test_next_spot_walked_too_far_is_clamped_and_says_so():
     assert child.distance == pytest.approx(dolly_distance(WALK_Z_MAX, radius=12.0), rel=1e-3)
 
 
+def test_dolly_lands_where_the_player_left_when_the_iteration_oscillates(monkeypatch):
+    # FLUX's deep forests: the radius read ahead grows fast with the dolly (its view narrows onto the far path),
+    # so z <- R(z) / (R(z) - walked) overshoots both ways (measured on a real spot: 1.518 <-> 1.65 forever, and
+    # the child placed 5.38 ahead of a player who walked 6.5). The dolly must still walk what was walked.
+    import vecworld.roam.spot as sm
+
+    monkeypatch.setattr(sm, "_parent_view", lambda parent, rel, z: 16.5 + 19.4 * (z - 1.518))
+    z, r = sm._dolly_for(_spot(12.0), 0.0, 6.5)
+    assert dolly_distance(z, r) == pytest.approx(6.5, rel=1e-3)
+    assert z == pytest.approx(r / (r - 6.5), rel=1e-3)
+
+
 def test_next_spot_scale_matches_the_variable_dolly():
     # The child sees what the parent saw at 12 now 12/z away (z = 1.5 for 4 walked); this one reads it k× that.
     parent = _spot(12.0)

@@ -95,13 +95,32 @@ def walk_z(r: float, walked: float) -> float:
 
 def _dolly_for(parent: Spot, rel_heading: float, walked: float) -> tuple[float, float]:
     """(z, R): the dolly that walks `walked` toward rel_heading and the parent's median radius R that way. R is read
-    over what the child's forward view shows after the dolly, which depends on z, so the two are iterated together."""
+    over what the child's forward view shows after the dolly, which depends on z, so the two are iterated together.
+
+    Where R grows fast with z (deep FLUX scenes: the narrower view reads further down the path) the iteration
+    overshoots both ways and never settles; then z is bisected on the walk it represents, dolly_distance(z, R(z)),
+    which grows with z, against `walked` (the same equation, z = R / (R - walked)), within WALK_Z_MIN..WALK_Z_MAX."""
     z = DOLLY
     for _ in range(6):
         nz = walk_z(_parent_view(parent, rel_heading, z), walked)
         if abs(nz - z) < 1e-4:
-            break
+            return nz, _parent_view(parent, rel_heading, nz)
         z = nz
+
+    def short(zz: float) -> float:          # how far the dolly zz falls short of the walk (< 0: past it)
+        d = dolly_distance(zz, _parent_view(parent, rel_heading, zz))
+        return walked - d if np.isfinite(d) else 0.0
+
+    lo, hi = WALK_Z_MIN, WALK_Z_MAX
+    if short(hi) >= 0:
+        z = hi
+    elif short(lo) <= 0:
+        z = lo
+    else:
+        for _ in range(30):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if short(mid) > 0 else (lo, mid)
+        z = 0.5 * (lo + hi)
     return z, _parent_view(parent, rel_heading, z)
 
 

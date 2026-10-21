@@ -47,6 +47,8 @@ html, body {
   font-size: 14px; letter-spacing: 0.12em;
   animation: breathe 2.4s ease-in-out infinite;
 }
+/* How far the painting of the spot ahead has got (polled from the server while in the fog). */
+#fog #fog-progress { top: calc(30% + 24px); font-size: 12px; animation: none; font-variant-numeric: tabular-nums; }
 @keyframes breathe { 50% { opacity: 0.35; } }
 .fogged #fog { opacity: 1; }
 
@@ -113,6 +115,8 @@ html, body {
 }
 #intro h1 { font-weight: 300; font-size: 44px; letter-spacing: 0.08em; margin: 0 0 8px; }
 #intro p { color: var(--ink-dim); margin: 0; }
+#intro #start-progress { margin-top: 14px; min-height: 1.5em; font-size: 13px; letter-spacing: 0.08em;
+                         font-variant-numeric: tabular-nums; }
 
 /* Bottom centre: mood chips over the text bar. */
 #dock {

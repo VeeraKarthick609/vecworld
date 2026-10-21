@@ -1,11 +1,16 @@
-"""The Dream Roam game: sessions, spots chained by heading, places with drift and arrival, and speculative
-pre-dreaming of the next spot in three directions.
+"""The Dream Roam game: sessions, spots chained by heading, places with drift and arrival, speculative
+pre-dreaming of the next spot (around the player's heading, in as many directions as the painter can afford), and
+the painting progress of the spot a player waits for.
 
 Headings are degrees, 0 = north (the first spot's forward), clockwise, in [0, 360).
 
 Locking: one service lock guards every session read/write. It may be held while calling into the GPU queue
 (queue lock nested inside), never while waiting on a Future, painting or calling the dreamer. A build reads only
 an immutable _Snap taken at submit time and returns a _Built; nothing in the session changes until _commit.
+
+Progress: a painter with a `progress` hook (FluxPainter) reports (done, total) during a job; the service takes the
+hook over and files the latest report under the job painting now (_paint names it). The GPU queue runs one job at
+a time, so that is the only job a report can come from.
 """
 import logging
 import math
@@ -18,7 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from vecworld.config import MAX_SESSIONS, MAX_THEME_CHARS, MOOD_BG_STRENGTH, MOOD_WORDS, MOODS, SESSION_TTL, STYLE
+from vecworld.config import (MAX_SESSIONS, MAX_THEME_CHARS, MOOD_BG_STRENGTH, MOOD_WORDS, MOODS, PREDREAM_HEADINGS,
+                             SESSION_TTL, STYLE)
 from vecworld.dream.gpu import GpuQueue, Stopped
 from vecworld.dream.ideas import Dreamer
 from vecworld.dream.painter import Painter, Prompt
@@ -32,7 +38,6 @@ from vecworld.scenes.palette import Stats, palette_stats
 
 log = logging.getLogger(__name__)
 
-SPREAD = 60.0           # the pre-dreamed set: the heading, then heading + SPREAD and heading - SPREAD
 TAKE_WITHIN = 45.0      # a pre-dreamed spot serves an exit (or a candidate direction) within this
 MAX_NEIGHBOURS = 4
 KEEP_SPOTS = 3          # spots whose files stay on disk per session
@@ -169,6 +174,14 @@ class RoamService:
         self.scene_dir.mkdir(parents=True, exist_ok=True)
         self._sessions: dict[str, RoamSession] = {}
         self._lock = threading.Lock()
+        # The pre-dreamed set: these offsets from the player's heading, in queue order (a painter without its own:
+        # Turbo's). A painter attribute, like its style, so it can't disagree with the painter actually in use.
+        self._headings = tuple(float(h) for h in getattr(painter, "predream_headings", PREDREAM_HEADINGS["turbo"]))
+        # (job, {"done", "total"} or None): the job painting now (or last) and its latest report. Written only on
+        # the GPU worker, read anywhere: one immutable tuple, swapped whole.
+        self._painting: tuple[object, dict | None] | None = None
+        if hasattr(painter, "progress"):
+            painter.progress = self._painted
 
     # --- sessions -------------------------------------------------------------------
 
@@ -203,7 +216,8 @@ class RoamService:
         s = self.get(sid)
         with self._claim(s):
             prompt = [(self._text(place, OPEN_GROUND, moods), 1.0)]
-            spot = self._run(s, lambda: self._paint(lambda: first_spot(self.painter, self.depth, prompt, s.seed)))
+            job = self._await(s, object())
+            spot = self._run(s, lambda: self._paint(job, lambda: first_spot(self.painter, self.depth, prompt, s.seed)))
             names = fallback_neighbours(place)[:MAX_NEIGHBOURS]
             journey = Journey(place, assign_bearings(names, None, random.Random(s.seed)))
             stats = palette_stats(spot.image)
@@ -238,9 +252,11 @@ class RoamService:
                 built = self._take(s, exit_heading)
                 if built is None:
                     running = self._keep_running(s, exit_heading)
+                    if running is not None:
+                        s.awaiting = (s.id, running[0])
             if running is not None:
                 # On the single worker a demand build would only start after this job anyway.
-                built, served = self._wait(s, running), "waited"
+                built, served = self._wait(s, running[1]), "waited"
                 with self._lock:
                     if self._sessions.get(s.id) is not s:
                         raise UnknownSession(s.id)
@@ -252,7 +268,8 @@ class RoamService:
                 with self._lock:
                     self._set([], s.id)   # the queued set (and a pre-dream painting elsewhere) would only delay it
                     snap = self._snap(s)
-                built = self._run(s, lambda: self._build(snap, exit_heading, walked))
+                    job = self._await(s, object())
+                built = self._run(s, lambda: self._build(snap, exit_heading, walked, job=job))
             view = self._commit(s, built, exit_heading, hints, served)
             log.debug("next: %s, walked %s -> distance %.2f, scale %.2f", served, walked, view.distance, view.scale)
             return view
@@ -352,28 +369,28 @@ class RoamService:
         return e.version == s.version and e.spot_id == s.spot.id
 
     def _submit_set(self, s: RoamSession) -> None:
-        """Make the queue's set for s: hint, hint + SPREAD, hint - SPREAD. A candidate within TAKE_WITHIN of a
-        live pre-dream (finished, or queued/running and re-requested by its key) reuses it; the rest are new.
-        Caller holds the lock."""
+        """Make the queue's set for s: hint + each of the painter's pre-dream headings. A candidate within
+        TAKE_WITHIN of a live pre-dream (finished, or queued/running and re-requested by its key) reuses it; the
+        rest are new. Caller holds the lock."""
         if s.spot is None or self._sessions.get(s.id) is not s:
             return
         snap = self._snap(s)
         jobs: list[tuple[str, Callable]] = []
         chosen: dict[str, Predream | float] = {}
-        for c in (s.hint % 360, (s.hint + SPREAD) % 360, (s.hint - SPREAD) % 360):
+        for c in ((s.hint + d) % 360 for d in self._headings):
             near = [(_diff(e.heading, c), e.heading, k) for k, e in s.prefetch.items()
                     if k not in chosen and self._current(s, e) and _alive(e.future) and _diff(e.heading, c) <= TAKE_WITHIN]
             if near:
                 k = min(near)[2]
                 e = chosen[k] = s.prefetch[k]
                 if not e.future.done():
-                    jobs.append((k, self._job(snap, e.heading)))
+                    jobs.append((k, self._job(s, k, snap, e.heading)))
                 continue
             h = round(c) % 360
             k = self._key(s, h)
             if k not in chosen:
                 chosen[k] = float(h)
-                jobs.append((k, self._job(snap, float(h))))
+                jobs.append((k, self._job(s, k, snap, float(h))))
         futs = self._set(jobs, s.id)
         out = {}
         for k, e in chosen.items():
@@ -390,9 +407,10 @@ class RoamService:
         s.prefetch = out
 
     def _set(self, jobs: list, owner: str) -> dict:
-        """Make the queue's pre-dream set for a session. A pre-dream still painting that is not in it is stopped:
-        built from a spot the player left, or toward a direction no longer wanted, it would only hold up the GPU
-        (one spot's paint is ~5 s) for the spot the player walks toward next."""
+        """Make the queue's pre-dream set for a session. A pre-dream still painting that is not in it is stopped (at
+        its next check_stop: FLUX checks between transformer passes): built from a spot the player left, or toward a
+        direction no longer wanted, it would only hold up the GPU (a FLUX step is ~61 s) for the spot the player
+        walks toward next."""
         return self.queue.submit_set(jobs, owner, stop_running=True)
 
     def _drop_set(self, s: RoamSession) -> None:
@@ -423,9 +441,10 @@ class RoamService:
                    key=lambda t: t[:2], default=None)
         return None if best is None else best[2].future.result(timeout=0)
 
-    def _keep_running(self, s: RoamSession, exit_heading: float) -> Future | None:
-        """The running pre-dream closest to the exit within TAKE_WITHIN, with the rest of the queued set cancelled;
-        None if there is none. Queued (not started) pre-dreams lose to a demand build. Caller holds the lock."""
+    def _keep_running(self, s: RoamSession, exit_heading: float) -> tuple[str, Future] | None:
+        """(key, future) of the running pre-dream closest to the exit within TAKE_WITHIN, with the rest of the
+        queued set cancelled; None if there is none. Queued (not started) pre-dreams lose to a demand build. Caller
+        holds the lock."""
         best = min(((_diff(e.heading, exit_heading), e.heading, k) for k, e in s.prefetch.items()
                     if self._current(s, e) and e.future.running() and _diff(e.heading, exit_heading) <= TAKE_WITHIN),
                    default=None)
@@ -433,10 +452,10 @@ class RoamService:
             return None
         k = best[2]
         e = s.prefetch[k]
-        f = self._set([(k, self._job(self._snap(s), e.heading))], s.id).get(k)
+        f = self._set([(k, self._job(s, k, self._snap(s), e.heading))], s.id).get(k)
         if f is not None and f is not e.future:
             f.cancel()    # it ended between our look and the queue's; its own future still holds the result
-        return e.future
+        return k, e.future
 
     def _wait(self, s: RoamSession, f: Future) -> _Built | None:
         """The pre-dream's result, waited for outside the lock; None if it failed (build on demand instead)."""
@@ -456,12 +475,14 @@ class RoamService:
         return _Snap(spot=s.spot, spot_stats=s.spot_stats, journey=s.journey, moods=tuple(s.moods), ref=s.ref,
                      ref_pending=s.ref_pending, version=s.version, seed=s.seed, steps=s.steps)
 
-    def _job(self, snap: _Snap, heading: float):
-        return lambda: self._build(snap, heading)
+    def _job(self, s: RoamSession, key: str, snap: _Snap, heading: float):
+        job = (s.id, key)          # what a move waiting on this pre-dream awaits (see next)
+        return lambda: self._build(snap, heading, job=job)
 
-    def _build(self, snap: _Snap, heading: float, walked: float | None = None) -> _Built:
+    def _build(self, snap: _Snap, heading: float, walked: float | None = None, job: object = None) -> _Built:
         """Paint the spot one step from snap.spot toward heading, for a player who walked `walked` (None: to the
-        walkable radius, as a pre-dream expects). Pure: reads only the snapshot."""
+        walkable radius, as a pre-dream expects), as the job `job` (its progress is filed under it). Pure: reads
+        only the snapshot."""
         j = _copy(snap.journey)
         ds = j.step(heading)
         w = 1.0 if ds.arrived else (ds.weights[1][1] if len(ds.weights) > 1 else 0.0)
@@ -475,8 +496,8 @@ class RoamService:
         else:
             ref, bg = (_blend(snap.ref, snap.spot_stats, w) if w > 0 else snap.ref), None
         seed = (snap.seed + snap.steps + 1) % 2**31
-        spot = self._paint(lambda: next_spot(self.painter, self.depth, snap.spot, heading, base, None, seed, ref,
-                                             bg_strength=bg, walked=walked))
+        spot = self._paint(job, lambda: next_spot(self.painter, self.depth, snap.spot, heading, base, None, seed,
+                                                  ref, bg_strength=bg, walked=walked))
         return _Built(spot, j, ds.arrived, snap.version, snap.spot.id, snap.ref_pending)
 
     def _commit(self, s: RoamSession, built: _Built, exit_heading: float, hints: int, served: str) -> SpotView:
@@ -509,6 +530,38 @@ class RoamService:
         self._forget_files(s)
         self._maybe_refill(s)
         return view
+
+    # --- painting progress ---------------------------------------------------------------
+
+    def progress(self, sid: str) -> dict | None:
+        """How far the painter has got with the spot this session's player is waiting for, as {"done", "total"}
+        (the painter's own units: FLUX counts transformer passes), or None when that spot isn't painting (queued
+        behind other work, finished, or a painter that doesn't report). During a move, that spot is the job the move
+        waits on: the running pre-dream it took over, or its own build. Otherwise it is the spot the player would
+        get at the edge: the pre-dream nearest the way they face."""
+        s = self.get(sid)
+        with self._lock:
+            job = s.awaiting
+            if job is None and not s.busy and s.spot is not None:
+                near = min(((_diff(e.heading, s.hint), k) for k, e in s.prefetch.items()
+                            if self._current(s, e) and _diff(e.heading, s.hint) <= TAKE_WITHIN), default=None)
+                job = None if near is None else (s.id, near[1])
+        painting = self._painting
+        if job is None or painting is None or painting[0] != job:
+            return None
+        return painting[1]
+
+    def _painted(self, done: int, total: int) -> None:
+        """The painter's progress hook (GPU worker thread): file the report under the job painting now."""
+        painting = self._painting
+        if painting is not None:
+            self._painting = (painting[0], {"done": int(done), "total": int(total)})
+
+    @staticmethod
+    def _await(s: RoamSession, job: object) -> object:
+        """The session's move now waits on `job` (cleared when the move ends). Caller holds the lock or the claim."""
+        s.awaiting = job
+        return job
 
     # --- places refill -------------------------------------------------------------------
 
@@ -560,10 +613,12 @@ class RoamService:
         except CancelledError:
             raise UnknownSession(s.id) from None   # evicted while waiting
 
-    @staticmethod
-    def _paint(fn):
+    def _paint(self, job: object, fn):
+        """Run fn (painting and depth, on the GPU worker) as the job `job`: the painter's progress until the next
+        job starts is this job's."""
         import torch
 
+        self._painting = (job, None)
         oom = False
         try:
             return fn()
@@ -690,6 +745,7 @@ class RoamService:
             def __exit__(self, exc_type, *rest):
                 with service._lock:
                     s.busy = False
+                    s.awaiting = None
                     if exc_type is not None:
                         service._after_failed_move(s)
 

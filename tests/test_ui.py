@@ -21,22 +21,29 @@ pytestmark = pytest.mark.ui
 
 
 class UiPainter(FakePainter):
-    """Solid panoramas. While .gate is clear, every step blocks (and sets .entered); .fail_steps makes every step a
-    GPU out-of-memory; .pano_delay slows the first panorama."""
+    """Solid panoramas. While .gate is clear, every step reports .report through its progress hook (as FluxPainter
+    does, when .report is set), then blocks (and sets .entered); .fail_steps makes every step a GPU out-of-memory;
+    .pano_delay slows the first panorama."""
 
     def __init__(self):
         super().__init__()
         self.fail_steps = False
         self.pano_delay = 0.0
+        self.progress = None            # the service's hook
+        self.report = None              # (done, total) a blocked step reports
         self.gate, self.entered = threading.Event(), threading.Event()
         self.gate.set()
 
     def panorama(self, *a, **kw):
+        if self.pano_delay and self.report is not None:
+            self.progress(*self.report)
         time.sleep(self.pano_delay)
         return super().panorama(*a, **kw)
 
     def step(self, *a, **kw):
         if not self.gate.is_set():
+            if self.report is not None:
+                self.progress(*self.report)
             self.entered.set()
             assert self.gate.wait(60)
         if self.fail_steps:
@@ -124,7 +131,7 @@ def server(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def healthy(server):
     _, _, painter = server
-    painter.fail_steps, painter.fail_next, painter.pano_delay = False, False, 0.0
+    painter.fail_steps, painter.fail_next, painter.pano_delay, painter.report = False, False, 0.0, None
     server[1].hide_next_image = False
     server[1].refuse_enter = False
     painter.gate.set()
@@ -322,6 +329,42 @@ def test_edge_waits_in_fog_then_continues(server, browser):
         key_up(browser, "w")
     wait(browser, "Number(getComputedStyle(document.getElementById('fog')).opacity) < 0.05")
     assert max(stalls(js(browser, "roam.samples"), walk_speed), default=0) <= 100
+    assert js(browser, "window.roamErrors") == []
+
+
+FOG_TEXT = "document.getElementById('fog').textContent"
+
+
+def test_fog_shows_progress(server, browser):
+    url, svc, painter = server
+    painter.gate.clear()                 # every step blocks: the pre-dream ahead paints, and says how far it got
+    painter.report = (3, 8)
+    start(browser, url)
+    first = js(browser, "roam.spotId")
+    assert "painting" not in js(browser, FOG_TEXT)
+    browser.execute_script("roamDev.look(0, 0.18)")
+    key_down(browser, "w")
+    try:
+        assert painter.entered.wait(10)
+        wait(browser, "roam.fog && roam.braking", timeout=10)
+        wait(browser, f"{FOG_TEXT}.includes('painting… 3/8')", timeout=5)    # polled every second
+        assert "dreaming the way ahead" in js(browser, FOG_TEXT)
+        painter.gate.set()
+        wait(browser, f"roam.spotId !== {first!r} && !roam.fog")
+    finally:
+        key_up(browser, "w")
+    wait(browser, f"!{FOG_TEXT}.includes('painting')", timeout=5)   # cleared for the next wait
+    assert js(browser, "window.roamErrors") == []
+
+
+def test_first_spot_shows_progress_under_the_intro(server, browser):
+    url, _, painter = server
+    painter.pano_delay, painter.report = 4.0, (5, 8)
+    open_game(browser, url)
+    submit(browser, "a quiet forest")
+    wait(browser, "document.getElementById('start-progress').textContent === 'painting… 5/8'", timeout=4)
+    wait(browser, "roam.started && roam.spotId !== null")
+    wait(browser, "document.getElementById('start-progress').textContent === ''", timeout=3)
     assert js(browser, "window.roamErrors") == []
 
 

@@ -9,6 +9,8 @@
 // switches into it on walking in (World.update). If it isn't there in time, the character coasts to a stop at the
 // rim in a dream fog and is moved into it as it lands. The server pre-dreams around the player's heading, which the
 // page hints at most every HINT_MS when it has turned by more than HINT_DEG.
+// While the page waits for a spot (the first one, or in the fog), it asks the server every PROGRESS_MS how far the
+// painting of that spot has got, and shows it.
 //
 // `here` is the world entry of the server's current spot. Walking back into the previous spot (World.update can
 // switch there until the next step) tells the server with /enter, so every /next is asked from the spot the player
@@ -34,6 +36,7 @@ const FOG_RIM = 0.95;                 // a pending spot shows the fog once the p
 const LOOK_X = 0.004, LOOK_Y = 0.003; // radians of camera turn per pixel of drag (as OrbitCam)
 const STICK_R = 44;                   // px the phone stick's knob travels
 const TOAST_MS = 3500;
+const PROGRESS_MS = 1000;             // how often a waiting page asks how far the spot it waits for has painted
 const STILL = Object.freeze({ fwd: 0, side: 0, run: false });
 
 const $ = id => document.getElementById(id);
@@ -163,6 +166,7 @@ function arrive(entry) {
 async function begin(place) {
   starting = true;
   input.disabled = true;
+  pollProgress();
   try {
     await ready;
     const v = await call("start", { place, moods: activeMoods() });
@@ -278,6 +282,39 @@ function sendHint(now) {
   hints.push({ t: now, heading: h });
   if (hints.length > 64) hints.shift();
   call("heading", { heading: h }).catch(() => {});   // best effort: only steers the pre-dreaming
+}
+
+// --- painting progress ----------------------------------------------------------
+// The server says how far the painter has got with the spot this page waits for ({done, total}, or {} when it isn't
+// painting: queued behind other work, or a painter that doesn't say). Shown in the fog, or under the intro while the
+// first spot paints.
+
+let polling = false;
+const waitingForSpot = () => starting || (started && fogged());
+
+function showProgress(p) {
+  const text = p && p.total > 0 ? `painting… ${p.done}/${p.total}` : "";
+  $("fog-progress").textContent = started ? text : "";
+  $("start-progress").textContent = started ? "" : text;
+}
+
+async function pollProgress() {
+  if (polling) return;
+  polling = true;
+  try {
+    while (waitingForSpot()) {
+      let p = null;
+      try {
+        const r = await fetch(`/api/session/${await session()}/progress`);
+        if (r.ok) p = await r.json();
+      } catch { /* best effort: the wait shows no count */ }
+      if (waitingForSpot()) showProgress(p);
+      await new Promise(ok => setTimeout(ok, PROGRESS_MS));
+    }
+  } finally {
+    polling = false;
+    showProgress(null);
+  }
 }
 
 // --- controls -----------------------------------------------------------------
@@ -423,6 +460,7 @@ function play(dt, now) {
   if (fogs.length > 200) fogs.shift();
   wasFog = fog;
   document.body.classList.toggle("fogged", fog);
+  if (fog) pollProgress();
   if (fog && exitBearing != null) {
     const d = rel(camBearing(), exitBearing) * Math.PI / 180;   // the fog thickens on the side the way lies
     document.body.style.setProperty("--fog-x", `${50 + 40 * Math.sin(d)}%`);

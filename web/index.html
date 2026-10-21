@@ -17,7 +17,7 @@
 <body>
   <main id="stage" aria-label="the dream; drag to look around"></main>
 
-  <div id="fog" aria-hidden="true"><span>dreaming the way ahead…</span></div>
+  <div id="fog" aria-hidden="true"><span>dreaming the way ahead…</span><span id="fog-progress"></span></div>
 
   <div id="compass" hidden>
     <div class="strip" aria-label="compass"></div>
@@ -27,6 +27,7 @@
   <div id="intro">
     <h1>Dream Roam</h1>
     <p>Type a place to dream of and pick a mood.<br>Then walk anywhere: signposts point to the places nearby.</p>
+    <p id="start-progress" role="status"></p>
   </div>
 
   <div id="keys" hidden><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> walk · <kbd>Shift</kbd> run · drag or click to look, <kbd>Esc</kbd> lets go</div>

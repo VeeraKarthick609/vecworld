@@ -1,4 +1,6 @@
+import queue
 import threading
+import time
 from concurrent.futures import Future, wait
 
 import numpy as np
@@ -162,7 +164,7 @@ def test_start_submits_a_set_of_three_heading_first(make):
     s = started(svc)
     assert len(q.sets) == 1
     keys = q.sets[0]
-    assert [key_heading(k) for k in keys] == [0, 60, 300]
+    assert [key_heading(k) for k in keys] == [0, 300, 60]     # PREDREAM_HEADINGS["turbo"]: 0, -60, +60
     assert all(k.startswith(f"{s.version}:{s.spot.id}:") for k in keys)
     assert set(s.prefetch) == set(keys)
 
@@ -285,7 +287,7 @@ def test_after_a_move_the_new_set_is_around_the_exit_heading(make):
     v = svc.next(s.id, 100)                       # nothing ran: on demand
     assert v.heading == pytest.approx(100)
     keys = q.sets[-1]
-    assert [key_heading(k) for k in keys] == [100, 160, 40]
+    assert [key_heading(k) for k in keys] == [100, 40, 160]
     assert all(k.startswith(f"{s.version}:{v.spot_id}:") for k in keys)
 
 
@@ -1197,7 +1199,7 @@ def test_a_move_elsewhere_stops_the_running_predream(make):
 def test_taking_a_predream_stops_the_one_still_painting_for_the_old_spot(make):
     from vecworld.dream.gpu import Stopped
 
-    svc = make(painter=StopPainter(block_at=2))      # heading 0 finishes; the +60 one hangs
+    svc = make(painter=StopPainter(block_at=2))      # heading 0 finishes; the -60 one hangs
     s = started(svc)
     fut = {key_heading(k): f for k, f in set_futures(s).items()}
     fut[0].result(timeout=5)
@@ -1205,7 +1207,7 @@ def test_taking_a_predream_stops_the_one_still_painting_for_the_old_spot(make):
     v = svc.next(s.id, 0)
     assert v.spot_id == spot_of(fut[0]).id
     with pytest.raises(Stopped):
-        fut[60].result(timeout=5)
+        fut[300].result(timeout=5)
     wait_set(s)                                     # the new spot's set paints straight away
     assert all(f":{v.spot_id}:" in k for k in s.prefetch)
 
@@ -1253,3 +1255,126 @@ def test_a_failed_write_leaves_the_session_on_its_spot(make, monkeypatch):
     monkeypatch.undo()
     assert svc.next(s.id, 90, walked=3.0).image_path.exists()
 
+
+
+# --- a slow painter: one-way pre-dream and painting progress ------------------------------------------------
+
+def test_predream_only_facing_direction_for_slow_painter(make):
+    from vecworld.config import PREDREAM_HEADINGS
+    from vecworld.dream.painter import TurboPainter
+    from vecworld.flux.painter import FluxPainter
+
+    assert PREDREAM_HEADINGS == {"flux": (0,), "turbo": (0, -60, 60)}
+    assert FluxPainter.predream_headings == PREDREAM_HEADINGS["flux"]
+    assert TurboPainter.predream_headings == PREDREAM_HEADINGS["turbo"]
+    painter = FakePainter()
+    painter.predream_headings = PREDREAM_HEADINGS["flux"]
+    q = ManualQueue()
+    svc = make(painter=painter, queue=q)
+    s = started(svc)
+    assert [[key_heading(k) for k in ks] for ks in q.sets] == [[0]]
+    svc.heading(s.id, 100)                     # turned: the one pre-dream follows the player's facing
+    assert [key_heading(k) for k in q.sets[-1]] == [100] and len(s.prefetch) == 1
+    v = svc.next(s.id, 100)                    # not finished: built on demand, then the next one faces on
+    assert v.served == "demand"
+    assert [key_heading(k) for k in q.sets[-1]] == [100]
+    assert all(k.startswith(f"{s.version}:{v.spot_id}:") for k in q.sets[-1])
+
+
+class ProgressPainter(FakePainter):
+    """Like FluxPainter, has a progress hook. Its n-th step (1-based) reports progress(n, 8) (.last); while .hold,
+    it then puts an Event on .waiting and blocks until that event is set."""
+
+    predream_headings = (0,)
+
+    def __init__(self):
+        super().__init__()
+        self.progress = None
+        self.hold = True
+        self.last = None
+        self.waiting: "queue.Queue[threading.Event]" = queue.Queue()
+
+    def step(self, *a, **kw):
+        self.last = (len(steps_of(self)) + 1, 8)
+        self.progress(*self.last)
+        if self.hold:
+            ev = threading.Event()
+            self.waiting.put(ev)
+            assert ev.wait(5)
+        return super().step(*a, **kw)
+
+    def let_go(self):
+        self.hold = False
+        while not self.waiting.empty():
+            self.waiting.get().set()
+
+
+def wait_until(cond, timeout=5):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return
+        time.sleep(0.01)
+    raise AssertionError("timed out")
+
+
+def test_progress_reported_while_building(make):
+    svc = make(painter=ProgressPainter())
+    p = svc.painter
+    p.hold = False
+    s, other = started(svc), started(svc)
+    wait_set(s)
+    wait_set(other)
+    p.hold = True
+    out, t = [], None
+    try:
+        svc.heading(s.id, 90)                     # turned: the pre-dream toward 90 paints
+        first = p.waiting.get(timeout=5)
+        # Walking toward the edge: the spot this player would get there is the pre-dream they face.
+        assert svc.progress(s.id) == {"done": p.last[0], "total": 8}
+        assert svc.progress(other.id) is None     # another player's job is not their progress
+        t = threading.Thread(target=lambda: out.append(svc.next(s.id, 270)))   # nothing that way: on demand
+        t.start()
+        wait_until(lambda: s.busy)
+        # The move waits for its own build, queued behind the pre-dream it stopped (a fake that never checks
+        # in): nothing to show, whatever the stale pre-dream reports.
+        wait_until(lambda: svc.progress(s.id) is None)
+        assert p.waiting.empty()
+        first.set()
+        second = p.waiting.get(timeout=5)         # the demand build paints
+        assert svc.progress(s.id) == {"done": p.last[0], "total": 8}
+        assert svc.progress(other.id) is None
+        second.set()
+        t.join(5)
+        assert out and out[0].served == "demand" and out[0].heading == pytest.approx(270)
+    finally:
+        p.let_go()
+        if t is not None:
+            t.join(5)
+
+
+def test_progress_follows_the_running_predream_a_move_waits_on(make):
+    svc = make(painter=ProgressPainter())
+    p = svc.painter
+    s = started(svc)
+    first = p.waiting.get(timeout=5)              # the pre-dream toward 0 is painting
+    out = []
+    t = threading.Thread(target=lambda: out.append(svc.next(s.id, 20)))
+    t.start()
+    try:
+        wait_until(lambda: s.busy)
+        assert svc.progress(s.id) == {"done": 1, "total": 8}
+        first.set()
+        t.join(5)
+        assert out and out[0].served == "waited"
+    finally:
+        p.let_go()
+        t.join(5)
+
+
+def test_progress_is_none_without_a_progress_hook(svc):
+    s = started(svc)
+    wait_set(s)
+    assert svc.progress(s.id) is None
+    with pytest.raises(UnknownSession):
+        svc.progress("nope")

@@ -6,8 +6,8 @@ from typing import Protocol
 import numpy as np
 from PIL import Image
 
-from vecworld.config import (BG_STRENGTH, FOCUS_HALF, PANO_H, PANO_W, STEP_STEPS, VAE_MARGIN, VAE_STRIDE,
-                             VAE_TILE, WIN)
+from vecworld.config import (BG_STRENGTH, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, STEP_STEPS, VAE_MARGIN,
+                             VAE_STRIDE, VAE_TILE, WIN)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.pano import focus_mask, ramp, tile_origins, windows, wrap_cols
 
@@ -37,6 +37,8 @@ class TurboPainter(Painter):
     Attention slicing is deliberately off: it ran out of memory at this size. SD-Turbo has no CFG,
     so there is no negative prompt.
     """
+
+    predream_headings = PREDREAM_HEADINGS["turbo"]   # ~5 s a step: pre-dream three ways
 
     def __init__(self, model_id: str = "stabilityai/sd-turbo"):
         # The VAE decoder wants ~340 MB blocks that a fragmented 4 GB cache can't give without

@@ -102,6 +102,12 @@ def create_app(service: RoamService, web_dir: Path) -> FastAPI:
         service.heading(sid, body.heading)
         return {"ok": True}
 
+    @app.get("/api/session/{sid}/progress")
+    async def progress(sid: str):
+        # How far the spot the player waits for has painted: {"done", "total"}, or {} when it isn't painting. The
+        # viewer polls it every second in the fog; it only reads state, so it runs inline.
+        return service.progress(sid) or {}
+
     @app.post("/api/session/{sid}/theme")
     async def theme(sid: str, body: ThemeIn):
         await run(service.set_theme, sid, body.place)
