@@ -92,4 +92,21 @@ FLUX_BG_STRENGTH = 0.15    # a walk step releases its background at this sigma (
 FLUX_BACK_FROM = 0.25
 FLUX_BACK_FEATHER = 0.1
 FLUX_BACK_STRENGTH = 0.5
+# How a FLUX walk step repaints the dollied view (FluxPainter.recipe; the user picks by eye, Task 2b A/B sheets).
+#   release "linear": Task 1's step. The band ahead (focus mask, FOCUS_FEATHER) is painted from scratch while the
+#     rest is held to the original until `side` (behind the camera `back`); a feather column is held at (1 - mask)
+#     throughout, so the feather is a crossfade of the new band and the old view.
+#   release "graded": every column is released once at its own strength (focus / side / back, mixed by the masks'
+#     weights; the focus mask feathered over `feather` of a turn) and from then on denoises with its neighbours.
+#   release "fresh": a new panorama from the step's prompt and seed; only the prompt blend carries the walk on.
+FLUX_STEP_RECIPES = {
+    "t1": {"release": "linear", "side": FLUX_BG_STRENGTH, "back": FLUX_BACK_STRENGTH, "focus": 1.0,
+           "feather": FOCUS_FEATHER},
+    "repaint": {"release": "graded", "side": 0.5, "back": 0.5, "focus": 1.0, "feather": 0.15},
+    "carry": {"release": "graded", "side": 0.5, "back": 0.75, "focus": 0.75, "feather": 0.15},
+    "renew": {"release": "graded", "side": 0.5, "back": 0.9, "focus": 0.9, "feather": 0.15},
+    "sharp": {"release": "graded", "side": 0.5, "back": 0.9, "focus": 1.0, "feather": 0.15},
+    "fresh": {"release": "fresh"},
+}
+FLUX_STEP_RECIPE = "sharp"   # Task 2b recommendation; the A/B sheet is the user's to judge
 FLUX_STYLE = "dreamlike landscape painting, soft atmospheric light, wordless scenery"   # "wordless": short prompts drew title lettering

@@ -46,12 +46,25 @@ class FakeVae:
         return SimpleNamespace(latent_dist=SimpleNamespace(mean=lat))
 
 
-def fake_painter(transformer=None, progress=None):
+def fake_painter(transformer=None, progress=None, recipe="t1"):
     p = FluxPainter.__new__(FluxPainter)
     p._setup(transformer or FakeTransformer(), FakeVae(),
              lambda text: (torch.zeros(1, 4, 8, dtype=torch.bfloat16), torch.zeros(1, 8, dtype=torch.bfloat16)),
              progress, dev="cpu", dtype=torch.float32)
+    p.recipe = recipe
     return p
+
+
+class TimedTransformer(FakeTransformer):
+    """Also records each call's sigma."""
+
+    def __init__(self):
+        super().__init__()
+        self.sigmas = []
+
+    def __call__(self, hidden_states, encoder_hidden_states, pooled_projections, timestep, *a, **k):
+        self.sigmas.append(round(float(timestep[0]), 4))
+        return super().__call__(hidden_states, encoder_hidden_states, pooled_projections, timestep, *a, **k)
 
 
 def test_windows_wrap_and_cover():
@@ -245,3 +258,73 @@ def test_close_unpins_once_and_ends_the_painter(monkeypatch):
     assert gone == [11, 22] and p._pinned == []
     with pytest.raises(RuntimeError):
         p.panorama([("a forest", 1.0)], seed=1)
+
+
+@pytest.mark.parametrize("recipe", ["t1", "repaint", "carry"])
+def test_a_step_without_focus_denoises_from_its_strength(recipe):
+    """Without a focus band a step is img2img: its first pass is at sigma = the background strength (it started
+    one schedule point later, i.e. at 0.25 for 0.5, before Task 2b)."""
+    tr = TimedTransformer()
+    p = fake_painter(tr, recipe=recipe)
+    prev = Image.new("RGB", (PANO_W, PANO_H), (90, 120, 60))
+    p.step(prev, [("a forest", 1.0)], None, None, seed=4, bg_strength=0.5)
+    assert tr.sigmas[0] == 0.5
+    assert sorted(set(tr.sigmas), reverse=True) == [0.5, 0.25]
+
+
+def _rw(rw):
+    return np.stack([r.reshape(-1).cpu().numpy() for r in rw])     # [step, column]
+
+
+def test_graded_release_releases_each_column_once_at_its_strength():
+    from vecworld.config import FLUX_BACK_FEATHER, FLUX_BACK_FROM
+    from vecworld.dream.pano import focus_mask
+
+    p = fake_painter(recipe="carry")
+    m = focus_mask(GW, 0.5, 0.15, 0.15)
+    sig, rw = p._graded_weights(m, 0.5, 0.5, 0.75, 0.9)
+    rw = _rw(rw)
+    assert 0.9 in sig and 0.5 in sig and 0.75 in sig
+    assert (np.diff(rw, axis=0) <= 0).all(), "a column is never held again once released"
+    assert (((rw > 0) & (rw < 1)).sum(0) <= 1).all(), "at most one partial hold per column"
+    d = np.abs((np.arange(GW) + 0.5) / GW - 0.5)
+    first_free = (rw >= 1).sum(0)          # the step from which a column is (at least partly) free
+    focus, side = m >= 1, (m == 0) & (d < FLUX_BACK_FROM)
+    back = d >= FLUX_BACK_FROM + FLUX_BACK_FEATHER
+    assert (first_free[focus] == sig.index(0.9) + 1).all()
+    assert (first_free[side] == sig.index(0.5) + 1).all()
+    assert (first_free[back] == sig.index(0.75) + 1).all()
+    feather = (m > 0) & (m < 1) & (d < FLUX_BACK_FROM)
+    released = sig.index(0.9) + 1 - rw[sig.index(0.9) + 1:].sum(0)   # fractional release step
+    assert (np.diff(released[feather][: feather.sum() // 2]) != 0).any(), "the feather grades between them"
+
+
+def test_graded_step_runs_every_column_together_after_its_release():
+    """The double exposure: with Task 1's release a feather column is pulled back to the original at every step
+    up to the background's release, so the band ahead and the background never denoise together there."""
+    from vecworld.dream.pano import focus_mask
+
+    m = focus_mask(GW, 0.5, 0.15, 0.15)
+    feather = (m > 0.2) & (m < 0.8)
+    lin = _rw(fake_painter()._reset_weights(m, 0.5, 0.5)[1])
+    gr = _rw(fake_painter(recipe="repaint")._graded_weights(m, 0.5, 0.5, 0.5, 1.0)[1])
+    held_partly = lambda rw: ((rw > 0) & (rw < 1)).sum(0)                    # noqa: E731
+    assert (held_partly(lin)[feather] >= 2).all()
+    assert (held_partly(gr)[feather] <= 1).all()
+
+
+def test_fresh_step_is_a_new_panorama():
+    p = fake_painter(recipe="fresh")
+    prev = Image.new("RGB", (PANO_W, PANO_H), (90, 120, 60))
+    out = p.step(prev, [("a forest", 1.0)], None, 0.5, seed=9)
+    assert np.array_equal(np.asarray(out), np.asarray(p.panorama([("a forest", 1.0)], seed=9)))
+
+
+def test_every_recipe_steps(monkeypatch):
+    from vecworld.config import FLUX_STEP_RECIPE, FLUX_STEP_RECIPES
+
+    assert FLUX_STEP_RECIPE in FLUX_STEP_RECIPES and "t1" in FLUX_STEP_RECIPES
+    prev = Image.new("RGB", (PANO_W, PANO_H), (90, 120, 60))
+    for name in FLUX_STEP_RECIPES:
+        assert fake_painter(recipe=name).step(prev, [("a", 1.0)], None, 0.5, seed=1, focus_half=0.18).size == \
+            (PANO_W, PANO_H)

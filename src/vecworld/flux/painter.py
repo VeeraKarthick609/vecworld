@@ -23,8 +23,8 @@ import numpy as np
 from PIL import Image
 
 from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
-                             FLUX_BG_STRENGTH, FLUX_GGUF, FLUX_STEPS, FLUX_STRIDE, FLUX_STYLE,
-                             FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
+                             FLUX_GGUF, FLUX_STEP_RECIPE, FLUX_STEP_RECIPES, FLUX_STEPS, FLUX_STRIDE,
+                             FLUX_STYLE, FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
@@ -155,6 +155,7 @@ class FluxPainter(Painter):
         self.transformer, self.vae = transformer, vae
         self._encode_text, self.progress = encode_text, progress
         self.stage: Callable[[str], None] | None = None
+        self.recipe = FLUX_STEP_RECIPE          # how step() repaints (a key of FLUX_STEP_RECIPES)
         self._pinned: list[int] = getattr(self, "_pinned", [])
         self._closed = False
         self._dev, self._dtype = dev, dtype
@@ -257,6 +258,29 @@ class FluxPainter(Painter):
             rw.append(torch.from_numpy(((1 - m) * hold).astype(np.float32)).to(self._dev)[None, None, None, :])
         return sig, rw
 
+    def _graded_weights(self, m: np.ndarray, focus_at: float | None, side: float, back: float, focus: float):
+        """(sigmas, rw) as _reset_weights, but each column is released once, at its own strength: `side` on the
+        sides, `back` behind the camera (from FLUX_BACK_FROM, feathered over FLUX_BACK_FEATHER), `focus` in the
+        focus mask m, and in between their mix by the mask's weight. A strength between two sigmas of the schedule
+        is held fully up to the earlier one and partly (by how far it lies toward the later one) at the later one.
+
+        _reset_weights instead holds a feather column at a fraction (1 - m) of the original through every step up
+        to the background's release: the band ahead and the background never denoise together there, so the
+        feather comes out as the two images crossfaded (a double exposure). Here every column, feather included,
+        denoises jointly with its neighbours from its release on.
+        """
+        torch = self._torch
+        w = len(m)
+        b = (np.zeros(w) if focus_at is None else
+             np.clip((_wrap_dist(w, focus_at) - FLUX_BACK_FROM) / FLUX_BACK_FEATHER, 0.0, 1.0))
+        bg = side + b * (back - side)
+        r = bg + m * (focus - bg)                                     # per column: the strength it is released at
+        sig, _ = self._step_sigmas(side, back, focus)
+        f = np.interp(-r, -np.asarray(sig), np.arange(len(sig)))       # its (fractional) release step
+        rw = [torch.from_numpy(np.clip(f - k + 1, 0.0, 1.0).astype(np.float32)).to(self._dev)[None, None, None, :]
+              for k in range(len(sig))]
+        return sig, rw
+
     # --- VAE, tiled along the wrapping width (TurboPainter's crossfaded tiles) -------------------------------
     # TurboPainter decodes vae.decode(lat / sf) and encodes mean * sf; FLUX's VAE adds a shift factor:
     # decode (lat / sf + shift) = decode((lat + shift * sf) / sf), encode (mean - shift) * sf.
@@ -342,11 +366,18 @@ class FluxPainter(Painter):
 
     def step(self, prev: Image.Image, base: Prompt, focus: Prompt | None, focus_at: float | None,
              seed: int, bg_strength: float | None = None, focus_half: float | None = None) -> Image.Image:
+        """One walk step from the dollied view prev, by self.recipe (config.FLUX_STEP_RECIPES): "fresh" paints a
+        new panorama from base; the others repaint prev, the focus band ahead at the recipe's focus strength and
+        the rest at its side and back strengths (bg_strength, if given, replaces the side strength and is the
+        least any column gets)."""
         torch = self._torch
-        bg_strength = FLUX_BG_STRENGTH if bg_strength is None else bg_strength
+        rec = FLUX_STEP_RECIPES[self.recipe]
+        if rec["release"] == "fresh":
+            return self.panorama(base, seed)
+        side = rec["side"] if bg_strength is None else bg_strength
         half = FOCUS_HALF if focus_half is None else focus_half
         h, w = PANO_H // 16, PANO_W // 16
-        m = np.zeros(w, np.float32) if focus_at is None else focus_mask(w, focus_at, half)
+        m = np.zeros(w, np.float32) if focus_at is None else focus_mask(w, focus_at, half, rec["feather"])
         with torch.inference_mode():
             self._stage("text")
             e_base = self._embed(base)
@@ -357,9 +388,13 @@ class FluxPainter(Painter):
             # and denoises from there, as img2img would. Schnell's 4-step grid only offers 0.25 / 0.5 / 0.75, so a
             # strength off it is added to it (one more Euler point for the band ahead: cheap, since only windows
             # with a column not held to the original run before the release).
-            sig, rw = self._reset_weights(m, focus_at, bg_strength)
-            # Nothing to regenerate: every step before the first release is overwritten, so start there (img2img).
-            start = 0 if m.any() else next(k for k, r in enumerate(rw) if (r < 1).any() or k == len(sig) - 1)
+            if rec["release"] == "linear":
+                sig, rw = self._reset_weights(m, focus_at, side)
+            else:
+                sig, rw = self._graded_weights(m, focus_at, side, max(side, rec["back"]), max(side, rec["focus"]))
+            # Every step up to the first release resets the whole grid to the original noised to its sigma, so
+            # start at the last of them (img2img): its reset is the starting latent, and its pass is made.
+            start = max(0, next((k for k, r in enumerate(rw) if (r < 1).any()), len(sig)) - 1)
             shift = seed % VAE_TILE
             self._stage("image")
             noise, orig = self._noise(seed), self._encode(prev, shift)
