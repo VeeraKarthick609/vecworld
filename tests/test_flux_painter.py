@@ -214,3 +214,34 @@ def test_windows_crossfade_without_steps_at_their_edges():
     v = (out - grid)[0, 1, 0]                                    # a channel the fake didn't seed, one row
     jumps = (torch.roll(v, -1) - v).abs()
     assert jumps.max() < 0.15, f"step {jumps.max():.2f} at column {int(jumps.argmax())}"
+
+
+def test_stages_name_the_work_around_the_passes():
+    """stage(name) says what a job is doing between the passes progress() counts: the text, the view it starts
+    from (a step), then the decode."""
+    log = []
+    p = fake_painter(progress=lambda k, total: log.append(("pass", k)))
+    p.stage = lambda name: log.append(("stage", name))
+    p.panorama([("a forest", 1.0)], seed=3)
+    names = [x for x in log if x[0] == "stage"]
+    assert names == [("stage", "text"), ("stage", "finishing")]
+    assert log[0] == ("stage", "text") and log[-1] == ("stage", "finishing") and ("pass", 1) in log
+    log.clear()
+    prev = Image.new("RGB", (PANO_W, PANO_H), (90, 120, 60))
+    p.step(prev, [("a forest", 1.0)], None, 0.5, seed=4, bg_strength=0.15)
+    assert [x for x in log if x[0] == "stage"] == [("stage", "text"), ("stage", "image"), ("stage", "finishing")]
+    assert log.index(("stage", "image")) < log.index(("pass", 1)) < log.index(("stage", "finishing"))
+
+
+def test_close_unpins_once_and_ends_the_painter(monkeypatch):
+    from vecworld.flux import painter as fp
+
+    gone = []
+    monkeypatch.setattr(fp, "_unpin", lambda ptrs: gone.extend(ptrs))
+    p = fake_painter()
+    p._pinned = [11, 22]
+    p.close()
+    p.close()                                   # safe twice
+    assert gone == [11, 22] and p._pinned == []
+    with pytest.raises(RuntimeError):
+        p.panorama([("a forest", 1.0)], seed=1)

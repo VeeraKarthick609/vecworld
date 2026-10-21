@@ -8,9 +8,10 @@ Locking: one service lock guards every session read/write. It may be held while 
 (queue lock nested inside), never while waiting on a Future, painting or calling the dreamer. A build reads only
 an immutable _Snap taken at submit time and returns a _Built; nothing in the session changes until _commit.
 
-Progress: a painter with a `progress` hook (FluxPainter) reports (done, total) during a job; the service takes the
-hook over and files the latest report under the job painting now (_paint names it). The GPU queue runs one job at
-a time, so that is the only job a report can come from.
+Progress: a painter with a `progress` hook (FluxPainter) reports (done, total) per pass, and with a `stage` hook names
+the work around the passes ("text", "image", "finishing"); the service takes both hooks over and files the latest
+report under the job painting now (_paint names it, and clears it when the job ends). The GPU queue runs one job
+at a time, so that is the only job a report can come from.
 """
 import logging
 import math
@@ -71,6 +72,10 @@ class _Built:
 
 def _thread(fn) -> None:
     threading.Thread(target=fn, name="roam-places", daemon=True).start()
+
+
+def _phase(name: str, done: int = 0, total: int = 0) -> dict:
+    return {"phase": name, "done": int(done), "total": int(total)}
 
 
 def _diff(a: float, b: float) -> float:
@@ -177,11 +182,14 @@ class RoamService:
         # The pre-dreamed set: these offsets from the player's heading, in queue order (a painter without its own:
         # Turbo's). A painter attribute, like its style, so it can't disagree with the painter actually in use.
         self._headings = tuple(float(h) for h in getattr(painter, "predream_headings", PREDREAM_HEADINGS["turbo"]))
-        # (job, {"done", "total"} or None): the job painting now (or last) and its latest report. Written only on
-        # the GPU worker, read anywhere: one immutable tuple, swapped whole.
+        # (job, {"phase", "done", "total"} or None): the job painting now and its latest report; None between
+        # jobs. Written only on the GPU worker, read anywhere: one immutable tuple, swapped whole.
         self._painting: tuple[object, dict | None] | None = None
-        if hasattr(painter, "progress"):
+        self._reports = hasattr(painter, "progress")   # a painter that says how far it got (FluxPainter)
+        if self._reports:
             painter.progress = self._painted
+        if hasattr(painter, "stage"):
+            painter.stage = self._staged
 
     # --- sessions -------------------------------------------------------------------
 
@@ -216,8 +224,9 @@ class RoamService:
         s = self.get(sid)
         with self._claim(s):
             prompt = [(self._text(place, OPEN_GROUND, moods), 1.0)]
-            job = self._await(s, object())
-            spot = self._run(s, lambda: self._paint(job, lambda: first_spot(self.painter, self.depth, prompt, s.seed)))
+            job = object()
+            spot = self._run(s, lambda: self._paint(job, lambda: first_spot(self.painter, self.depth, prompt, s.seed)),
+                             job)
             names = fallback_neighbours(place)[:MAX_NEIGHBOURS]
             journey = Journey(place, assign_bearings(names, None, random.Random(s.seed)))
             stats = palette_stats(spot.image)
@@ -253,7 +262,7 @@ class RoamService:
                 if built is None:
                     running = self._keep_running(s, exit_heading)
                     if running is not None:
-                        s.awaiting = (s.id, running[0])
+                        s.awaiting = ((s.id, running[0]), running[1])
             if running is not None:
                 # On the single worker a demand build would only start after this job anyway.
                 built, served = self._wait(s, running[1]), "waited"
@@ -268,8 +277,8 @@ class RoamService:
                 with self._lock:
                     self._set([], s.id)   # the queued set (and a pre-dream painting elsewhere) would only delay it
                     snap = self._snap(s)
-                    job = self._await(s, object())
-                built = self._run(s, lambda: self._build(snap, exit_heading, walked, job=job))
+                    job = object()
+                built = self._run(s, lambda: self._build(snap, exit_heading, walked, job=job), job)
             view = self._commit(s, built, exit_heading, hints, served)
             log.debug("next: %s, walked %s -> distance %.2f, scale %.2f", served, walked, view.distance, view.scale)
             return view
@@ -534,34 +543,43 @@ class RoamService:
     # --- painting progress ---------------------------------------------------------------
 
     def progress(self, sid: str) -> dict | None:
-        """How far the painter has got with the spot this session's player is waiting for, as {"done", "total"}
-        (the painter's own units: FLUX counts transformer passes), or None when that spot isn't painting (queued
-        behind other work, finished, or a painter that doesn't report). During a move, that spot is the job the move
-        waits on: the running pre-dream it took over, or its own build. Otherwise it is the spot the player would
-        get at the edge: the pre-dream nearest the way they face."""
+        """What the painter is doing for the spot this session's player waits for: {"phase", "done", "total"}, or
+        None when there is no such spot, it is finished, or the painter doesn't report (Turbo). Phases:
+        "waiting" (queued behind other GPU work), "starting", "text" (encoding the prompt), "image" (encoding the
+        view a step starts from), "painting" (done of total transformer passes), "finishing" (decode and depth).
+        During a move, that spot is the job the move waits on: the running pre-dream it took over, or its own
+        build. Otherwise it is the spot the player would get at the edge: the pre-dream nearest the way they face."""
         s = self.get(sid)
         with self._lock:
-            job = s.awaiting
-            if job is None and not s.busy and s.spot is not None:
+            awaited = s.awaiting
+            if awaited is None and not s.busy and s.spot is not None:
                 near = min(((_diff(e.heading, s.hint), k) for k, e in s.prefetch.items()
                             if self._current(s, e) and _diff(e.heading, s.hint) <= TAKE_WITHIN), default=None)
-                job = None if near is None else (s.id, near[1])
-        painting = self._painting
-        if job is None or painting is None or painting[0] != job:
+                awaited = None if near is None else ((s.id, near[1]), s.prefetch[near[1]].future)
+        if awaited is None or not self._reports:
             return None
-        return painting[1]
+        job, fut = awaited
+        if fut.done():
+            return None
+        painting = self._painting
+        if painting is not None and painting[0] == job and painting[1] is not None:
+            return dict(painting[1])
+        return _phase("starting" if fut.running() else "waiting")
 
     def _painted(self, done: int, total: int) -> None:
         """The painter's progress hook (GPU worker thread): file the report under the job painting now."""
         painting = self._painting
         if painting is not None:
-            self._painting = (painting[0], {"done": int(done), "total": int(total)})
+            self._painting = (painting[0], _phase("painting", done, total))
 
-    @staticmethod
-    def _await(s: RoamSession, job: object) -> object:
-        """The session's move now waits on `job` (cleared when the move ends). Caller holds the lock or the claim."""
-        s.awaiting = job
-        return job
+    def _staged(self, name: str) -> None:
+        """The painter's stage hook (GPU worker thread). "finishing" keeps the pass count it got to."""
+        painting = self._painting
+        if painting is not None:
+            last = painting[1] or {}
+            keep = name == "finishing"
+            self._painting = (painting[0], _phase(name, last.get("done", 0) if keep else 0,
+                                                  last.get("total", 0) if keep else 0))
 
     # --- places refill -------------------------------------------------------------------
 
@@ -606,24 +624,31 @@ class RoamService:
 
     # --- helpers ----------------------------------------------------------------------
 
-    def _run(self, s: RoamSession, fn):
-        """Run fn on the GPU queue at on-demand priority and wait for it (never under the lock)."""
+    def _run(self, s: RoamSession, fn, job: object = None):
+        """Run fn on the GPU queue at on-demand priority and wait for it (never under the lock). With `job`, the
+        session's move awaits it (see progress)."""
+        fut = self.queue.submit(fn, owner=s.id)
+        if job is not None:
+            with self._lock:
+                s.awaiting = (job, fut)
         try:
-            return self.queue.submit(fn, owner=s.id).result()
+            return fut.result()
         except CancelledError:
             raise UnknownSession(s.id) from None   # evicted while waiting
 
     def _paint(self, job: object, fn):
-        """Run fn (painting and depth, on the GPU worker) as the job `job`: the painter's progress until the next
-        job starts is this job's."""
+        """Run fn (painting and depth, on the GPU worker) as the job `job`: the painter's reports meanwhile are
+        this job's, and gone when it ends (finished, stopped or failed)."""
         import torch
 
-        self._painting = (job, None)
+        self._painting = (job, _phase("starting") if self._reports else None)
         oom = False
         try:
             return fn()
         except torch.cuda.OutOfMemoryError:
             oom = True
+        finally:
+            self._painting = None
         # Raised outside the except block, so the error doesn't chain the OOM's traceback, whose frames hold
         # the build's CUDA tensors, into the future that keeps it.
         if oom:

@@ -1331,18 +1331,18 @@ def test_progress_reported_while_building(make):
         svc.heading(s.id, 90)                     # turned: the pre-dream toward 90 paints
         first = p.waiting.get(timeout=5)
         # Walking toward the edge: the spot this player would get there is the pre-dream they face.
-        assert svc.progress(s.id) == {"done": p.last[0], "total": 8}
+        assert svc.progress(s.id) == {"phase": "painting", "done": p.last[0], "total": 8}
         assert svc.progress(other.id) is None     # another player's job is not their progress
         t = threading.Thread(target=lambda: out.append(svc.next(s.id, 270)))   # nothing that way: on demand
         t.start()
         wait_until(lambda: s.busy)
         # The move waits for its own build, queued behind the pre-dream it stopped (a fake that never checks
-        # in): nothing to show, whatever the stale pre-dream reports.
-        wait_until(lambda: svc.progress(s.id) is None)
+        # in): it says it is waiting, whatever the stale pre-dream reports.
+        wait_until(lambda: svc.progress(s.id) == {"phase": "waiting", "done": 0, "total": 0})
         assert p.waiting.empty()
         first.set()
         second = p.waiting.get(timeout=5)         # the demand build paints
-        assert svc.progress(s.id) == {"done": p.last[0], "total": 8}
+        assert svc.progress(s.id) == {"phase": "painting", "done": p.last[0], "total": 8}
         assert svc.progress(other.id) is None
         second.set()
         t.join(5)
@@ -1363,7 +1363,7 @@ def test_progress_follows_the_running_predream_a_move_waits_on(make):
     t.start()
     try:
         wait_until(lambda: s.busy)
-        assert svc.progress(s.id) == {"done": 1, "total": 8}
+        assert svc.progress(s.id) == {"phase": "painting", "done": 1, "total": 8}
         first.set()
         t.join(5)
         assert out and out[0].served == "waited"
@@ -1378,3 +1378,53 @@ def test_progress_is_none_without_a_progress_hook(svc):
     assert svc.progress(s.id) is None
     with pytest.raises(UnknownSession):
         svc.progress("nope")
+
+
+class StagePainter(FakePainter):
+    """Like FluxPainter: progress and stage hooks. A step runs .script (("stage", name) or ("pass", (done, total))),
+    blocking after each event on an Event put on .waiting."""
+
+    predream_headings = (0,)
+    script = (("stage", "text"), ("stage", "image"), ("pass", (1, 10)), ("pass", (2, 10)), ("stage", "finishing"))
+
+    def __init__(self):
+        super().__init__()
+        self.progress = self.stage = None
+        self.waiting: "queue.Queue[threading.Event]" = queue.Queue()
+
+    def step(self, *a, **kw):
+        for kind, arg in self.script:
+            self.stage(arg) if kind == "stage" else self.progress(*arg)
+            ev = threading.Event()
+            self.waiting.put(ev)
+            assert ev.wait(5)
+        return super().step(*a, **kw)
+
+
+def test_progress_names_each_phase_of_the_painting(make):
+    svc = make(painter=StagePainter())
+    p = svc.painter
+    s = started(svc)
+    seen = []
+    try:
+        for _ in StagePainter.script:
+            ev = p.waiting.get(timeout=5)
+            seen.append(svc.progress(s.id))
+            ev.set()
+        wait_set(s)
+    finally:
+        while not p.waiting.empty():
+            p.waiting.get().set()
+    assert seen == [{"phase": "text", "done": 0, "total": 0}, {"phase": "image", "done": 0, "total": 0},
+                    {"phase": "painting", "done": 1, "total": 10}, {"phase": "painting", "done": 2, "total": 10},
+                    {"phase": "finishing", "done": 2, "total": 10}]
+
+
+def test_a_finished_job_leaves_no_progress_behind(make):
+    svc = make(painter=ProgressPainter())
+    p = svc.painter
+    p.hold = False
+    s = started(svc)
+    wait_set(s)                                   # the pre-dream the player faces is done
+    assert svc.progress(s.id) is None
+    assert svc._painting is None

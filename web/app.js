@@ -285,15 +285,22 @@ function sendHint(now) {
 }
 
 // --- painting progress ----------------------------------------------------------
-// The server says how far the painter has got with the spot this page waits for ({done, total}, or {} when it isn't
-// painting: queued behind other work, or a painter that doesn't say). Shown in the fog, or under the intro while the
-// first spot paints.
+// The server says what the painter is doing for the spot this page waits for ({phase, done, total}, or {} for a
+// painter that doesn't say). Shown in the fog, or under the intro while the first spot paints.
 
 let polling = false;
 const waitingForSpot = () => starting || (started && fogged());
+const PHASES = {
+  waiting: () => "waiting for the painter…",
+  starting: () => "preparing…",
+  text: () => "preparing… (text encoding)",
+  image: () => "preparing… (reading the view)",
+  painting: p => `painting… ${p.done}/${p.total}`,
+  finishing: () => "finishing… (decoding, depth)",
+};
 
 function showProgress(p) {
-  const text = p && p.total > 0 ? `painting… ${p.done}/${p.total}` : "";
+  const text = p && PHASES[p.phase] ? PHASES[p.phase](p) : "";
   $("fog-progress").textContent = started ? text : "";
   $("start-progress").textContent = started ? "" : text;
 }
@@ -455,7 +462,7 @@ function play(dt, now) {
   world.tick(dt);
   sendHint(now);
   const fog = fogged();
-  if (fog && !wasFog) fogs.push({ t0: now, t1: null });
+  if (fog && !wasFog) { fogs.push({ t0: now, t1: null }); showProgress(null); }   // no count left from the last wait
   if (!fog && wasFog) fogs[fogs.length - 1].t1 = now;
   if (fogs.length > 200) fogs.shift();
   wasFog = fog;

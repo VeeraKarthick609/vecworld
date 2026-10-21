@@ -29,8 +29,9 @@ class UiPainter(FakePainter):
         super().__init__()
         self.fail_steps = False
         self.pano_delay = 0.0
-        self.progress = None            # the service's hook
+        self.progress = self.stage = None   # the service's hooks
         self.report = None              # (done, total) a blocked step reports
+        self.stage_name = None          # ... or the stage it is in
         self.gate, self.entered = threading.Event(), threading.Event()
         self.gate.set()
 
@@ -42,6 +43,8 @@ class UiPainter(FakePainter):
 
     def step(self, *a, **kw):
         if not self.gate.is_set():
+            if self.stage_name is not None:
+                self.stage(self.stage_name)
             if self.report is not None:
                 self.progress(*self.report)
             self.entered.set()
@@ -132,6 +135,7 @@ def server(tmp_path_factory):
 def healthy(server):
     _, _, painter = server
     painter.fail_steps, painter.fail_next, painter.pano_delay, painter.report = False, False, 0.0, None
+    painter.stage_name = None
     server[1].hide_next_image = False
     server[1].refuse_enter = False
     painter.gate.set()
@@ -354,6 +358,25 @@ def test_fog_shows_progress(server, browser):
     finally:
         key_up(browser, "w")
     wait(browser, f"!{FOG_TEXT}.includes('painting')", timeout=5)   # cleared for the next wait
+    assert js(browser, "window.roamErrors") == []
+
+
+def test_fog_names_the_phase_before_the_passes(server, browser):
+    url, _, painter = server
+    painter.gate.clear()                 # every step blocks while encoding its text (no pass counted yet)
+    painter.stage_name = "text"
+    start(browser, url)
+    first = js(browser, "roam.spotId")
+    browser.execute_script("roamDev.look(0, 0.18)")
+    key_down(browser, "w")
+    try:
+        assert painter.entered.wait(10)
+        wait(browser, "roam.fog && roam.braking", timeout=10)
+        wait(browser, f"{FOG_TEXT}.includes('preparing… (text encoding)')", timeout=5)
+        painter.gate.set()
+        wait(browser, f"roam.spotId !== {first!r} && !roam.fog")
+    finally:
+        key_up(browser, "w")
     assert js(browser, "window.roamErrors") == []
 
 

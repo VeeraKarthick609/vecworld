@@ -66,7 +66,7 @@ class RoamSession:
     places_for: str | None = None            # the place whose neighbours the LLM has answered (or failed) for
     refilling: str | None = None             # the place a places refill is running for
     busy: bool = False
-    awaiting: object = None                  # the GPU job the move in flight waits on (see RoamService.progress)
+    awaiting: tuple | None = None            # (job, its Future): what the move in flight waits on (see progress)
     last_used: float = 0.0
     files: list[tuple[Path, Path]] = field(default_factory=list)  # (jpg, png) per spot still on disk, oldest first
     visits: dict[str, Visit] = field(default_factory=dict)   # by spot id: the spots whose files are still on disk

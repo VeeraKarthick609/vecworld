@@ -57,30 +57,42 @@ def _read_gguf(path) -> dict:
     return out
 
 
-def _pin_in_place(modules) -> int:
-    """Page-lock the CPU parameters and buffers of modules where they already lie (cudaHostRegister); returns bytes.
+def _pin_in_place(modules) -> list[int]:
+    """Page-lock the CPU parameters and buffers of modules where they already lie (cudaHostRegister); returns the
+    registered pointers, which _unpin must release before the tensors are freed.
 
     diffusers' streamed group offload pins a second copy of each tensor (tensor.pin_memory()) and keeps the
     original until the first forward, so the 6.7 GB transformer briefly needs ~13.5 GB of RAM, and torch's pinned
     allocator rounds every block up to a power of two (8.8 GB held for 6.7). A tensor already pinned is returned
     as is by pin_memory(), so registering them first keeps one copy at its true size. Only modules whose CPU
-    tensors live as long as the process may be passed: a registered buffer freed and reused breaks later copies
-    (the offload group holding the transformer's non-block layers moves them with .to(), freeing the originals).
+    tensors live as long as the painter may be passed: a registered buffer freed and reused breaks later copies
+    ("CUDA error: invalid argument ... Copy is larger than memobj size"; the offload group holding the transformer's
+    non-block layers moves them with .to(), freeing the originals).
     """
     import torch
 
-    cudart, seen, total = torch.cuda.cudart(), set(), 0
+    cudart, seen, total = torch.cuda.cudart(), [], 0
     for t in [x for m in modules for x in (*m.parameters(), *m.buffers())]:
         st = t.untyped_storage()
         ptr, n = st.data_ptr(), st.nbytes()
         if t.device.type != "cpu" or n == 0 or ptr in seen or t.is_pinned():
             continue
-        seen.add(ptr)
         err = cudart.cudaHostRegister(ptr, n, 0)
         if int(err) != 0:
+            _unpin(seen)
             raise RuntimeError(f"cudaHostRegister failed ({err}) after locking {total / 1e9:.1f} GB")
+        seen.append(ptr)
         total += n
-    return total
+    return seen
+
+
+def _unpin(ptrs) -> None:
+    """Unregister host ranges _pin_in_place registered (cudaHostUnregister), while their tensors still live."""
+    import torch
+
+    cudart = torch.cuda.cudart()
+    for ptr in ptrs:
+        cudart.cudaHostUnregister(ptr)
 
 
 def _wrap_dist(w: int, at: float) -> np.ndarray:
@@ -101,8 +113,13 @@ class FluxPainter(Painter):
     """FLUX.1-schnell (Q4_K_S GGUF, bf16 compute) painting a PANO_W x PANO_H cylinder in wrapping windows.
 
     progress(done, total) is called after every transformer pass (one window batch at one step), total being
-    the passes the job will make; check_stop() runs before every pass and every VAE tile. A RoamService given this
-    painter takes the hook over to report each session's painting.
+    the passes the job will make; stage(name) names the work around them: "text" (T5 + CLIP, tens of seconds on a
+    cache miss), "image" (a step's VAE encode of the view it starts from), "finishing" (the VAE decode).
+    check_stop() runs before every pass and every VAE tile. A RoamService given this painter takes both hooks over
+    to report each session's painting.
+
+    The transformer's CPU weights are page-locked where they lie; close() (also run when the painter is freed)
+    releases them, after which the painter can't paint.
     """
 
     style = FLUX_STYLE
@@ -120,7 +137,7 @@ class FluxPainter(Painter):
         tr = FluxTransformer2DModel.from_single_file(
             _read_gguf(str(FLUX_GGUF)), quantization_config=GGUFQuantizationConfig(compute_dtype=bf16),
             torch_dtype=bf16, config=FLUX_BASE, subfolder="transformer")
-        _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
+        self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
         tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"), offload_type="block_level",
                                 num_blocks_per_group=1, use_stream=True)
         vae = AutoencoderKL.from_pretrained(FLUX_BASE, subfolder="vae", torch_dtype=bf16).to(dev)
@@ -137,12 +154,34 @@ class FluxPainter(Painter):
         self._torch = torch
         self.transformer, self.vae = transformer, vae
         self._encode_text, self.progress = encode_text, progress
+        self.stage: Callable[[str], None] | None = None
+        self._pinned: list[int] = getattr(self, "_pinned", [])
+        self._closed = False
         self._dev, self._dtype = dev, dtype
         self._sf, self._shift = vae.config.scaling_factor, vae.config.shift_factor
         self._lat_shape = (1, 16, PANO_H // 8, PANO_W // 8)
         i, j = torch.meshgrid(torch.arange(FLUX_WIN), torch.arange(FLUX_WIN), indexing="ij")
         self._img_ids = torch.stack([torch.zeros_like(i), i, j], -1).reshape(-1, 3).to(dev, dtype)
         self._txt_ids = torch.zeros(FLUX_TEXT_LEN, 3, device=dev, dtype=dtype)
+
+    def close(self) -> None:
+        """Unregister the page-locked weights (safe twice). The painter can't paint after it."""
+        self._closed = True
+        ptrs, self._pinned = getattr(self, "_pinned", []), []
+        if ptrs:
+            _unpin(ptrs)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - at interpreter exit CUDA may already be gone
+            pass
+
+    def _stage(self, name: str) -> None:
+        if self._closed:
+            raise RuntimeError("this FluxPainter is closed")
+        if self.stage is not None:
+            self.stage(name)
 
     # --- text ------------------------------------------------------------------------------------------
 
@@ -293,10 +332,12 @@ class FluxPainter(Painter):
 
     def panorama(self, base: Prompt, seed: int) -> Image.Image:
         with self._torch.inference_mode():
+            self._stage("text")
             e = self._embed(base)
             grid = self._noise(seed)
             n = len(windows(*grid.shape[-2:], FLUX_WIN, FLUX_STRIDE))
             out = self._denoise(grid, self._sigmas(FLUX_STEPS), [e] * n)
+            self._stage("finishing")
             return self._decode(out, shift=seed % VAE_TILE)
 
     def step(self, prev: Image.Image, base: Prompt, focus: Prompt | None, focus_at: float | None,
@@ -307,6 +348,7 @@ class FluxPainter(Painter):
         h, w = PANO_H // 16, PANO_W // 16
         m = np.zeros(w, np.float32) if focus_at is None else focus_mask(w, focus_at, half)
         with torch.inference_mode():
+            self._stage("text")
             e_base = self._embed(base)
             e_focus = self._embed(focus) if focus is not None else e_base
             wins = windows(h, w, FLUX_WIN, FLUX_STRIDE)
@@ -319,8 +361,10 @@ class FluxPainter(Painter):
             # Nothing to regenerate: every step before the first release is overwritten, so start there (img2img).
             start = 0 if m.any() else next(k for k, r in enumerate(rw) if (r < 1).any() or k == len(sig) - 1)
             shift = seed % VAE_TILE
+            self._stage("image")
             noise, orig = self._noise(seed), self._encode(prev, shift)
             s0 = sig[start]
             grid = (1 - s0) * orig + s0 * noise
             out = self._denoise(grid, sig[start:], embs, keep=(orig, noise, rw[start:]))
+            self._stage("finishing")
             return self._decode(out, shift)

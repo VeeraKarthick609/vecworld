@@ -15,7 +15,9 @@ BASE = [(f"a dirt path through a sunlit old forest clearing, open ground in the 
 def painter():
     from vecworld.flux.painter import FluxPainter
 
-    return FluxPainter()
+    p = FluxPainter()
+    yield p
+    p.close()     # unregister its page-locked host memory before it is freed (see test_flux_close_gpu)
 
 
 @pytest.fixture(scope="module")
