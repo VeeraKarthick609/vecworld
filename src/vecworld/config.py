@@ -89,17 +89,20 @@ FLUX_STEPS = 4
 # gate with FLUX_A16_KEEP below (docs/engine/04-w4a8.md). "mma" is the lossless W4A16 kernel (Task 5);
 # VECWORLD_KERNEL=off runs the diffusers path.
 FLUX_KERNEL = "w4a8"
-# Under w4a8, the linears (fnmatch patterns of module names) kept on "mma" (W4A16). The study (scripts/w4a8_study.py,
-# bench/t5b-study.json) ranked the text stream's MLP, the value projections and the text q / v projections worst;
-# with those kept the walk gate still failed (spot 1 seam 1.16, spot 3 1.14), so the ledger's suspects joined them:
-# the double blocks' MLP-out and attention-outs, and the first and last blocks of each kind. That walk passed (spot 1
-# 1.098 against the 1.1 limit; the lossless reference scores 1.082 there) with 70.3% of the token-facing FLOPs on INT8.
+# Under w4a8, the linears (fnmatch patterns of module names) kept on "mma" (W4A16); vecworld.engine.keep_for applies
+# them under w4a8 only. Chosen by the walk gate and an ablation (docs/engine/04-w4a8.md, "the gate"):
+#   - the study's (scripts/w4a8_study.py, bench/t5b-study.json) five worst families: the text stream's MLP, every
+#     value projection, the text q / v projections. Alone they failed the gate (spot 1 seam 1.16, spot 3 1.14), as did
+#     the study's next-worst 23 layers on top (1.19);
+#   - plus the double blocks' residual-stream outputs, MLP-out (ff.net.2) and both attention-outs: the walk passed
+#     (max seam 1.058). Without the attention-outs (1.24) or without ff.net.2 (1.22) it failed, and keeping the first
+#     and last blocks instead did not help (1.16). The study ranks these outputs only mid to least hurt per layer:
+#     the walk, not the per-layer error, picked them.
+# 75.0% of the token-facing FLOPs stay on INT8.
 FLUX_A16_KEEP: tuple[str, ...] = (
     "transformer_blocks.*.ff_context.net.0.proj", "transformer_blocks.*.ff_context.net.2", "*.attn.to_v",
     "transformer_blocks.*.attn.add_v_proj", "transformer_blocks.*.attn.add_q_proj",
     "transformer_blocks.*.ff.net.2", "transformer_blocks.*.attn.to_out.0", "transformer_blocks.*.attn.to_add_out",
-    "transformer_blocks.0.*", "transformer_blocks.18.*", "single_transformer_blocks.0.*",
-    "single_transformer_blocks.37.*",
 )
 FLUX_BATCH = 4             # windows per transformer pass (peak 1.4 GB allocated on AC; Task 6 re-batches)
 FLUX_BG_STRENGTH = 0.15    # a walk step releases its background at this sigma (0.25: SSIM 0.58 outside the focus, 0.15: 0.67)

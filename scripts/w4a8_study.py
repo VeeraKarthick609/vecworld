@@ -12,7 +12,7 @@ Per layer: relative L2 error of the output and its max-rel, the activations' max
 and max over tokens) and per channel (largest channel's max |x| over the median channel's), and its FLOPs per 512
 pass. Layers are ranked by relative L2 (the worse of the two contexts).
 
-  uv run python scripts/w4a8_study.py --out bench/t5b-study.json
+  VECWORLD_KERNEL=mma uv run python scripts/w4a8_study.py --out bench/t5b-study.json
   uv run python scripts/w4a8_study.py --share 'transformer_blocks.*.ff.net.2,single_transformer_blocks.*.proj_out'
 """
 import argparse
@@ -101,7 +101,7 @@ def run(out: Path):
     R = {}
     p, prompt, _ = bench.load_painter(R, mon)
     if p.kernel != "mma":
-        sys.exit(f"the study measures against W4A16: run it with VECWORLD_KERNEL unset or mma (got {p.kernel})")
+        sys.exit(f"the study measures against W4A16: run it with VECWORLD_KERNEL=mma (got {p.kernel})")
     ext = load_ext()
     names = {id(m): n for n, m in p.transformer.named_modules() if isinstance(m, Q4KLinear)}
     shapes = {n: (m.in_features, m.out_features) for n, m in p.transformer.named_modules() if isinstance(m, Q4KLinear)}

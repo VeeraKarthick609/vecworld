@@ -401,6 +401,73 @@ def test_kernel_defaults_to_w4a8(monkeypatch):
         engine_kernel()
 
 
+def test_keep_for_applies_the_keep_list_under_w4a8_only():
+    """vecworld.engine.keep_for: config.FLUX_A16_KEEP under w4a8, nothing under any other kernel (mma stays pure)."""
+    from vecworld.config import FLUX_A16_KEEP
+    from vecworld.engine import keep_for
+
+    assert keep_for("w4a8") == tuple(FLUX_A16_KEEP) and FLUX_A16_KEEP
+    assert keep_for("mma") == keep_for("tiled") == keep_for("naive") == keep_for(None) == ()
+
+
+class _Stop(Exception):
+    pass
+
+
+def test_painter_swaps_with_the_kernels_keep_list(monkeypatch):
+    """FluxPainter hands swap_linears keep_for(its kernel): FLUX_A16_KEEP under w4a8 (the default), nothing under mma
+    or tiled; and records it as painter.keep_a16 (walk_sheet writes it into each walk's timings.json)."""
+    import diffusers
+
+    import vecworld.engine.ext as ext_mod
+    import vecworld.engine.swap as swap_mod
+    import vecworld.flux.painter as painter_mod
+    from vecworld.config import FLUX_A16_KEEP
+
+    seen = []
+
+    def swap(tr, gg, kernel, keep_a16=()):
+        seen.append((kernel, tuple(keep_a16)))
+        raise _Stop                              # far enough: nothing after the swap is under test
+
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: "transformer")
+    monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
+    monkeypatch.setattr(swap_mod, "swap_linears", swap)
+    for value, want in ((None, ("w4a8", tuple(FLUX_A16_KEEP))), ("mma", ("mma", ())), ("tiled", ("tiled", ()))):
+        if value is None:
+            monkeypatch.delenv("VECWORLD_KERNEL", raising=False)
+        else:
+            monkeypatch.setenv("VECWORLD_KERNEL", value)
+        seen.clear()
+        with pytest.raises(_Stop):
+            FluxPainter()
+        assert seen == [want], value
+
+
+def test_keep_patterns_match_real_flux_linears():
+    """Every FLUX_A16_KEEP pattern names at least one linear of the real FLUX transformer (built on the meta device
+    from its config, no weights), and none of them a modulation linear. (swap_linears also raises on a pattern that
+    matches no Q4_K linear, so a typo can't silently keep nothing.)"""
+    import fnmatch
+
+    import torch
+    from diffusers import FluxTransformer2DModel
+
+    from vecworld.config import FLUX_A16_KEEP, FLUX_BASE
+
+    cfg = FluxTransformer2DModel.load_config(FLUX_BASE, subfolder="transformer", local_files_only=True)
+    with torch.device("meta"):
+        tr = FluxTransformer2DModel.from_config(cfg)
+    names = [n for n, m in tr.named_modules() if isinstance(m, torch.nn.Linear) and m.in_features % 256 == 0]
+    assert len(names) > 400
+    for p in FLUX_A16_KEEP:
+        hits = [n for n in names if fnmatch.fnmatchcase(n, p)]
+        assert hits, p
+        assert all("norm" not in n for n in hits) or p.endswith(".*"), p
+
+
 def test_a_broken_extension_build_fails_before_the_model_load(monkeypatch):
     """With an engine kernel (the default), FluxPainter builds/loads the CUDA extension first: a failure stops it at
     once, before the minute-long transformer load, and says how to paint without the engine."""

@@ -38,7 +38,8 @@ def _x(m, k, seed):
     return x.to("cuda", torch.bfloat16)
 
 
-@pytest.mark.parametrize("m, k", [(1, 3072), (7, 3072), (333, 12288), (1280, 15360)])
+# K = 16640 is past the 16384 values a block holds in registers: the two-pass path.
+@pytest.mark.parametrize("m, k", [(1, 3072), (7, 3072), (333, 12288), (1280, 15360), (5, 16640)])
 def test_quantize_act_matches_torch(m, k):
     from vecworld.engine.q4k import quantize_act
 
@@ -76,7 +77,7 @@ def _w4a8(w, m, seed, bias=True, tile=0):
     packed = torch.from_numpy(np.ascontiguousarray(w.data)).cuda()
     xq, s, xsum = quantize_act(x)
     out = load_ext().q4k_gemm_w4a8(xq, s, xsum, packed, b, tile_n=tile, out_fp32=True)
-    return out, fake_quant_ref(xq, s, w, b)
+    return out, fake_quant_ref(xq, s, w, b), b
 
 
 def _err(out, ref):
@@ -87,7 +88,7 @@ def _err(out, ref):
 @pytest.mark.parametrize("name, m", [(REAL[0], 256), (REAL[1], 256), (REAL[2], 256), (REAL[1], 1333),
                                      (REAL[2], 1280)])
 def test_w4a8_gemm_matches_fake_quant(gg, name, m, tile):
-    out, ref = _w4a8(gg[name], m, m, tile=tile)
+    out, ref, _ = _w4a8(gg[name], m, m, tile=tile)
     assert out.dtype == torch.float32 and out.shape == ref.shape
     err = _err(out, ref)
     print(f"\nw4a8 {tile or 'auto'} vs fake quant, {name} M={m}: max-rel {err:.2e}")
@@ -98,23 +99,23 @@ def test_w4a8_gemm_matches_fake_quant(gg, name, m, tile):
 @pytest.mark.parametrize("n", [1000, 1001])
 @pytest.mark.parametrize("m", [1, 7, 333, 1792])
 def test_w4a8_gemm_ragged(gg, m, n, tile):
-    """Review Focus 2: ragged M (tokens x windows), N no tile multiple and odd (with a bias tail), both tile shapes
-    forced and the launcher's pick; and Q4KLinear's bf16 output, leading dims kept, is the kernel's rounded."""
+    """Review Focus 2: ragged M (tokens x windows), N no tile multiple, even (the bf16 pair store) and odd (the bias
+    tail), with a bias, both tile shapes forced and the launcher's pick; and Q4KLinear's bf16 output, leading dims
+    kept, is the kernel's fp32 output rounded."""
     from vecworld.engine.q4k import SMALL_M, Q4KLinear
 
     t = rows(gg[REAL[0]], n)
-    out, ref = _w4a8(t, m, m, bias=n % 2 == 1, tile=tile)
+    out, ref, b = _w4a8(t, m, m, tile=tile)
     assert out.shape == (m, n)
     err = _err(out, ref)
     print(f"\nw4a8 {tile or 'auto'} M={m} N={n}: max-rel {err:.2e}")
     assert err < FAKE_QUANT_BAR
     if tile == 0:
         x = _x(m, t.shape[1], m)
-        y = Q4KLinear(t, None, "w4a8").cuda()(x.view(1, m, -1))
+        y = Q4KLinear(t, b.cpu(), "w4a8").cuda()(x.view(1, m, -1))
         assert y.shape == (1, m, n) and y.dtype == torch.bfloat16 and torch.isfinite(y).all()
         if m >= SMALL_M["w4a8"]:                    # below it the linear runs naive (M = 1 modulation linears)
-            out_nb, ref_nb = _w4a8(t, m, m, bias=False)
-            assert torch.equal(y[0], out_nb.to(torch.bfloat16))
+            assert torch.equal(y[0], out.to(torch.bfloat16))
 
 
 def test_w4a8_outlier_token(gg):
@@ -162,6 +163,29 @@ def test_w4a8_keep_a16(gg):
     m2.lin = torch.nn.Linear(3072, 64, dtype=torch.bfloat16)
     assert swap_linears(m2, {"lin.weight": table[f"{names[0]}.weight"]}, "w4a8") == 1   # default: keep nothing
     assert m2.lin.kernel == "w4a8"
+    m3 = torch.nn.Module()
+    m3.lin = torch.nn.Linear(3072, 64, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"blocks\.\*\.ff\.net\.3"):           # a typo keeps nothing: refused
+        swap_linears(m3, {"lin.weight": table[f"{names[0]}.weight"]}, "w4a8", keep_a16=("blocks.*.ff.net.3",))
+    assert type(m3.lin) is torch.nn.Linear                                     # nothing swapped
+
+
+def test_w4a8_nonfinite_token(gg):
+    """An inf or NaN in a token makes that token's outputs NaN (as on the bf16 paths), not clamped finite numbers,
+    and leaves every other token bit-identical."""
+    from vecworld.engine.q4k import Q4KLinear, quantize_act
+
+    lin = Q4KLinear(rows(gg[REAL[0]], 1000), None, "w4a8").cuda()
+    x = _x(64, 3072, 9)
+    ref = lin(x)
+    for bad in (float("inf"), float("nan")):
+        xb = x.clone()
+        xb[10, 5] = bad
+        _, s, _ = quantize_act(xb)
+        y = lin(xb)
+        assert torch.isnan(s[10]) and torch.isnan(y[10]).all(), bad
+        keep = torch.arange(64, device="cuda") != 10
+        assert torch.equal(y[keep], ref[keep])
 
 
 def test_w4a8_misaligned(gg):

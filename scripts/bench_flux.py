@@ -113,9 +113,9 @@ def load_transformer():
         str(FLUX_GGUF), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
         torch_dtype=torch.bfloat16, config=FLUX_BASE, subfolder="transformer")
     if kernel is not None:
-        from vecworld.config import FLUX_A16_KEEP
+        from vecworld.engine import keep_for
         from vecworld.engine.swap import gguf_linears, swap_linears
-        swap_linears(tr, gguf_linears(tr), kernel, keep_a16=FLUX_A16_KEEP if kernel == "w4a8" else ())
+        swap_linears(tr, gguf_linears(tr), kernel, keep_a16=keep_for(kernel))
     return tr, str(FLUX_GGUF)
 
 
@@ -308,55 +308,54 @@ GEMM_SHAPES = [(1024, 3072, 9216), (1024, 3072, 3072), (1024, 3072, 12288), (102
 
 
 def do_gemm(R, mon):
-    """Per GEMM_SHAPES entry, on a real Q4_K weight of that shape (the first in the GGUF): Q4KLinear on "mma" (W4A16)
-    and on "w4a8" (its quantize_act included; w4a8_gemm_ms is the INT8 GEMM alone, on x quantized beforehand), against
-    torch.matmul on the same weight dequantized to bf16 beforehand: the median of 20 timed calls after warm-up, two
-    rounds each, run alternately, and the better round kept. TFLOP/s are bf16-equivalent (2 M K N / time), whatever
-    the number format. VECWORLD_KERNEL doesn't change what is timed (both engine kernels always are)."""
+    """Per GEMM_SHAPES entry: VECWORLD_KERNEL's TFLOP/s on a real Q4_K weight of that shape (the first in the GGUF;
+    Q4KLinear's own dispatch; the "ours_*" fields, as in bench/t5-gemm.json) against torch.matmul on the same weight
+    dequantized to bf16 beforehand: the median of 20 timed calls after warm-up, two rounds each, run alternately, and
+    the better round kept. A W4A8 column is always added (Q4KLinear "w4a8", its quantize_act included; quantize_ms
+    alone), so --what gemm under VECWORLD_KERNEL=mma compares the two. TFLOP/s are bf16-equivalent (2 M K N / time)."""
     import gguf
     import numpy as np
     import torch
     from vecworld.config import FLUX_GGUF
-    from vecworld.engine.ext import load_ext
     from vecworld.engine.q4k import Q4KLinear, quantize_act, read_gguf
+    from vecworld.engine import engine_kernel
+    kernel = engine_kernel()
     tensors = read_gguf(FLUX_GGUF)
-    ext = load_ext()
     R["bf16_peak_tflops"] = bf16_peak()
     rows = []
     for M, K, N in GEMM_SHAPES:
         t = next(t for t in tensors.values() if t.type == gguf.GGMLQuantizationType.Q4_K and t.shape == (N, K))
-        mma, w8 = Q4KLinear(t, None, "mma").cuda(), Q4KLinear(t, None, "w4a8").cuda()
+        lin, w8 = Q4KLinear(t, None, kernel).cuda(), Q4KLinear(t, None, "w4a8").cuda()
         wd = torch.from_numpy(gguf.quants.dequantize(np.asarray(t.data), t.type).reshape(N, K)).to("cuda", torch.bfloat16)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, generator=torch.Generator("cuda").manual_seed(0))
-        fns = {"mma": lambda: mma(x), "w4a8": lambda: w8(x), "matmul": lambda: x @ wd.T,
-               "quantize": lambda: quantize_act(x)}
+        fns = {"ours": lambda: lin(x), "matmul": lambda: x @ wd.T, "w4a8": lambda: w8(x), "quantize": lambda: quantize_act(x)}
         with torch.inference_mode():
-            q = quantize_act(x)
-            fns["w4a8_gemm"] = lambda: ext.q4k_gemm_w4a8(*q, w8.qweight)
             ms = {k: bench(f, 20) for k, f in fns.items()}
             ms = {k: min(v, bench(fns[k], 20)) for k, v in ms.items()}
         f = 2 * M * K * N
-        row = dict(m=M, k=K, n=N, weight=t.name, **{f"{k}_ms": round(v, 3) for k, v in ms.items()})
-        for k in ("mma", "w4a8", "w4a8_gemm", "matmul"):
-            row[f"{k}_tflops"] = round(f / ms[k] / 1e9, 2)
-        row["mma_pct_of_matmul"] = round(100 * ms["matmul"] / ms["mma"], 1)
-        row["w4a8_pct_of_matmul"] = round(100 * ms["matmul"] / ms["w4a8"], 1)
-        row["w4a8_speedup_over_mma"] = round(ms["mma"] / ms["w4a8"], 2)
+        row = dict(m=M, k=K, n=N, weight=t.name, ours_ms=round(ms["ours"], 3), matmul_ms=round(ms["matmul"], 3),
+                   ours_tflops=round(f / ms["ours"] / 1e9, 2), matmul_tflops=round(f / ms["matmul"] / 1e9, 2),
+                   pct_of_matmul=round(100 * ms["matmul"] / ms["ours"], 1),
+                   w4a8_ms=round(ms["w4a8"], 3), quantize_ms=round(ms["quantize"], 3),
+                   w4a8_tflops=round(f / ms["w4a8"] / 1e9, 2),
+                   w4a8_pct_of_matmul=round(100 * ms["matmul"] / ms["w4a8"], 1),
+                   w4a8_over_ours=round(ms["ours"] / ms["w4a8"], 2))
         rows.append(row)
-        print(f"M={M:5d} K={K:5d} N={N:5d}  mma {row['mma_tflops']:6.2f}  w4a8 {row['w4a8_tflops']:6.2f} "
-              f"(gemm {row['w4a8_gemm_tflops']:6.2f}, quantize {ms['quantize']:.3f} ms)  matmul "
-              f"{row['matmul_tflops']:6.2f}  w4a8/mma {row['w4a8_speedup_over_mma']:.2f}x", flush=True)
-        del mma, w8, wd, q
+        print(f"M={M:5d} K={K:5d} N={N:5d}  {kernel} {row['ours_tflops']:6.2f}  matmul {row['matmul_tflops']:6.2f}  "
+              f"{row['pct_of_matmul']:5.1f}%   w4a8 {row['w4a8_tflops']:6.2f} (quantize {row['quantize_ms']:.3f} ms) "
+              f"{row['w4a8_over_ours']:.2f}x", flush=True)
+        del lin, w8, wd
         torch.cuda.empty_cache()
     R["shapes"] = rows
     for name, sel in (("m1024_1280", lambda r: r["m"] != 256), ("m256", lambda r: r["m"] == 256)):
         rs = [r for r in rows if sel(r)]
-        for k in ("mma", "w4a8"):
-            R[f"{name}_{k}_pct_of_matmul_min"] = min(r[f"{k}_pct_of_matmul"] for r in rs)
-            # aggregate: matmul's total time over ours across the shapes (the FLOP-weighted rate ratio)
-            R[f"{name}_{k}_pct_of_matmul_overall"] = round(100 * sum(r["matmul_ms"] for r in rs)
-                                                           / sum(r[f"{k}_ms"] for r in rs), 1)
-        R[f"{name}_w4a8_speedup_over_mma_overall"] = round(sum(r["mma_ms"] for r in rs) / sum(r["w4a8_ms"] for r in rs), 2)
+        R[f"{name}_pct_of_matmul_min"] = min(r["pct_of_matmul"] for r in rs)
+        # aggregate: matmul's total time over ours across the shapes (the FLOP-weighted rate ratio)
+        R[f"{name}_pct_of_matmul_overall"] = round(100 * sum(r["matmul_ms"] for r in rs) / sum(r["ours_ms"] for r in rs), 1)
+        R[f"{name}_w4a8_pct_of_matmul_min"] = min(r["w4a8_pct_of_matmul"] for r in rs)
+        R[f"{name}_w4a8_pct_of_matmul_overall"] = round(100 * sum(r["matmul_ms"] for r in rs)
+                                                        / sum(r["w4a8_ms"] for r in rs), 1)
+        R[f"{name}_w4a8_over_ours_overall"] = round(sum(r["ours_ms"] for r in rs) / sum(r["w4a8_ms"] for r in rs), 2)
 
 
 def add_engine_fields(R):

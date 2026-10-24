@@ -7,7 +7,8 @@
 A walk calls first_spot / next_spot exactly as RoamService.start and RoamService._build do (the same prompts,
 fallback neighbours, journey drift, colour reference and seeds), with no browser, server or GPU queue. headings[i]
 is the world bearing spot i is reached by (headings[0] is the first spot's, 0). It writes spot{i}.png, prev{i}.png
-(the dollied view each step started from), sheet.png and timings.json into --out.
+(the dollied view each step started from), sheet.png and timings.json into --out; timings.json also records the
+engine kernel, the linears kept on mma (FLUX_A16_KEEP under w4a8) and the git sha the walk ran.
 
 Each spot gets a seam score (seam_profile: the strongest full-height step in local detail between the columns
 either side of one column). A walk whose spot scores above --max-seam exits 1; --check re-scores walks already
@@ -227,6 +228,19 @@ def main(argv=None):
         sys.exit("seams above %.2f: %s" % (a.max_seam, "; ".join(bad)))
 
 
+def _git() -> str:
+    """HEAD's short sha, "-dirty" with uncommitted tracked changes: which code a walk ran."""
+    import subprocess
+
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT,
+                               capture_output=True, text=True).stdout.strip()
+        return sha.strip() + ("-dirty" if dirty else "")
+    except OSError:
+        return "unknown"
+
+
 def run(painter, depth, recipe, theme, seed, headings, walked, out: Path) -> dict:
     """One walk into `out` (spot/prev images, sheet.png, timings.json); returns the timings record."""
     if recipe is not None:
@@ -239,6 +253,8 @@ def run(painter, depth, recipe, theme, seed, headings, walked, out: Path) -> dic
     for i, p in enumerate(w["prevs"], 1):
         p.save(out / f"prev{i}.png")
     info = {"recipe": recipe, "theme": theme, "seed": seed, "headings": headings, "walked": walked,
+            "kernel": getattr(painter, "kernel", None), "keep_a16": list(getattr(painter, "keep_a16", ())),
+            "git": _git(),
             "spot_s": [round(x, 2) for x in w["spot_s"]], "paint_s": [round(x, 2) for x in w["paint_s"]],
             "distance": [round(s.distance, 3) for s in w["spots"]], "scale": [round(s.scale, 3) for s in w["spots"]],
             "prompts": [[[t, round(x, 3)] for t, x in p] for p in w["prompts"]]}

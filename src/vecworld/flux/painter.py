@@ -25,13 +25,13 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 
-from vecworld.config import (FLUX_A16_KEEP, FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
+from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
                              FLUX_GGUF, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
                              FLUX_STYLE, FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
-from vecworld.engine import engine_kernel, load_engine_ext
+from vecworld.engine import engine_kernel, keep_for, load_engine_ext
 
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
 
@@ -138,7 +138,7 @@ class FluxPainter(Painter):
 
     VECWORLD_KERNEL (read at construction, see vecworld.engine.engine_kernel(); unset: config.FLUX_KERNEL, "w4a8" with
     config.FLUX_A16_KEEP on "mma"; "off": diffusers) names the engine kernel the transformer's Q4_K linears run on;
-    self.kernel records it (None: diffusers).
+    self.kernel records it (None: diffusers), self.keep_a16 the patterns kept on mma (vecworld.engine.keep_for).
     """
 
     style = FLUX_STYLE
@@ -164,8 +164,8 @@ class FluxPainter(Painter):
             # they are pinned in place and streamed like the parameters they replace.
             from vecworld.engine.swap import gguf_linears, swap_linears
 
-            keep = FLUX_A16_KEEP if self.kernel == "w4a8" else ()     # W4A8's per-layer policy only
-            self.swapped = swap_linears(tr, gguf_linears(tr), self.kernel, keep_a16=keep)
+            self.keep_a16 = keep_for(self.kernel)
+            self.swapped = swap_linears(tr, gguf_linears(tr), self.kernel, keep_a16=self.keep_a16)
         self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
         tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"), offload_type="block_level",
                                 num_blocks_per_group=1, use_stream=True)
@@ -187,6 +187,7 @@ class FluxPainter(Painter):
         self.recipe = FLUX_STEP_RECIPE
         self._pinned: list[int] = getattr(self, "_pinned", [])
         self.kernel: str | None = getattr(self, "kernel", None)
+        self.keep_a16: tuple[str, ...] = getattr(self, "keep_a16", ())   # the linears kept on mma (keep_for)
         self._closed = False
         self._dev, self._dtype = dev, dtype
         self._sf, self._shift = vae.config.scaling_factor, vae.config.shift_factor

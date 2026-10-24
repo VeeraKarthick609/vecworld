@@ -24,6 +24,15 @@ def engine_kernel() -> str | None:
     return name
 
 
+def keep_for(kernel: str | None) -> tuple[str, ...]:
+    """The linears (fnmatch patterns of module names, for swap_linears' keep_a16) that stay on "mma" under `kernel`:
+    config.FLUX_A16_KEEP under "w4a8" (W4A8's per-layer policy, docs/engine/04-w4a8.md), nothing under any other
+    kernel, so VECWORLD_KERNEL=mma / tiled / naive stay pure. The one rule for the painter and the bench."""
+    from vecworld.config import FLUX_A16_KEEP
+
+    return tuple(FLUX_A16_KEEP) if kernel == "w4a8" else ()
+
+
 def load_engine_ext():
     """ext.load_ext(), with a hint on failure: the first call in a process may compile the extension (CUDA 13.4
     toolkit, ninja), and the painter calls this before its minute-long model load so a broken build fails at once."""

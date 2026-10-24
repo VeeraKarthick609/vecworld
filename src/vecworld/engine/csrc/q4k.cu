@@ -713,15 +713,15 @@ __global__ void __launch_bounds__((BM / WM) * (BN / WN) * 32, MIN_BLOCKS)
 // torch.round), clamped to +-127; a zero token gets s = 0, xq = 0. xsum[m, j] = sum of xq over sub-block j (32
 // values = 4 consecutive 8-value chunks, held by 4 neighbouring lanes). A row of up to QT * QREG * 8 = 16384 values
 // (every FLUX linear) is read once into registers; a longer one is read twice.
+// max|x| is taken on the bf16 bit patterns of |x| (an integer max): the same value for finite x, but an inf or NaN
+// wins instead of being dropped (fmaxf drops NaN). Such a token gets s = NaN and xq = 0, so its outputs come out NaN,
+// as on the bf16 paths, rather than as quietly clamped numbers.
 constexpr int QT = 256, QREG = 8;
 
-__device__ __forceinline__ float amax8(uint4 v, float amax) {
+__device__ __forceinline__ uint32_t amax8(uint4 v, uint32_t amax) {
     const uint32_t u[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u[e]));
-        amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
-    }
+    for (int e = 0; e < 4; ++e) amax = max(amax, max(u[e] & 0x7FFFu, (u[e] >> 16) & 0x7FFFu));
     return amax;
 }
 
@@ -756,7 +756,7 @@ __global__ void __launch_bounds__(QT) quantize_kernel(const __nv_bfloat16* __res
     const int chunks = K / 8;
     const bool regs = chunks <= QT * QREG;
     uint4 v[QREG];
-    float amax = 0.f;
+    uint32_t amax = 0;                           // bf16 bits of max |x|
     if (regs) {
 #pragma unroll
         for (int i = 0; i < QREG; ++i) {
@@ -768,14 +768,14 @@ __global__ void __launch_bounds__(QT) quantize_kernel(const __nv_bfloat16* __res
         for (int c = tid; c < chunks; c += QT) amax = amax8(xr[c], amax);
     }
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o));
-    __shared__ float red[QT / 32];
+    for (int o = 16; o > 0; o >>= 1) amax = max(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o));
+    __shared__ uint32_t red[QT / 32];
     if ((tid & 31) == 0) red[tid >> 5] = amax;
     __syncthreads();
     amax = red[0];
 #pragma unroll
-    for (int i = 1; i < QT / 32; ++i) amax = fmaxf(amax, red[i]);
-    const float s = __fdiv_rn(amax, 127.f);
+    for (int i = 1; i < QT / 32; ++i) amax = max(amax, red[i]);
+    const float s = amax >= 0x7F80u ? __int_as_float(0x7FC00000) : __fdiv_rn(__uint_as_float(amax << 16), 127.f);
     if (tid == 0) s_out[m] = s;
     int8_t* qr = xq + int64_t(m) * K;
     int* sr = xsum + int64_t(m) * (K / 32);

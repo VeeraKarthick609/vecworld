@@ -52,7 +52,8 @@ def _packed(weight: GGUFTensor) -> torch.Tensor:
 def quantize_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """W4A8's activation side, one kernel: x bf16 [M, K] -> (xq int8 [M, K], s fp32 [M], xsum int32 [M, K // 32]).
     Per token s = max|x_t| / 127 and xq = round(x_t / s) (half to even); xsum is the sum of xq over each 32-wide
-    sub-block, for the dmin * m_j term (docs/engine/04-w4a8.md). A zero token gets s = 0, xq = 0."""
+    sub-block, for the dmin * m_j term (docs/engine/04-w4a8.md). A zero token gets s = 0, xq = 0; a token
+    holding an inf or NaN gets s = NaN (xq = 0), so its outputs come out NaN."""
     from vecworld.engine.ext import load_ext
 
     return tuple(load_ext().q4k_quantize_act(x))

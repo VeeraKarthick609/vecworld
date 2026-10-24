@@ -34,7 +34,8 @@ def swap_linears(model: torch.nn.Module, gguf: dict[str, GGUFTensor], kernel: st
     linears were replaced.
 
     keep_a16: fnmatch patterns of module names (e.g. "transformer_blocks.*.ff.net.2") whose linears run on "mma"
-    (W4A16) instead of `kernel`: W4A8's per-layer policy, config.FLUX_A16_KEEP (docs/engine/04-w4a8.md)."""
+    (W4A16) instead of `kernel`: W4A8's per-layer policy, config.FLUX_A16_KEEP (docs/engine/04-w4a8.md). A pattern
+    that matches none of the linears being replaced raises ValueError (a typo would silently keep nothing)."""
     todo = []
     for name, mod in model.named_modules():
         if not isinstance(mod, torch.nn.Linear):
@@ -44,6 +45,9 @@ def swap_linears(model: torch.nn.Module, gguf: dict[str, GGUFTensor], kernel: st
                 or tuple(t.shape) != (mod.out_features, mod.in_features) or mod.in_features % QK_K):
             continue
         todo.append((name, mod, t))
+    unmatched = [p for p in keep_a16 if not any(fnmatchcase(name, p) for name, _, _ in todo)]
+    if unmatched:
+        raise ValueError(f"keep_a16 patterns match no Q4_K linear: {', '.join(unmatched)}")
     for name, mod, t in todo:
         parent, _, child = name.rpartition(".")
         k = "mma" if any(fnmatchcase(name, p) for p in keep_a16) else kernel
