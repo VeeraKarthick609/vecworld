@@ -107,6 +107,21 @@ The full report is in the session scratchpad (`flux-spike/report.md`); its scrip
 - **Step by step (the user's decision).** The build **pauses after each engine piece** (each kernel stage counts as a piece). Claude walks the user through the piece and its before/after numbers, and the next piece starts only after that walkthrough. The plan's milestones are cut at these checkpoints.
 - **Toolchain detail.** nvcc on PATH is 12.4, but torch is cu130. Build the extension with `CUDA_HOME=/usr/local/cuda-13.4`.
 
+### 7.2 Goal B (2026-10-24)
+
+The user's decisions after the Task 2b walk and the learning ledger's step breakdown (`docs/engine/learning-ledger.md`, Part 2):
+
+- **Decision 1 = B, speed first.** The engine's goal shifts to ops/sec: step time and achieved TFLOP/s. W4A8 on the INT8 tensor cores, glue fusion, CUDA graphs and block caching come into scope. This supersedes W4A8 as a non-goal (§4) and as a later fallback (§7.1, "When the kernel is done"). Measured, visible quality losses are accepted as long as the quality gate below passes.
+- **Decision 2: `sharp` stays the walk-step recipe.** `FLUX_STEP_RECIPE` defaults to `"sharp"` (graded release, side 0.75, back 0.9, focus 1.0, feather 0.25), no longer provisional.
+- **Success metric.** For every engine task: step time and achieved TFLOP/s, measured with `scripts/bench_flux.py` on AC against `bench/baseline.json`.
+  - Step = one transformer pass over one 512×512 window with 256 text tokens (N = 1024 + 256 = 1280), `--what tile512`. Baseline: **2.74 s**.
+  - Achieved TFLOP/s = the step's FLOPs by the exact count (ledger §1.6: 17.7 TFLOP at N = 1280) ÷ step time. Baseline: **6.45 TFLOP/s, 34%** of the measured 19.1 TFLOP/s bf16 peak. Once W4A8 or block skipping is in, the count stays nominal and the number is labelled bf16-equivalent.
+  - Each engine task adds a row to `bench/` and to `docs/engine/speed.md`.
+- **Target: a step from ~2.74 s to ~1 s before block caching**, then block caching on top. This **supersedes §7.1's walk-step target of about 90 s on AC**; walk-step wall time is still reported with every bench row.
+- **Quality gate.** After W4A8 (plan Task 5b), glue fusion (Task 6) and block caching (Task 8), a 6-spot walk with the `sharp` recipe must still pass `scripts/walk_sheet.py --check` (no spot above the seam limit 1.1), and the user judges its contact sheet at the checkpoint. Lossless pieces still match the diffusers reference (§5); W4A8 and block caching are judged by this gate instead.
+- **Order** (plan Tasks 3–10): fused Q4_K naive → tiled → tensor-core bf16 `mma` (W4A16) → W4A8 → M=1 modulation GEMV → glue fusion → CUDA graphs → block caching → window batching → layer streamer + io_uring loader + T5 on the engine.
+- **Step by step.** A user walkthrough follows every engine task from Task 3 on, except the final one.
+
 ## 8. Left to the builder
 
 - Module layout (for example `vecworld/engine/` with `csrc/`).
