@@ -1,6 +1,7 @@
 """The hand-written Q4_K kernels against gguf-py's dequant + torch.matmul, on the real FLUX tensors (gpu; run
 with the game server stopped)."""
 import gc
+import re
 
 import numpy as np
 import pytest
@@ -75,7 +76,7 @@ def test_q4k_gemm_matches_reference(gg, name, kernel):
 
 
 @pytest.mark.parametrize("kernel", KERNELS)
-@pytest.mark.parametrize("m", [1, 7, 333, 1792])
+@pytest.mark.parametrize("m", [1, 7, 32, 333, 1792])
 def test_q4k_gemm_ragged(gg, m, kernel):
     """Ragged M (tokens x windows) and an out_features that is no tile multiple (1000), with leading dims."""
     from vecworld.engine.q4k import Q4KLinear
@@ -91,6 +92,44 @@ def test_q4k_gemm_ragged(gg, m, kernel):
     assert torch.isfinite(out).all()
 
 
+@pytest.mark.parametrize("kernel", KERNELS)
+@pytest.mark.parametrize("m", [7, 333])
+def test_q4k_gemm_odd_n(gg, m, kernel):
+    """out_features 1001 (not a multiple of 4): the tiled epilogue's per-element store and bias tail, on both
+    kernels, against x @ deq(W)^T + bias."""
+    from vecworld.engine.q4k import Q4KLinear
+
+    t = rows(gg[REAL[0]], 1001)
+    g = torch.Generator().manual_seed(m)
+    x = torch.randn(m, t.shape[1], generator=g).to("cuda", torch.bfloat16)
+    bias = (torch.randn(1001, generator=g) * 0.1).to("cuda", torch.bfloat16)
+    out = Q4KLinear(t, bias, kernel).cuda()(x)
+    ref = x.float() @ deq(t).cuda().T + bias.float()
+    assert out.shape == (m, 1001)
+    assert rel_err(out, ref) < 2e-2
+
+
+def test_q4k_tiled_small_m_runs_naive(gg, monkeypatch):
+    """Q4KLinear on "tiled" sends M < TILED_MIN_M (the M = 1 modulation linears) to the naive kernel, and M >= it to
+    the tiled one. (The raw tiled kernel is checked at small M in test_q4k_gemm_matches_naive.)"""
+    import vecworld.engine.ext as ext_mod
+    from vecworld.engine.q4k import TILED_MIN_M, Q4KLinear
+
+    real, calls = ext_mod.load_ext(), []
+
+    class Spy:
+        def __getattr__(self, name):
+            calls.append(name)
+            return getattr(real, name)
+
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: Spy())
+    lin = Q4KLinear(rows(gg[REAL[0]], 64), None, "tiled").cuda()
+    for m in (1, TILED_MIN_M - 1, TILED_MIN_M, 1280):
+        lin(torch.randn(m, 3072, device="cuda", dtype=torch.bfloat16))
+    assert TILED_MIN_M == 32
+    assert calls == ["q4k_gemm_naive", "q4k_gemm_naive", "q4k_gemm_tiled", "q4k_gemm_tiled"]
+
+
 # Every later stage against the naive reference directly, on the same real weights. Both decode each weight
 # bit-exactly and sum in fp32; only the summation order differs, so the bf16 outputs agree to about one bf16 step of
 # the largest output (2^-8 = 3.9e-3 relative to it). A decode or indexing bug is orders of magnitude above this bar.
@@ -101,7 +140,7 @@ NAIVE_BAR = 8e-3
 @pytest.mark.parametrize("name, m, n", [(REAL[0], 256, None), (REAL[1], 256, None), (REAL[2], 256, None),
                                         (REAL[0], 1, 1000), (REAL[0], 7, 1000), (REAL[0], 333, 1000),
                                         (REAL[0], 1792, 1000), (REAL[0], 31, 1000), (REAL[0], 128, 1000),
-                                        (REAL[0], 129, 1000)])
+                                        (REAL[0], 129, 1000), (REAL[0], 7, 1001), (REAL[0], 333, 1001)])
 def test_q4k_gemm_matches_naive(gg, name, m, n, kernel):
     from vecworld.engine.ext import load_ext
 
@@ -122,8 +161,9 @@ def test_q4k_gemm_matches_naive(gg, name, m, n, kernel):
 @pytest.mark.parametrize("kernel", KERNELS)
 def test_q4k_gemm_misaligned(gg, kernel):
     """The kernels read x and the packed weight with 16-byte vector loads. The extension rejects a view whose base
-    address is not 16-byte aligned (instead of a misaligned-address fault or a silent wrong read); Q4KLinear copies
-    such a view to an aligned buffer and computes the right answer."""
+    address is not 16-byte aligned (instead of a misaligned-address fault or a silent wrong read). Q4KLinear copies a
+    misaligned activation and computes the right answer, but raises on a misaligned packed weight, naming it: a
+    weight layout that breaks alignment must fail loudly, not cost a weight-sized copy on every call."""
     from vecworld.engine.ext import load_ext
     from vecworld.engine.q4k import Q4KLinear
 
@@ -141,9 +181,11 @@ def test_q4k_gemm_misaligned(gg, kernel):
     with pytest.raises(RuntimeError, match="aligned"):
         gemm(x, wm)
     lin = Q4KLinear(t, None, kernel).cuda()
-    lin.qweight.data = wm
     ref = x.float() @ deq(t).cuda().T
-    assert rel_err(lin(xm), ref) < 2e-2
+    assert rel_err(lin(xm), ref) < 2e-2              # a misaligned activation is copied once, then computed
+    lin.qweight.data = wm
+    with pytest.raises(RuntimeError, match=re.escape(t.name) + ".*aligned"):   # an error, never copied
+        lin(x)
 
 
 def test_swap_skips_non_q4k(gg):

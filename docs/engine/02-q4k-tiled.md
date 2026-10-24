@@ -60,9 +60,10 @@ memory for 64 FMAs, and loads each value from VRAM into shared memory only once 
   per FMA).
 - **Each weight byte fetched once.** A Q4_K run of 32 bytes holds two sub-blocks, the low nibbles and the high
   nibbles. The kernel loads the run into registers once and decodes it twice, once for each of two K steps.
-- **Coalescing.** The loads are 16-byte vectors. On x, a thread reads 64 contiguous bytes of its row, in four loads.
-  On W, two threads read the 32 bytes of a run. Each 32-byte sector a warp touches gets used in full, half by one
-  instruction and half by the next one, which hits L1. Weight rows are 1.7 to 8.6 KB apart, so a warp can't read
+- **Coalescing.** The loads are 16-byte vectors. On x, each row's 64 bytes per K step are read by 2 threads, each
+  making 2 loads of 16 bytes (pieces c and c + 2 of the row's four; a warp's load covers 32 rows, one piece each). On
+  W, two threads read the 32 bytes of a run. A warp's load uses half of each 32-byte sector it touches; the other
+  half is read by a neighbouring load (the next piece, or the other half of the run), usually from L1. Weight rows are 1.7 to 8.6 KB apart, so a warp can't read
   one long contiguous stretch of W without a re-layout of the weights. That re-layout is a Task 5 question. The
   alternative mapping for x, 4 lanes per row so a warp reads 512 contiguous bytes, measured the same (see below).
 - **No bank conflicts.** Consecutive lanes store consecutive m (or n), so a warp's stores hit 32 different banks. The
@@ -80,8 +81,11 @@ memory for 64 FMAs, and loads each value from VRAM into shared memory only once 
   naive. `Q4KLinear` sends M < 32 (`TILED_MIN_M`) to the naive kernel. The measured crossover is M = 24 to 32. The
   extension's `q4k_gemm_tiled` itself always tiles, and the tests check it at M = 1 and 7 too.
 - **Alignment.** Both kernels read with vector loads, so the extension now rejects a misaligned x or weight view
-  (`TORCH_CHECK`, 16 bytes). `Q4KLinear` copies such a view to an aligned buffer first. `test_q4k_gemm_misaligned`
-  covers both. Fresh CUDA allocations are always aligned, so the copy never happens in the painter.
+  (`TORCH_CHECK`, 16 bytes). `Q4KLinear` copies a misaligned *activation* (a fresh copy of an x that
+  is already made per call; fresh CUDA allocations are aligned, so it fires only for exotic views). It raises,
+  naming the layer, on a misaligned packed *weight*: a weight layout that breaks alignment is a bug to fix where the
+  layout is made, not something to pay a weight-sized copy for on every call. `test_q4k_gemm_misaligned` covers
+  both.
 
 ## Choosing the tile shape (measured)
 
@@ -105,7 +109,7 @@ stopped. The range is over five shapes: 3072 -> 3072, 3072 -> 12288, 3072 -> 184
 | 128 x 128, 2 blocks per SM (register cap 128), plain order | 3.5 .. 5.5 |
 | 128 x 128, 2 blocks per SM, GROUP_M = 4 | 4.6 .. 5.7 |
 | **128 x 128, 8 x 8, 256, 2 blocks per SM, GROUP_M = 2 (chosen)** | **5.2 .. 5.6** |
-| for scale: cuBLAS fp32 SGEMM, 4096^3, TF32 off (the CUDA-core ceiling in practice) | 5.3 |
+| for scale: cuBLAS fp32 SGEMM, 4096^3, TF32 off, measured (not the fp32 peak, which is ~8 TFLOP/s: 2560 cores x 2 x ~1.6 GHz sustained) | 5.3 |
 
 So the tiled kernel runs a Q4_K GEMM about as fast as cuBLAS runs a plain fp32 GEMM on the same CUDA cores, and
 6 to 7x faster than the naive kernel. It is still far from the 19.1 TFLOP/s of the bf16 tensor cores: that gap is
@@ -119,10 +123,10 @@ and after each run), with the game server stopped. The benches ran on this task'
 
 | | Reference (diffusers) | Naive (Task 3) | **Tiled (Task 4)** |
 |---|---|---|---|
-| Step: one 512 window pass (`tile512.s_per_pass_median`) | 2.79 s (baseline 2.74 s) | 22.98 s | **3.77 s** |
-| Achieved TFLOP/s (17.67 TFLOP per pass) | 6.33 (baseline 6.45) | 0.77 | **4.69** |
-| % of the measured 19.1 TFLOP/s bf16 peak | 33% (baseline 34%) | 4.0% | **24.5%** |
-| Walk step (`step.s`, `sharp`, 40 window passes) | 61.4 s | 945.1 s | **156.3 s** (3.91 s per window pass, 4.52 TFLOP/s) |
+| Step: one 512 window pass (`tile512.s_per_pass_median`) | 2.74 s baseline (Task 1 painter: 2.79 s) | 22.98 s | **3.77 s** |
+| Achieved TFLOP/s (17.67 TFLOP per pass) | 6.45 baseline (Task 1 painter: 6.33) | 0.77 | **4.69** |
+| % of the measured 19.1 TFLOP/s bf16 peak | 34% baseline (Task 1 painter: 33%) | 4.0% | **24.5%** |
+| Walk step (`step.s`, `sharp`, 40 window passes) | 61.4 s (Task 1 painter) | 945.1 s | **156.3 s** (3.91 s per window pass, 4.52 TFLOP/s) |
 | Resident step, weights on the GPU (`blocks.512x512.resident_step_s`) | 2.59 s | 21.25 s | **3.58 s** (4.94 TFLOP/s) |
 | ... of which dequant | 1.08 s (42%) | 0.00 s | **0.00 s** (no bf16 weight is ever written) |
 | ... of which attention (SDPA) | 0.06 s | 0.07 s | 0.07 s |
@@ -135,9 +139,10 @@ Files: `bench/t4-tiled.json` (tile512), `bench/t4-tiled-step.json` (walk step) a
 **What the numbers say.** The tiled kernel is **6.1x faster than the naive one** per step (22.98 -> 3.77 s), and
 the dequant share is gone: 0.00 s, against the reference's 1.08 s. The step is still **1.38x slower than the
 reference** (3.77 against 2.74 s), as the brief expected. The reference spends 1.08 s unpacking weights but then
-runs its GEMMs on tensor cores at up to 19 TFLOP/s. This kernel unpacks for free but does its GEMMs on CUDA cores,
-whose practical ceiling is about 5.3 TFLOP/s (cuBLAS's own fp32 SGEMM). At 4.7 to 5.1 TFLOP/s on the whole pass it
-sits close to that ceiling, so further CUDA-core tuning can't close the gap. Tensor cores (Task 5) can: the same
+runs its GEMMs on tensor cores at up to 19 TFLOP/s. This kernel unpacks for free but does its GEMMs on CUDA cores.
+Their fp32 peak is about 8 TFLOP/s; cuBLAS's own fp32 SGEMM measured 5.3 TFLOP/s here. At 4.7 to 5.1 TFLOP/s on the
+whole pass this kernel is close to what cuBLAS gets from the same cores, so further CUDA-core tuning could win
+perhaps 10 to 30% but is unlikely to close the 1.38x gap. Tensor cores (Task 5) can: the same
 GEMM work at even half the bf16 peak would take about 1.8 s.
 
 A double and a single block do about the same FLOPs (about 113M weights each, over 1280 tokens). On CUDA cores they
@@ -152,8 +157,10 @@ plus a direct check against the naive kernel:
 | Gate | Bar | Naive | Tiled |
 |---|---|---|---|
 | Dequant bit-exact vs gguf-py (shared decode) | `torch.equal` | yes | yes (the same `decode`) |
-| GEMM vs `x @ deq(W)^T` on 3 real tensors, and ragged M = 1, 7, 333, 1792 with N = 1000 | max-rel < 2e-2 | pass | pass |
-| **Tiled vs naive** directly (`test_q4k_gemm_matches_naive`): 3 real tensors at M = 256, and N = 1000 at M = 1, 7, 31, 128, 129, 333, 1792, calling the raw kernels | max-rel < 8e-3 (one bf16 step of the largest output) | - | 5.7e-4 .. 3.5e-3 |
+| GEMM vs `x @ deq(W)^T` on 3 real tensors, and ragged M = 1, 7, 32, 333, 1792 with N = 1000 | max-rel < 2e-2 | pass | pass |
+| Odd N = 1001 with bias (tiled's per-element epilogue), M = 7 and 333, `test_q4k_gemm_odd_n` | max-rel < 2e-2 | pass | pass |
+| `Q4KLinear("tiled")` picks naive at M = 1 and 31, tiled at M = 32 and 1280, `test_q4k_tiled_small_m_runs_naive` | exact call list | - | pass |
+| **Tiled vs naive** directly (`test_q4k_gemm_matches_naive`): 3 real tensors at M = 256, and N = 1000 at M = 1, 7, 31, 128, 129, 333, 1792 and N = 1001 at M = 7, 333, calling the raw kernels | max-rel < 8e-3 (one bf16 step of the largest output) | - | 5.7e-4 .. 3.5e-3 |
 | One block (double 0, single 0) vs diffusers, primary | max-rel < 2e-2 | 8.3e-3 / 5.5e-3 | 8.3e-3 / 5.5e-3 |
 | One whole forward pass vs diffusers | rel L2 < 0.06 | 4.18% (max-rel 0.127) | 4.72% (max-rel 0.162) |
 | 4-step picture at seed 0 vs diffusers | PSNR >= 28 dB | 29.87 dB | 29.05 dB |
@@ -165,6 +172,6 @@ Task 3). By eye the picture is the same forest, path, light shafts and ferns; it
 ## What to read next
 
 - Task 5 (`mma`): feed the decoded bf16 fragments to `mma.sync.m16n8k16` instead of fp32 FMAs. The tensor cores
-  do 16 x 8 x 16 multiply-adds per instruction, and the 3050 Ti's bf16 peak is 19.1 TFLOP/s against about 5.3 here.
+  do 16 x 8 x 16 multiply-adds per instruction, and the 3050 Ti's bf16 peak is 19.1 TFLOP/s, against ~8 fp32 on CUDA cores (5.3 measured for cuBLAS SGEMM).
   The tiling, decode-once and prefetch in this kernel carry over; the inner loop changes.
 - `docs/engine/speed.md`: the running table.

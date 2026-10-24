@@ -43,10 +43,11 @@ def _packed(weight: GGUFTensor) -> torch.Tensor:
     return t
 
 
-def _aligned(t: torch.Tensor) -> torch.Tensor:
-    """t, or an aligned copy of it: the kernels read x and the packed weight with 16-byte vector loads. Fresh CUDA
-    allocations are always aligned; only a view that starts mid-allocation needs the copy."""
-    return t if t.data_ptr() % 16 == 0 else t.clone()
+def _aligned_activation(x: torch.Tensor) -> torch.Tensor:
+    """x, or an aligned copy of it: the kernels read x with 16-byte vector loads. x is an activation, made fresh each
+    call, and fresh CUDA allocations are always aligned; only an exotic view that starts mid-allocation gets copied,
+    which costs one activation-sized copy. (A misaligned packed *weight* is never copied: see Q4KLinear.forward.)"""
+    return x if x.data_ptr() % 16 == 0 else x.clone()
 
 
 class Q4KLinear(torch.nn.Module):
@@ -68,6 +69,7 @@ class Q4KLinear(torch.nn.Module):
         if bias is not None and tuple(bias.shape) != (self.out_features,):
             raise ValueError(f"{weight.name}: bias {tuple(bias.shape)} for {self.out_features} outputs")
         self.kernel = kernel
+        self.weight_name = weight.name
         self.qweight = torch.nn.Parameter(_packed(weight), requires_grad=False)
         self.bias = None if bias is None else torch.nn.Parameter(bias.detach(), requires_grad=False)
 
@@ -75,10 +77,15 @@ class Q4KLinear(torch.nn.Module):
         from vecworld.engine.ext import load_ext
 
         lead = x.shape[:-1]
-        x2 = _aligned(x.reshape(-1, self.in_features).to(torch.bfloat16).contiguous())
+        x2 = _aligned_activation(x.reshape(-1, self.in_features).to(torch.bfloat16).contiguous())
         b = None if self.bias is None else self.bias.to(torch.bfloat16).contiguous()
         kernel = "naive" if self.kernel == "tiled" and x2.shape[0] < TILED_MIN_M else self.kernel
-        y = getattr(load_ext(), f"q4k_gemm_{kernel}")(x2, _aligned(self.qweight), b)
+        if self.qweight.data_ptr() % 16:
+            # Loud on purpose: a misaligned weight means whatever laid it out (e.g. a slot buffer carving views) is
+            # wrong. Copying it here would hide that behind a weight-sized copy on every call.
+            raise RuntimeError(f"Q4KLinear {self.weight_name}: the packed weight must be 16-byte aligned (vector "
+                               f"loads); its address is {self.qweight.data_ptr() % 16} bytes off")
+        y = getattr(load_ext(), f"q4k_gemm_{kernel}")(x2, self.qweight, b)
         return y.reshape(*lead, self.out_features)
 
     def extra_repr(self) -> str:
