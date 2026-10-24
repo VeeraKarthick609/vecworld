@@ -14,7 +14,7 @@ walk step's wall time (not gated).
 | 3: fused Q4_K, naive (correctness reference) | `--painter engine`, `VECWORLD_KERNEL=naive` | 22.98 | 0.77 | 4.0 | 945.1 | 1.02 / 1.33 | lossless: block max-rel 8.3e-3 (< 2e-2), forward rel L2 4.2% (< 6%), picture 29.87 dB (>= 28) | 6f01119-dirty (this task's diff, before commit) |
 | 4: fused Q4_K, tiled (shared memory, CUDA cores) | `--painter engine`, `VECWORLD_KERNEL=tiled` | 3.77 | 4.69 | 24.5 | 156.3 | 1.02 / 1.33 | lossless: block max-rel 8.3e-3 (< 2e-2), forward rel L2 4.7% (< 6%), picture 29.05 dB (>= 28); vs naive max-rel <= 3.5e-3. M < 32 linears (the M = 1 modulation layers, ~1% of the pass) run the naive kernel | 49f56bb-dirty (this task's diff, before commit) |
 | 5: fused Q4_K, tensor cores (bf16 `mma.sync`, W4A16) | `--painter engine`, `VECWORLD_KERNEL=mma` (unset = mma; `off` = diffusers) | **1.40** | **12.62** | **66.1** | 57.4 | 1.02 / 1.33 | lossless: block max-rel 8.3e-3 (< 2e-2), forward rel L2 4.4% (< 6%), picture 29.37 dB (>= 28); vs naive max-rel <= 6.3e-3. GEMM 90.6-93.4% of torch.matmul at M = 1024/1280, 92-105% at M = 256 (`bench/t5-gemm.json`). M < 7 linears run naive | 075df02-dirty (this task's diff, before commit) |
-| 5b: W4A8, per-token INT8 activations on the INT8 tensor cores (`mma.sync` s8), 70.3% of token-facing FLOPs; **the default** | `--painter engine`, `VECWORLD_KERNEL=w4a8` (unset = w4a8 with `FLUX_A16_KEEP` on mma; `mma` = W4A16; `off` = diffusers) | **1.17** | **15.10** (bf16-equivalent) | **79.0** | 49.4 | 1.02 / 1.33 | lossy, judged by the walk gate: `--check` passes (max seam 1.098 at spot 1, limit 1.1; Task 5 mma 1.080, diffusers 1.082) with the 12-pattern `FLUX_A16_KEEP` (attempt 3 of 3; all-INT8 1.25 and the study's worst families 1.16 failed). Same-seed 512 image vs mma 24.91 dB PSNR (recorded, not gated). GEMM 1.47-1.74x mma, 143-156% of torch.matmul bf16 (`bench/t5b-w4a8-gemm.json`) | bd179b8-dirty (this task's diff, before commit) |
+| 5b: W4A8, per-token INT8 activations on the INT8 tensor cores (`mma.sync` s8), 75.0% of token-facing FLOPs; **the default** | `--painter engine`, `VECWORLD_KERNEL=w4a8` (unset = w4a8 with `FLUX_A16_KEEP` on mma; `mma` = W4A16; `off` = diffusers) | **1.15** | **15.37** (bf16-equivalent) | **80.4** | 48.9 | 1.02 / 1.33 | lossy, judged by the walk gate: two walks at a2bdb67 pass `--check`, bit-identical (max seam 1.058 at spot 1, limit 1.1; Task 5 mma 1.080, diffusers 1.082) with the 8-pattern `FLUX_A16_KEEP` chosen by ablation (the study's 5 worst families + the double blocks' MLP-out and attention-outs; 8 lists walked, see 04-w4a8.md). Same-seed 512 image vs mma 25.22 dB PSNR (recorded, not gated). GEMM 1.45-1.72x mma, 135-156% of torch.matmul bf16 (`bench/t5b-w4a8-gemm.json`) | a2bdb67 (tile512; step and gemm a2bdb67-dirty: a rewritten bench JSON only) |
 
 Task 3 is the correctness reference, **8.2x slower** than the baseline step: CUDA cores, one thread per output, no
 reuse. See `docs/engine/01-q4k-naive.md`.
@@ -31,8 +31,9 @@ windows per pass, which already spread the reference's dequant. Since Task 5 the
 default (`VECWORLD_KERNEL=off` for diffusers). See `docs/engine/03-q4k-mma.md`.
 
 Task 5b quantizes each linear's input per token to INT8 and runs the Q4_K codes on the INT8 tensor cores
-(`mma.m16n8k32`, one instruction = one Q4_K sub-block): the GEMM runs 1.5-1.7x faster than `mma` (~27 bf16-equivalent
-TFLOP/s against ~17), and the step drops **1.40 -> 1.17 s** (the GEMM from ~0.98 to ~0.73 s per pass, est.). It is
+(`mma.m16n8k32`, one instruction = one Q4_K sub-block): the GEMM runs ~1.5x faster than `mma` (~25 bf16-equivalent
+TFLOP/s against ~17), and the step drops **1.40 -> 1.15 s** (the GEMM from ~0.99 to ~0.74 s per pass, est.). It is
 lossy, so the walk gate admits it, not a match to the reference: with every linear on INT8 a borderline fog edge
-(spot 1) crossed the seam limit, so 12 families stay on `mma` (`config.FLUX_A16_KEEP`), 29.7% of the token-facing
-FLOPs. The walk step drops 57.4 -> 49.4 s. See `docs/engine/04-w4a8.md`.
+(spot 1) crossed the seam limit. An ablation over 8 keep-lists found the pass needs the study's 5 worst families plus
+the double blocks' residual-stream outputs (MLP-out and attention-outs) on `mma` (`config.FLUX_A16_KEEP`), 25% of the
+token-facing FLOPs. The walk step drops 57.4 -> 48.9 s. See `docs/engine/04-w4a8.md`.

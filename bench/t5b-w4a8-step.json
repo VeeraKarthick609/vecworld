@@ -1,32 +1,32 @@
 {
  "power": "ac",
- "git": "bd179b8-dirty",
+ "git": "a2bdb67-dirty",
  "results": {
   "what": "step",
   "painter": "engine",
   "kernel": "w4a8",
   "gpu_power": "90.00 4 8",
-  "load_s": 11.9,
+  "load_s": 12.0,
   "rss_after_setup_gb": 7.62,
-  "t5_encode_cold_s": 6.3,
+  "t5_encode_cold_s": 6.47,
   "mon_t5": {
-   "rss_gb": 8.2,
+   "rss_gb": 8.19,
    "smi_mib": 1296
   },
   "step": {
-   "s": 49.4,
+   "s": 48.9,
    "passes": 10,
-   "s_per_pass_median": 4.76,
+   "s_per_pass_median": 4.69,
    "peak_alloc_gb": 1.33,
    "rss_gb": 8.67,
    "smi_mib": 1710,
    "window_passes": 40,
-   "s_per_window_pass": 1.23,
+   "s_per_window_pass": 1.22,
    "flop_per_step": 17672448245760,
-   "achieved_tflops": 14.37,
-   "pct_bf16_peak": 75.2
+   "achieved_tflops": 14.49,
+   "pct_bf16_peak": 75.8
   },
-  "wall_s": 106.2,
+  "wall_s": 105.5,
   "gpu_power_end": "90.00 4 8"
  }
 }
