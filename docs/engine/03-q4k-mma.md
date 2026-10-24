@@ -94,7 +94,7 @@ are no bank conflicts.
 - **Tile order:** blocks go in groups of 4 M tiles walking along N, as in Task 4, so blocks running at the same time
   share x and W in L2. With 2 blocks per SM the group size made no measurable difference (2, 4, 8, 16 within 1%).
 - **Few tiles:** when the 128 x 128 grid has fewer than 4 waves (8 x 20 SMs = 160 tiles), the launcher uses 128 x 64
-  tiles (4 warps, 3 blocks per SM) so the last wave doesn't leave SMs idle. In FLUX that is the M = 256 text-stream
+  tiles (4 warps, 2 blocks per SM: 2 x 38 KB of shared memory) so the last wave doesn't leave SMs idle. In FLUX that is the M = 256 text-stream
   linears with N = 3072 or 9216.
 - **Ragged edges:** rows past M or N are zero-filled by `cp.async` (src-size 0). A zero header decodes to d = dmin = 0,
   so those weights are 0. The epilogue stores pairs where both are inside N, single values otherwise.
@@ -177,7 +177,7 @@ the limit was measured by ablation instead:
 | the same, no decode (timing only, wrong results) | 96 .. 110 |
 | **128 x 128, 128 x 16 warps (1 x 8: each weight decoded once), 2 stages, 2 per SM (chosen)** | **90 .. 99** |
 | the same, no decode (timing only) | 96 .. 104 |
-| 128 x 64, 128 x 16 warps, 2 stages, 3 per SM (chosen when < 160 tiles) | 86 .. 95 (M = 256: 91 .. 105) |
+| 128 x 64, 128 x 16 warps, 2 stages, 2 per SM (chosen when < 160 tiles) | 86 .. 95 (M = 256: 91 .. 105) |
 | 128 x 64, 3 stages | 71 .. 77 (3 x 57 KB of shared memory: only 1 block fits per SM) |
 
 The lesson: on this GPU, **two resident blocks per SM** mattered more than pipeline depth or tile size. The rest
@@ -229,17 +229,24 @@ The same gates as Tasks 3 and 4, parametrized over the kernel (`tests/test_q4k.p
 |---|---|---|---|---|
 | Dequant bit-exact vs gguf-py (GGUF layout, no repacking) | `torch.equal` | yes | yes | yes (same layout; the fragment decode uses the same two roundings) |
 | GEMM vs `x @ deq(W)^T`: 3 real tensors (M = 256, bias), ragged M = 1, 7, 32, 333, 1792 with N = 1000, N = 1001 with bias at M = 7, 333 | max-rel < 2e-2 | pass | pass | pass |
-| **mma vs naive** directly (`test_q4k_gemm_matches_naive`, raw kernels): 3 real tensors at M = 256; N = 1000 at M = 1, 7, 31, 128, 129, 333, 1792; N = 1001 at M = 7, 333 | max-rel < 8e-3 | - | 5.7e-4 .. 3.5e-3 | **2.9e-3 .. 6.3e-3** |
+| **mma vs naive** directly (`test_q4k_gemm_matches_naive`, raw kernels): 3 real tensors at M = 256; N = 1000 at M = 1, 7, 31, 128, 129, 333, 1792; N = 1001 at M = 7, 333; and above the 160-tile threshold (auto picks 128 x 128) M = 1333 on N = 3072 and 3001 | max-rel < 8e-3 | - | 5.7e-4 .. 3.5e-3 | **2.9e-3 .. 6.3e-3** |
 | Small M goes to naive (`test_q4k_mma_small_m_runs_naive`: naive at M = 1, 6; mma at 7, 1280) | exact call list | - | - | pass |
+| **mma vs x @ bf16(deq W)** exactly, both tiles forced + auto, ragged M up to 1333, N = 1000 / 1001 / 3001 (`test_q4k_mma_matches_bf16_weights`) | excess over half a bf16 step < 1e-4 of max | - | - | 4.7e-7 .. 1.7e-5 |
+| Both tiles forced vs naive on the same cases (`test_q4k_mma_tiles_match_naive`) | max-rel < 8e-3 | - | - | 2.9e-3 .. 6.3e-3 |
 | Misaligned x copied, misaligned packed weight raises naming the module (`test_q4k_gemm_misaligned`) | as Task 4 | pass | pass | pass |
 | One block (double 0, single 0) vs diffusers, primary | max-rel < 2e-2 | 8.3e-3 / 5.5e-3 | 8.3e-3 / 5.5e-3 | **8.30e-3 / 5.49e-3** |
 | One whole forward pass vs diffusers | rel L2 < 0.06 | 4.18% | 4.72% | **4.36%** (max-rel 0.129) |
 | 4-step picture at seed 0 vs diffusers | PSNR >= 28 dB | 29.87 dB | 29.05 dB | **29.37 dB** |
 | Default kernel (`test_kernel_defaults_to_mma`): unset or empty -> mma, `off` / `reference` -> diffusers | exact | | | pass |
 
-mma vs naive is a little looser than tiled vs naive: the tensor cores take bf16 inputs, so each decoded weight is
-rounded to bf16 (diffusers' path rounds its weights to bf16 too). It is still under one bf16 step of the largest
-output. By eye, the picture sheet shows the same forest, path, light shafts and ferns as the reference; the
+mma vs naive is looser than tiled vs naive: the tensor cores take bf16 inputs, so each decoded weight is rounded
+to bf16 (diffusers' path rounds its weights to bf16 too). That costs up to about 1.6 bf16 steps of the largest output
+(6.3e-3 against the 8e-3 bar). So mma is also held to the arithmetic it is meant to do. `test_q4k_mma_matches_bf16_weights`
+compares it with x times the bf16-rounded gguf weight computed exactly (fp64). Each output may differ by half a bf16
+step (y's own rounding), and what is left over must stay under 1e-4 of the largest output: measured 4.7e-7 to 1.7e-5.
+`test_q4k_mma_tiles_match_naive` forces each tile shape (128 x 128 and 128 x 64) on the same ragged cases, up to
+M = 1333 x N = 3001 (264 tiles), and `test_q4k_mma_tile_choice` checks which one the launcher picks. The two shapes
+give bit-identical outputs: every output sums its K terms in the same order. By eye, the picture sheet shows the same forest, path, light shafts and ferns as the reference; the
 difference image is fine needle and fern texture only.
 
 ## What to read next

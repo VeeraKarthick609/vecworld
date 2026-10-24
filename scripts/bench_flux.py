@@ -1,6 +1,6 @@
 """FLUX bench harness. --painter reference benches the game's FluxPainter (diffusers + GGUF + group offload);
---painter engine benches the same painter with the engine flags (VECWORLD_KERNEL=mma, ...) taken from the
-environment (the painter's default kernel is mma; --painter reference sets VECWORLD_KERNEL=off). Engine results
+--painter engine benches the same painter with the engine flags taken from the environment (VECWORLD_KERNEL unset
+is mma, as for the painter; --painter reference sets VECWORLD_KERNEL=off). Engine results
 also carry the step's FLOP count, achieved TFLOP/s and % of the measured bf16 peak.
 
   uv run python scripts/bench_flux.py --painter reference --what pano --out bench/x.json
@@ -102,16 +102,19 @@ def bench(fn, n=5):
 
 
 def load_transformer():
-    """The bare transformer; with VECWORLD_KERNEL naming a kernel (--painter engine), its Q4_K linears on it."""
+    """The bare transformer, its Q4_K linears on the kernel VECWORLD_KERNEL resolves to (vecworld.engine.engine_kernel,
+    the painter's own rule: unset is mma, "off" leaves diffusers)."""
     import torch
     from diffusers import FluxTransformer2DModel, GGUFQuantizationConfig
     from vecworld.config import FLUX_BASE, FLUX_GGUF
+    from vecworld.engine import engine_kernel
+    kernel = engine_kernel()
     tr = FluxTransformer2DModel.from_single_file(
         str(FLUX_GGUF), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
         torch_dtype=torch.bfloat16, config=FLUX_BASE, subfolder="transformer")
-    if os.environ.get("VECWORLD_KERNEL", "off") not in ("off", "reference"):
+    if kernel is not None:
         from vecworld.engine.swap import gguf_linears, swap_linears
-        swap_linears(tr, gguf_linears(tr), os.environ["VECWORLD_KERNEL"])
+        swap_linears(tr, gguf_linears(tr), kernel)
     return tr, str(FLUX_GGUF)
 
 
@@ -312,7 +315,8 @@ def do_gemm(R, mon):
     import torch
     from vecworld.config import FLUX_GGUF
     from vecworld.engine.q4k import Q4KLinear, read_gguf
-    kernel = os.environ["VECWORLD_KERNEL"]
+    from vecworld.engine import engine_kernel
+    kernel = engine_kernel()
     tensors = read_gguf(FLUX_GGUF)
     R["bf16_peak_tflops"] = bf16_peak()
     rows = []
@@ -363,8 +367,9 @@ def main():
     ap.add_argument("--what", choices=list(WHATS), required=True)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    if a.painter == "engine" and os.environ.get("VECWORLD_KERNEL", "off") in ("off", "reference"):
-        sys.exit("--painter engine needs its flags: set VECWORLD_KERNEL (e.g. mma)")
+    from vecworld.engine import engine_kernel
+    if a.painter == "engine" and engine_kernel() is None:
+        sys.exit("--painter engine with VECWORLD_KERNEL=off is the reference: unset it (mma) or name a kernel")
     if a.what == "gemm" and a.painter != "engine":
         sys.exit("--what gemm times an engine kernel: use --painter engine")
     if a.painter == "reference":
@@ -374,7 +379,7 @@ def main():
         sys.exit("on battery: speed numbers are invalid; plug in and rerun")
     import torch
     mon = Mon()
-    R = {"what": a.what, "painter": a.painter, "kernel": os.environ.get("VECWORLD_KERNEL"), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
+    R = {"what": a.what, "painter": a.painter, "kernel": engine_kernel(), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
     t0 = time.time()
     WHATS[a.what](R, mon)
     R["wall_s"] = round(time.time() - t0, 1)

@@ -44,3 +44,24 @@ def test_gemm_bench_covers_the_flux_linear_shapes():
     assert bench.GEMM_SHAPES == ([(1024, k, n) for k, n in four] + [(256, k, n) for k, n in four]
                                  + [(1280, 3072, 21504), (1280, 15360, 3072)])
     assert bench.WHATS["gemm"] is bench.do_gemm
+
+
+def test_load_transformer_resolves_the_kernel_as_the_painter_does(monkeypatch):
+    """bench_flux.load_transformer uses vecworld.engine.engine_kernel: unset VECWORLD_KERNEL swaps in mma (as the
+    painter does), "off" leaves diffusers' linears, a name picks that kernel."""
+    import diffusers
+
+    import vecworld.engine.swap as swap_mod
+
+    swapped = []
+    monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: "transformer")
+    monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
+    monkeypatch.setattr(swap_mod, "swap_linears", lambda tr, gg, kernel: swapped.append(kernel))
+    for value, want in ((None, ["mma"]), ("off", []), ("reference", []), ("tiled", ["tiled"])):
+        swapped.clear()
+        if value is None:
+            monkeypatch.delenv("VECWORLD_KERNEL", raising=False)
+        else:
+            monkeypatch.setenv("VECWORLD_KERNEL", value)
+        assert bench.load_transformer()[0] == "transformer"
+        assert swapped == want, value

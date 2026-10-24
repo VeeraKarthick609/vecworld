@@ -155,8 +155,9 @@ def test_q4k_mma_small_m_runs_naive(gg, monkeypatch):
 # Every later stage against the naive reference directly, on the same real weights. Both decode each weight
 # bit-exactly and sum in fp32; only the summation order differs, so the bf16 outputs agree to about one bf16 step of
 # the largest output (2^-8 = 3.9e-3 relative to it). A decode or indexing bug is orders of magnitude above this bar.
-# "mma" also rounds each decoded weight to bf16 (the tensor cores' input type, as diffusers' path does): measured
-# 2.9e-3 .. 6.3e-3 against naive (tiled 5.7e-4 .. 3.5e-3), still under the bar.
+# "mma" also rounds each decoded weight to bf16 (the tensor cores' input type, as diffusers' path does), so against
+# naive it measures 2.9e-3 .. 6.3e-3 (tiled 5.7e-4 .. 3.5e-3): up to about 1.6 bf16 steps, inside this bar but with
+# little headroom. test_q4k_mma_matches_bf16_weights holds mma to a far tighter bar against the same weight rounding.
 NAIVE_BAR = 8e-3
 
 
@@ -164,7 +165,8 @@ NAIVE_BAR = 8e-3
 @pytest.mark.parametrize("name, m, n", [(REAL[0], 256, None), (REAL[1], 256, None), (REAL[2], 256, None),
                                         (REAL[0], 1, 1000), (REAL[0], 7, 1000), (REAL[0], 333, 1000),
                                         (REAL[0], 1792, 1000), (REAL[0], 31, 1000), (REAL[0], 128, 1000),
-                                        (REAL[0], 129, 1000), (REAL[0], 7, 1001), (REAL[0], 333, 1001)])
+                                        (REAL[0], 129, 1000), (REAL[0], 7, 1001), (REAL[0], 333, 1001),
+                                        (REAL[1], 1333, None), (REAL[0], 1333, 3001)])
 def test_q4k_gemm_matches_naive(gg, name, m, n, kernel):
     from vecworld.engine.ext import load_ext
 
@@ -180,6 +182,70 @@ def test_q4k_gemm_matches_naive(gg, name, m, n, kernel):
     err = rel_err(out, ref.float())
     print(f"\n{kernel} vs naive, {t.name} M={m}: max-rel {err:.2e}")
     assert err < NAIVE_BAR
+
+
+# Both mma tile shapes, forced (tile_n), on the same ragged shapes: q4k_gemm_mma picks 128 x 128 only at >= 160 tiles
+# (the M = 1024 / 1280 FLUX linears), so without forcing, small cases would only ever run 128 x 64. N = 3001 and 1001
+# are odd and no tile multiple, M = 1333 / 333 / 129 / 7 / 1 are ragged; 1333 x 3072 and 1333 x 3001 are 264 tiles.
+MMA_CASES = [(REAL[0], 1, 1000), (REAL[0], 7, 1001), (REAL[0], 129, 1000), (REAL[0], 333, 1001), (REAL[1], 256, None),
+             (REAL[1], 1333, None), (REAL[0], 1333, 3001), (REAL[2], 1280, None)]
+
+
+def _case(gg, name, m, n):
+    t = gg[name] if n is None else rows(gg[name], n)
+    g = torch.Generator().manual_seed(m)
+    x = torch.randn(m, t.shape[1], generator=g).to("cuda", torch.bfloat16)
+    bias = (torch.randn(t.shape[0], generator=g) * 0.1).to("cuda", torch.bfloat16)
+    return t, x, bias, torch.from_numpy(np.ascontiguousarray(t.data)).cuda()
+
+
+def test_q4k_mma_tile_choice():
+    """q4k_gemm_mma's own pick: 128 x 128 tiles from 160 tiles up (8 x the 3050 Ti's 20 SMs), 128 x 64 below. Every
+    M = 1024 / 1280 FLUX linear runs 128 x 128; the cases above cover both."""
+    from vecworld.engine.ext import load_ext
+
+    pick = load_ext().q4k_mma_tile_n
+    assert torch.cuda.get_device_properties(0).multi_processor_count == 20
+    assert [pick(m, n) for m, n in ((1333, 3072), (1333, 3001), (1024, 3072), (1280, 21504), (1280, 3072))] == [128] * 5
+    assert [pick(m, n) for m, n in ((256, 3072), (256, 9216), (1792, 1000), (1, 18432), (1280, 1000))] == [64] * 5
+
+
+@pytest.mark.parametrize("tile", [64, 128])
+@pytest.mark.parametrize("name, m, n", MMA_CASES)
+def test_q4k_mma_tiles_match_naive(gg, name, m, n, tile):
+    from vecworld.engine.ext import load_ext
+
+    t, x, bias, packed = _case(gg, name, m, n)
+    ext = load_ext()
+    ref = ext.q4k_gemm_naive(x, packed, bias)
+    out = ext.q4k_gemm_mma(x, packed, bias, tile_n=tile)
+    assert out.shape == ref.shape == (m, t.shape[0])
+    err = rel_err(out, ref.float())
+    print(f"\nmma {tile} vs naive, {t.name} M={m}: max-rel {err:.2e}")
+    assert err < NAIVE_BAR
+
+
+# mma against the arithmetic it is meant to do: x times the gguf weight rounded to bf16 (what the tensor cores take),
+# exactly (fp64), plus bias. Max-rel alone can't be tight here: y itself is rounded to bf16 at the end, and half a
+# bf16 step of an output is up to 2^-8 = 3.9e-3 of the largest (measured max-rel 1.9e-3 .. 3.1e-3). So the test
+# allows each output its own half step, |out - ref| <= ulp_bf16(ref) / 2, and bars only what is left over: fp32
+# summation order. Measured excess 4.7e-7 .. 1.7e-5 of max|ref| over MMA_CASES, identical for both tiles
+# (2026-10-24); the bar is 1e-4, 6x the worst. One misdecoded or misplaced weight moves an output by far more.
+BF16_EXCESS_BAR = 1e-4
+
+
+@pytest.mark.parametrize("tile", [0, 64, 128])
+@pytest.mark.parametrize("name, m, n", MMA_CASES)
+def test_q4k_mma_matches_bf16_weights(gg, name, m, n, tile):
+    from vecworld.engine.ext import load_ext
+
+    t, x, bias, packed = _case(gg, name, m, n)
+    ref = x.double() @ deq(t).to(torch.bfloat16).cuda().double().T + bias.double()
+    out = load_ext().q4k_gemm_mma(x, packed, bias, tile_n=tile).double()
+    half_step = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(1e-30))) - 8)
+    excess = float(((out - ref).abs() - half_step).clamp_min(0).max() / ref.abs().max())
+    print(f"\nmma {tile or 'auto'} vs x @ bf16(deq W), {t.name} M={m}: excess over half a bf16 step {excess:.2e}")
+    assert excess < BF16_EXCESS_BAR
 
 
 @pytest.mark.parametrize("kernel", KERNELS)
@@ -282,10 +348,9 @@ BLOCK_KERNELS = KERNELS            # the same gate holds every kernel to diffuse
 def blocks():
     """Double block 0 and single block 0 of the bare diffusers transformer (no offload), their inputs (seeded
     random activations, 1024 image + 256 text tokens, rotary embedding) and diffusers' outputs, fp32 on the CPU."""
-    import os
-
-    os.environ.pop("VECWORLD_KERNEL", None)    # load_transformer would swap the linears: this is the reference
-    tr, _ = _bench().load_transformer()
+    with pytest.MonkeyPatch.context() as mp:     # the reference: unset would swap in the default kernel (mma)
+        mp.setenv("VECWORLD_KERNEL", "off")
+        tr, _ = _bench().load_transformer()
     dev, L, T = "cuda", 1024, 256
     g = torch.Generator().manual_seed(0)
     hs, es = (torch.randn(1, n, 3072, generator=g).to(dev, torch.bfloat16) for n in (L, T))

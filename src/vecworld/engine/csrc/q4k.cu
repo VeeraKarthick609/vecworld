@@ -595,7 +595,7 @@ torch::Tensor q4k_gemm_tiled(torch::Tensor x, torch::Tensor w, c10::optional<tor
 // Two tile shapes (docs/engine/03-q4k-mma.md): 128 x 128 when there are enough tiles to fill the GPU many times over,
 // 128 x 64 when there are few (M = 256: 2 M tiles), where the last wave of 128 x 128 tiles would leave SMs idle. Both
 // put their warps (8 or 4) side by side along N, each warp 128 rows x 16 columns, so every weight is decoded once per
-// block. Two pipeline stages; 2 (128 x 128) or 3 (128 x 64) blocks share an SM.
+// block. Two pipeline stages; 2 blocks share an SM in both (44 KB and 38 KB of shared memory each, of 100 KB).
 namespace {
 
 template <int BM, int BN, int WM, int WN, int STAGES, int GROUP, int MIN_BLOCKS>
@@ -614,17 +614,23 @@ void launch_mma(const torch::Tensor& x, const torch::Tensor& w, const __nv_bfloa
 
 }  // namespace
 
-torch::Tensor q4k_gemm_mma(torch::Tensor x, torch::Tensor w, c10::optional<torch::Tensor> bias) {
+int64_t q4k_mma_tile_n(int64_t M, int64_t N) {
+    const int64_t big_tiles = (M + 127) / 128 * ((N + 127) / 128);
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    return big_tiles >= 8 * sms ? 128 : 64;     // >= 4 waves of 2 blocks per SM: 128 x 128
+}
+
+torch::Tensor q4k_gemm_mma(torch::Tensor x, torch::Tensor w, c10::optional<torch::Tensor> bias, int64_t tile_n) {
     const __nv_bfloat16* b = check_gemm(x, w, bias);
     const int64_t M = x.size(0), N = w.size(0);
+    TORCH_CHECK(tile_n == 0 || tile_n == 64 || tile_n == 128, "tile_n must be 0 (pick), 64 or 128, got ", tile_n);
     const c10::cuda::CUDAGuard guard(x.device());
     auto y = torch::empty({M, N}, x.options());
     if (M == 0 || N == 0) return y;
-    const int64_t big_tiles = (M + 127) / 128 * ((N + 127) / 128);
-    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    if (big_tiles >= 8 * sms)               // >= 4 waves of 2 blocks per SM
+    if (tile_n == 0) tile_n = q4k_mma_tile_n(M, N);
+    if (tile_n == 128)
         launch_mma<128, 128, 128, 16, 2, 4, 2>(x, w, b, y);
     else
-        launch_mma<128, 64, 128, 16, 2, 4, 3>(x, w, b, y);
+        launch_mma<128, 64, 128, 16, 2, 4, 3>(x, w, b, y);   // 3 only caps registers (170); 2 blocks fit per SM
     return y;
 }

@@ -384,8 +384,10 @@ def test_kernel_defaults_to_mma(monkeypatch):
     """VECWORLD_KERNEL unset or empty: the FLUX painter (and so the game) runs its Q4_K linears on the mma kernel.
     "off" (or "reference") keeps the diffusers path; a kernel name picks that kernel; anything else is refused before
     the minute-long model load."""
-    from vecworld.flux.painter import engine_kernel
+    import vecworld.flux.painter as painter_mod
+    from vecworld.engine import engine_kernel
 
+    assert painter_mod.engine_kernel is engine_kernel      # one rule for the painter, the game and the bench
     monkeypatch.delenv("VECWORLD_KERNEL", raising=False)
     assert engine_kernel() == "mma"
     for value, kernel in (("", "mma"), ("off", None), ("reference", None), ("naive", "naive"), ("tiled", "tiled"),
@@ -395,3 +397,24 @@ def test_kernel_defaults_to_mma(monkeypatch):
     monkeypatch.setenv("VECWORLD_KERNEL", "fastest")
     with pytest.raises(ValueError, match="fastest"):
         engine_kernel()
+
+
+def test_a_broken_extension_build_fails_before_the_model_load(monkeypatch):
+    """With an engine kernel (the default), FluxPainter builds/loads the CUDA extension first: a failure stops it at
+    once, before the minute-long transformer load, and says how to paint without the engine."""
+    import diffusers
+
+    import vecworld.engine.ext as ext_mod
+
+    def broken():
+        raise OSError("nvcc not found")
+
+    def no_load(*a, **k):
+        raise AssertionError("the transformer load started before the extension was checked")
+
+    monkeypatch.setattr(ext_mod, "load_ext", broken)
+    monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", no_load)
+    monkeypatch.delenv("VECWORLD_KERNEL", raising=False)
+    with pytest.raises(RuntimeError, match=r"VECWORLD_KERNEL=off") as e:
+        FluxPainter()
+    assert "nvcc not found" in str(e.value) and isinstance(e.value.__cause__, OSError)
