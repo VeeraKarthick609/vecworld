@@ -1,4 +1,5 @@
 // Q4_K kernels. Stage 1 (Task 3): the naive correctness reference. Stage 2 (Task 4): tiled through shared memory.
+// Stage 3 (Task 5): tensor cores (bf16 mma.sync), decoding Q4_K into the B fragments in registers.
 //
 // A Q4_K super-block holds 256 weights of one row in 144 bytes:
 //   d (fp16) | dmin (fp16) | scales[12]: 8 x 6-bit sc, 8 x 6-bit m | qs[128]: 256 x 4-bit codes
@@ -302,6 +303,217 @@ __global__ void __launch_bounds__(TILED_THREADS, 2)
     }
 }
 
+// Tensor-core GEMM (Task 5): y = x W^T (+ bias) on bf16 mma.sync.m16n8k16, the weights decoded from Q4_K in
+// registers. A thread block computes a BM x BN tile of y; each warp a WM x WN piece of it. K advances BK = 64
+// weights per stage (one 32-byte run of a super-block's codes: sub-blocks 2r and 2r+1).
+//
+//   global --cp.async (16 B)--> shared, STAGES deep:  A stage: x[m0 .. m0+BM, k .. k+64]  bf16, 128 B a row
+//                                                     W stage: per weight row, the super-block header (16 B: d,
+//                                                              dmin, scales) and run r (32 B), still packed
+//   shared --ldmatrix.x4--> A fragments (registers)
+//   shared --2 x 16-bit loads--> 4 code bytes --decode (exact gguf fp32, RN to bf16)--> B fragments (registers)
+//   mma.sync m16n8k16: A (16 x 16 bf16) x B (16 x 8 bf16) += C (16 x 8 fp32), per warp
+//
+// The B fragment of m16n8k16 gives lane (g = lane / 4, t = lane % 4) column n = g at k = 2t, 2t+1, 2t+8, 2t+9 (of
+// the 16). In a 64-weight run, byte i holds k = i (low nibble) and k = 32 + i (high nibble), so the bytes
+// {2t, 2t+1, 2t+8, 2t+9} feed k16 step 0 (low nibbles) and step 2 (high), and the same bytes + 16 steps 1 and 3:
+// two 16-bit shared loads give a lane the codes of two k16 steps, and all four k values of a fragment fall in one
+// 32-weight sub-block, so one (d * sc, dmin * m) pair decodes them. No repacking: the kernel reads the GGUF layout.
+// A row's 48 shared bytes put 8 rows (g) x 2 words (t) on 16 different banks: conflict-free. The x tile's 16-byte
+// chunks are XOR-swizzled by row (chunk ^ row % 8), so ldmatrix's 8 row reads hit 8 different bank groups.
+//
+// Rows past M or N are zero-filled by cp.async (zero header: d = dmin = 0, so their weights decode to 0).
+namespace mma {
+
+constexpr int BK = 64;                       // weights per stage: one run (two sub-blocks)
+constexpr int A_ROW = BK * 2;                // bytes per x row per stage (8 chunks of 16)
+constexpr int W_ROW = 48;                    // bytes per weight row per stage: header 16 + run 32
+
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+// 16 bytes global -> shared without passing through registers; src_bytes = 0 fills the 16 bytes with zeros.
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, int src_bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(dst)), "l"(src), "r"(src_bytes));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(smem_addr(p)));
+}
+
+__device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Sub-blocks 2r and 2r+1's multipliers from a super-block header held in registers (h.x = d | dmin, h.y..h.w =
+// scales[12]); r is the run (0..3). The same bit layout as scale_min, specialised to a pair of sub-blocks: their
+// bytes sit next to each other, so one shift by (r & 1) * 16 lines both up.
+__device__ __forceinline__ void run_scales(uint4 h, int r, SubScale& lo, SubScale& hi) {
+    const int sh = (r & 1) * 16;
+    const uint32_t Y = h.y >> sh, Z = h.z >> sh, Wd = h.w >> sh;
+    uint32_t sc0, sc1, m0, m1;
+    if (r < 2) {
+        sc0 = Y & 63, sc1 = (Y >> 8) & 63, m0 = Z & 63, m1 = (Z >> 8) & 63;
+    } else {
+        sc0 = (Wd & 0xF) | ((Y >> 2) & 0x30), sc1 = ((Wd >> 8) & 0xF) | ((Y >> 10) & 0x30);
+        m0 = ((Wd >> 4) & 0xF) | ((Z >> 2) & 0x30), m1 = ((Wd >> 12) & 0xF) | ((Z >> 10) & 0x30);
+    }
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h.x & 0xFFFF)));
+    const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(h.x >> 16)));
+    lo = {__fmul_rn(d, float(sc0)), __fmul_rn(dmin, float(m0))};
+    hi = {__fmul_rn(d, float(sc1)), __fmul_rn(dmin, float(m1))};
+}
+
+// 4-bit code -> exact float without an int->float conversion: 0x4B000000 | q is the float 2^23 + q.
+__device__ __forceinline__ float code_f(uint32_t v, uint32_t sel) {
+    return __uint_as_float(__byte_perm(v, 0x4B000000u, sel)) - 8388608.f;
+}
+
+// decode() on a code already in a float (the same two roundings).
+__device__ __forceinline__ float decode_qf(SubScale s, float q) { return __fsub_rn(__fmul_rn(s.d_sc, q), s.dm); }
+
+// One B fragment (two bf16x2 registers) from 4 codes (bytes of v: k = 2t, 2t+1, 2t+8, 2t+9, already masked to
+// 0..15): each weight decoded exactly as gguf-py does in fp32, then rounded to bf16.
+__device__ __forceinline__ void decode_frag(uint32_t v, SubScale s, uint32_t& b0, uint32_t& b1) {
+    const float w[4] = {decode_qf(s, code_f(v, 0x7440)), decode_qf(s, code_f(v, 0x7441)),
+                        decode_qf(s, code_f(v, 0x7442)), decode_qf(s, code_f(v, 0x7443))};
+    __nv_bfloat162 p0 = __floats2bfloat162_rn(w[0], w[1]), p1 = __floats2bfloat162_rn(w[2], w[3]);
+    b0 = *reinterpret_cast<uint32_t*>(&p0);
+    b1 = *reinterpret_cast<uint32_t*>(&p1);
+}
+
+template <int BM, int BN, int WM, int WN, int STAGES, int GROUP, int MIN_BLOCKS>
+__global__ void __launch_bounds__((BM / WM) * (BN / WN) * 32, MIN_BLOCKS)
+    gemm_mma_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w,
+                    const __nv_bfloat16* __restrict__ bias, __nv_bfloat16* __restrict__ y, int M, int N, int K) {
+    constexpr int WARPS_N = BN / WN, T = (BM / WM) * WARPS_N * 32;
+    constexpr int MI = WM / 16, NI = WN / 8;            // m16 and n8 fragments per warp
+    constexpr int A_STAGE = BM * A_ROW, W_STAGE = BN * W_ROW;
+    constexpr int A_CHUNKS = BM * (A_ROW / 16), W_CHUNKS = BN * 3;
+    static_assert(A_CHUNKS % T == 0, "x chunks per thread");
+    extern __shared__ __align__(16) uint8_t smem[];
+    uint8_t* As = smem;
+    uint8_t* Ws = smem + STAGES * A_STAGE;
+
+    // Grouped tile order: GROUP M tiles walk along N together, so blocks running at once share x and W in L2.
+    const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN, L = blockIdx.x;
+    const int first = L / (GROUP * num_n) * GROUP, gs = min(num_m - first, GROUP);
+    const int m0 = (first + L % (GROUP * num_n) % gs) * BM, n0 = L % (GROUP * num_n) / gs * BN;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp / WARPS_N, wn = warp % WARPS_N, g = lane >> 2, t = lane & 3;
+    const int64_t row_bytes = int64_t(K / QK_K) * BLOCK_BYTES;
+    const int KT = K / BK;
+
+    auto load = [&](int kt, int st) {           // stage st <- K step kt (super-block kt / 4, run kt % 4)
+        uint8_t* a = As + st * A_STAGE;
+#pragma unroll
+        for (int i = 0; i < A_CHUNKS / T; ++i) {
+            const int idx = tid + i * T, r = idx >> 3, c = idx & 7;
+            const bool ok = m0 + r < M;
+            const __nv_bfloat16* src = ok ? x + int64_t(m0 + r) * K + kt * BK + c * 8 : x;
+            cp_async16(a + r * A_ROW + ((c ^ (r & 7)) << 4), src, ok ? 16 : 0);
+        }
+        uint8_t* ws = Ws + st * W_STAGE;
+        const int64_t boff = int64_t(kt >> 2) * BLOCK_BYTES, roff = 16 + (kt & 3) * 32;
+#pragma unroll
+        for (int i = 0; i < (W_CHUNKS + T - 1) / T; ++i) {
+            const int idx = tid + i * T;
+            if (idx < W_CHUNKS) {
+                const int r = idx / 3, part = idx % 3;
+                const bool ok = n0 + r < N;
+                const uint8_t* src = ok ? w + int64_t(n0 + r) * row_bytes + boff + (part ? roff + (part - 1) * 16 : 0) : w;
+                cp_async16(ws + r * W_ROW + part * 16, src, ok ? 16 : 0);
+            }
+        }
+    };
+
+    float acc[MI][NI][4] = {};
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KT) load(s, s);
+        cp_async_commit();
+    }
+    for (int kt = 0; kt < KT; ++kt) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();                         // stage kt landed for everyone; stage kt - 1 is free again
+        if (kt + STAGES - 1 < KT) load(kt + STAGES - 1, (kt + STAGES - 1) % STAGES);
+        cp_async_commit();
+
+        const int st = kt % STAGES, r = kt & 3;
+        const uint8_t* a = As + st * A_STAGE;
+        const uint8_t* ws = Ws + st * W_STAGE;
+        SubScale sc[NI][2];
+#pragma unroll
+        for (int j = 0; j < NI; ++j)
+            run_scales(*reinterpret_cast<const uint4*>(ws + (wn * WN + j * 8 + g) * W_ROW), r, sc[j][0], sc[j][1]);
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {            // bytes 16p .. 16p + 15 of the run
+            uint32_t q[NI];
+#pragma unroll
+            for (int j = 0; j < NI; ++j) {
+                const uint8_t* run = ws + (wn * WN + j * 8 + g) * W_ROW + 16 + 16 * p + 2 * t;
+                q[j] = uint32_t(*reinterpret_cast<const uint16_t*>(run)) |
+                       (uint32_t(*reinterpret_cast<const uint16_t*>(run + 8)) << 16);
+            }
+#pragma unroll
+            for (int nib = 0; nib < 2; ++nib) {  // low nibbles: sub-block 2r, k16 step p; high: 2r+1, step p + 2
+                const int s = p + 2 * nib;
+                uint32_t b[NI][2];
+#pragma unroll
+                for (int j = 0; j < NI; ++j)
+                    decode_frag((q[j] >> (4 * nib)) & 0x0F0F0F0Fu, sc[j][nib], b[j][0], b[j][1]);
+                uint32_t af[MI][4];
+#pragma unroll
+                for (int i = 0; i < MI; ++i) {
+                    const int row = wm * WM + i * 16 + (lane & 15), chunk = 2 * s + (lane >> 4);
+                    ldmatrix_x4(af[i], a + row * A_ROW + ((chunk ^ (row & 7)) << 4));
+                }
+#pragma unroll
+                for (int i = 0; i < MI; ++i)
+#pragma unroll
+                    for (int j = 0; j < NI; ++j) mma_bf16(acc[i][j], af[i], b[j][0], b[j][1]);
+            }
+        }
+    }
+    cp_async_wait<0>();
+
+    // Epilogue: + bias, round to bf16, a pair of outputs (4 bytes) per store where both are inside N.
+    const bool pair_ok = (N & 1) == 0;
+#pragma unroll
+    for (int j = 0; j < NI; ++j) {
+        const int n = n0 + wn * WN + j * 8 + 2 * t;
+        const float b0 = bias != nullptr && n < N ? __bfloat162float(bias[n]) : 0.f;
+        const float b1 = bias != nullptr && n + 1 < N ? __bfloat162float(bias[n + 1]) : 0.f;
+#pragma unroll
+        for (int i = 0; i < MI; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int m = m0 + wm * WM + i * 16 + g + 8 * h;
+                if (m >= M) continue;
+                const float o0 = acc[i][j][2 * h] + b0, o1 = acc[i][j][2 * h + 1] + b1;
+                __nv_bfloat16* yp = y + int64_t(m) * N + n;
+                if (pair_ok && n + 1 < N) {
+                    *reinterpret_cast<__nv_bfloat162*>(yp) = __floats2bfloat162_rn(o0, o1);
+                } else {
+                    if (n < N) yp[0] = __float2bfloat16(o0);
+                    if (n + 1 < N) yp[1] = __float2bfloat16(o1);
+                }
+            }
+    }
+}
+
+}  // namespace mma
+
 void check_packed(const torch::Tensor& w, int64_t in) {
     TORCH_CHECK(w.is_cuda() && w.scalar_type() == torch::kUInt8 && w.dim() == 2 && w.is_contiguous(),
                 "packed Q4_K weight must be a contiguous CUDA uint8 [out, in / 256 * 144] tensor");
@@ -377,5 +589,42 @@ torch::Tensor q4k_gemm_tiled(torch::Tensor x, torch::Tensor w, c10::optional<tor
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), w.data_ptr<uint8_t>(), b,
         reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), int(M), int(N), int(K));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+// Two tile shapes (docs/engine/03-q4k-mma.md): 128 x 128 when there are enough tiles to fill the GPU many times over,
+// 128 x 64 when there are few (M = 256: 2 M tiles), where the last wave of 128 x 128 tiles would leave SMs idle. Both
+// put their warps (8 or 4) side by side along N, each warp 128 rows x 16 columns, so every weight is decoded once per
+// block. Two pipeline stages; 2 (128 x 128) or 3 (128 x 64) blocks share an SM.
+namespace {
+
+template <int BM, int BN, int WM, int WN, int STAGES, int GROUP, int MIN_BLOCKS>
+void launch_mma(const torch::Tensor& x, const torch::Tensor& w, const __nv_bfloat16* b, torch::Tensor& y) {
+    const int64_t M = x.size(0), K = x.size(1), N = w.size(0);
+    auto kern = mma::gemm_mma_kernel<BM, BN, WM, WN, STAGES, GROUP, MIN_BLOCKS>;
+    constexpr int smem = STAGES * (BM * mma::A_ROW + BN * mma::W_ROW);
+    static_assert(smem <= 48 * 1024, "more dynamic shared memory needs cudaFuncSetAttribute");
+    const int64_t tiles = (M + BM - 1) / BM * ((N + BN - 1) / BN);
+    TORCH_CHECK(tiles <= INT32_MAX, "too many tiles for the mma grid");
+    kern<<<unsigned(tiles), (BM / WM) * (BN / WN) * 32, smem, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), w.data_ptr<uint8_t>(), b,
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), int(M), int(N), int(K));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace
+
+torch::Tensor q4k_gemm_mma(torch::Tensor x, torch::Tensor w, c10::optional<torch::Tensor> bias) {
+    const __nv_bfloat16* b = check_gemm(x, w, bias);
+    const int64_t M = x.size(0), N = w.size(0);
+    const c10::cuda::CUDAGuard guard(x.device());
+    auto y = torch::empty({M, N}, x.options());
+    if (M == 0 || N == 0) return y;
+    const int64_t big_tiles = (M + 127) / 128 * ((N + 127) / 128);
+    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    if (big_tiles >= 8 * sms)               // >= 4 waves of 2 blocks per SM
+        launch_mma<128, 128, 128, 16, 2, 4, 2>(x, w, b, y);
+    else
+        launch_mma<128, 64, 128, 16, 2, 4, 3>(x, w, b, y);
     return y;
 }

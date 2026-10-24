@@ -378,3 +378,20 @@ def test_a_linear_recipe_releases_behind_at_its_own_back_strength(monkeypatch):
     prev = Image.new("RGB", (PANO_W, PANO_H), (90, 120, 60))
     p.step(prev, [("a forest", 1.0)], None, 0.5, seed=4, focus_half=0.15)
     assert 0.6 in tr.sigmas
+
+
+def test_kernel_defaults_to_mma(monkeypatch):
+    """VECWORLD_KERNEL unset or empty: the FLUX painter (and so the game) runs its Q4_K linears on the mma kernel.
+    "off" (or "reference") keeps the diffusers path; a kernel name picks that kernel; anything else is refused before
+    the minute-long model load."""
+    from vecworld.flux.painter import engine_kernel
+
+    monkeypatch.delenv("VECWORLD_KERNEL", raising=False)
+    assert engine_kernel() == "mma"
+    for value, kernel in (("", "mma"), ("off", None), ("reference", None), ("naive", "naive"), ("tiled", "tiled"),
+                          ("mma", "mma")):
+        monkeypatch.setenv("VECWORLD_KERNEL", value)
+        assert engine_kernel() == kernel, value
+    monkeypatch.setenv("VECWORLD_KERNEL", "fastest")
+    with pytest.raises(ValueError, match="fastest"):
+        engine_kernel()

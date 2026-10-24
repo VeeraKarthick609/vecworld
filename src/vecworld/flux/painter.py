@@ -13,8 +13,9 @@ crossfade. The differences:
 - Text: T5-XXL sequence embeddings (vecworld.flux.text, GPU block by block, cached) plus CLIP-L pooled (GPU).
   A Prompt's texts blend as a weighted sum of both.
 - The transformer is the 4-bit GGUF through diffusers, streamed block by block with diffusers' group offload.
-  With VECWORLD_KERNEL set (e.g. "naive"), its Q4_K linears run on the engine's hand-written kernel instead of
-  diffusers' dequantize-then-matmul (vecworld.engine); every other layer stays on the diffusers path.
+  Its Q4_K linears run on the engine's hand-written kernel (vecworld.engine; VECWORLD_KERNEL, default FLUX_KERNEL =
+  "mma") instead of diffusers' dequantize-then-matmul; every other layer stays on the diffusers path.
+  VECWORLD_KERNEL=off keeps diffusers for those too.
 """
 import math
 import os
@@ -25,13 +26,28 @@ import numpy as np
 from PIL import Image
 
 from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
-                             FLUX_GGUF, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
+                             FLUX_GGUF, FLUX_KERNEL, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
                              FLUX_STYLE, FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
 
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
+KERNEL_OFF = ("off", "reference")    # VECWORLD_KERNEL values that keep the diffusers path
+
+
+def engine_kernel() -> str | None:
+    """The engine kernel VECWORLD_KERNEL asks for: unset or empty, FLUX_KERNEL (the default, "mma"); "off" or
+    "reference", None (diffusers' dequantize-then-matmul); otherwise a name from vecworld.engine.q4k.KERNELS, checked
+    here so a typo fails before the minute-long model load."""
+    name = os.environ.get("VECWORLD_KERNEL") or FLUX_KERNEL
+    if name in KERNEL_OFF:
+        return None
+    from vecworld.engine.q4k import KERNELS
+
+    if name not in KERNELS:
+        raise ValueError(f"VECWORLD_KERNEL={name!r}; built kernels: {', '.join(KERNELS)} (or off)")
+    return name
 
 
 def _read_gguf(path) -> dict:
@@ -134,8 +150,8 @@ class FluxPainter(Painter):
     The transformer's CPU weights are page-locked where they lie; close() (also run when the painter is freed)
     releases them, after which the painter can't paint.
 
-    VECWORLD_KERNEL (read at construction; unset or empty: the diffusers reference) names the engine kernel the
-    transformer's Q4_K linears run on (vecworld.engine.q4k.KERNELS); self.kernel records it.
+    VECWORLD_KERNEL (read at construction, see engine_kernel(); unset: "mma", "off": the diffusers reference) names
+    the engine kernel the transformer's Q4_K linears run on; self.kernel records it (None: diffusers).
     """
 
     style = FLUX_STYLE
@@ -149,12 +165,7 @@ class FluxPainter(Painter):
 
         from vecworld.flux.text import T5Text
 
-        self.kernel = os.environ.get("VECWORLD_KERNEL") or None
-        if self.kernel is not None:
-            from vecworld.engine.q4k import KERNELS
-
-            if self.kernel not in KERNELS:      # before the minute-long load, not after it
-                raise ValueError(f"VECWORLD_KERNEL={self.kernel!r}; built kernels: {', '.join(KERNELS)}")
+        self.kernel = engine_kernel()           # before the minute-long load, not after it
         dev, bf16 = torch.device("cuda"), torch.bfloat16
         tr = FluxTransformer2DModel.from_single_file(
             _read_gguf(str(FLUX_GGUF)), quantization_config=GGUFQuantizationConfig(compute_dtype=bf16),

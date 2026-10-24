@@ -1,13 +1,16 @@
 """FLUX bench harness. --painter reference benches the game's FluxPainter (diffusers + GGUF + group offload);
---painter engine benches the same painter with the engine flags (VECWORLD_KERNEL=naive, ...) taken from the
-environment. Engine results also carry the step's FLOP count, achieved TFLOP/s and % of the measured bf16 peak.
+--painter engine benches the same painter with the engine flags (VECWORLD_KERNEL=mma, ...) taken from the
+environment (the painter's default kernel is mma; --painter reference sets VECWORLD_KERNEL=off). Engine results
+also carry the step's FLOP count, achieved TFLOP/s and % of the measured bf16 peak.
 
   uv run python scripts/bench_flux.py --painter reference --what pano --out bench/x.json
   VECWORLD_KERNEL=naive uv run python scripts/bench_flux.py --painter engine --what tile512 --out bench/t3-naive.json
 
 tile512, pano and step run the real painter (its T5 and CLIP included; T5 is encoded once, before timing, and
-its cold encode is recorded). blocks and bw measure the bare transformer and the machine. Speed numbers are only
-valid on AC power; on battery this exits without touching the GPU.
+its cold encode is recorded). blocks and bw measure the bare transformer and the machine. gemm times
+VECWORLD_KERNEL's GEMM alone on the FLUX linear shapes against torch.matmul on the same weight pre-dequantized to
+bf16 (the reference's cuBLAS GEMM, without its dequant). Speed numbers are only valid on AC power; on battery
+this exits without touching the GPU.
 """
 import argparse, glob, json, mmap, os, subprocess, sys, threading, time
 from pathlib import Path
@@ -99,14 +102,14 @@ def bench(fn, n=5):
 
 
 def load_transformer():
-    """The bare transformer; with VECWORLD_KERNEL set (--painter engine), its Q4_K linears on that kernel."""
+    """The bare transformer; with VECWORLD_KERNEL naming a kernel (--painter engine), its Q4_K linears on it."""
     import torch
     from diffusers import FluxTransformer2DModel, GGUFQuantizationConfig
     from vecworld.config import FLUX_BASE, FLUX_GGUF
     tr = FluxTransformer2DModel.from_single_file(
         str(FLUX_GGUF), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
         torch_dtype=torch.bfloat16, config=FLUX_BASE, subfolder="transformer")
-    if os.environ.get("VECWORLD_KERNEL"):
+    if os.environ.get("VECWORLD_KERNEL", "off") not in ("off", "reference"):
         from vecworld.engine.swap import gguf_linears, swap_linears
         swap_linears(tr, gguf_linears(tr), os.environ["VECWORLD_KERNEL"])
     return tr, str(FLUX_GGUF)
@@ -293,6 +296,50 @@ def do_bw(R, mon):
         R[key] = round(total / (time.perf_counter() - t) / 1e9, 2)
 
 
+# (M, K, N) of FLUX's token-facing linears: one 512 window with its text (M = 1024 image + 256 text tokens; a double
+# block's image and text streams run apart, M = 1024 and 256; a single block runs them joined, M = 1280).
+GEMM_SHAPES = [(1024, 3072, 9216), (1024, 3072, 3072), (1024, 3072, 12288), (1024, 12288, 3072),
+               (256, 3072, 9216), (256, 3072, 3072), (256, 3072, 12288), (256, 12288, 3072),
+               (1280, 3072, 21504), (1280, 15360, 3072)]
+
+
+def do_gemm(R, mon):
+    """Per GEMM_SHAPES entry: VECWORLD_KERNEL's TFLOP/s on a real Q4_K weight of that shape (the first in the GGUF;
+    Q4KLinear's own dispatch) against torch.matmul on the same weight dequantized to bf16 beforehand: the median of
+    20 timed calls after warm-up, two rounds each, run alternately, and the better round kept."""
+    import gguf
+    import numpy as np
+    import torch
+    from vecworld.config import FLUX_GGUF
+    from vecworld.engine.q4k import Q4KLinear, read_gguf
+    kernel = os.environ["VECWORLD_KERNEL"]
+    tensors = read_gguf(FLUX_GGUF)
+    R["bf16_peak_tflops"] = bf16_peak()
+    rows = []
+    for M, K, N in GEMM_SHAPES:
+        t = next(t for t in tensors.values() if t.type == gguf.GGMLQuantizationType.Q4_K and t.shape == (N, K))
+        lin = Q4KLinear(t, None, kernel).cuda()
+        wd = torch.from_numpy(gguf.quants.dequantize(np.asarray(t.data), t.type).reshape(N, K)).to("cuda", torch.bfloat16)
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, generator=torch.Generator("cuda").manual_seed(0))
+        with torch.inference_mode():
+            ours, ref = bench(lambda: lin(x), 20), bench(lambda: x @ wd.T, 20)
+            ours, ref = min(ours, bench(lambda: lin(x), 20)), min(ref, bench(lambda: x @ wd.T, 20))
+        f = 2 * M * K * N
+        rows.append(dict(m=M, k=K, n=N, weight=t.name, ours_ms=round(ours, 3), matmul_ms=round(ref, 3),
+                         ours_tflops=round(f / ours / 1e9, 2), matmul_tflops=round(f / ref / 1e9, 2),
+                         pct_of_matmul=round(100 * ref / ours, 1)))
+        print(f"M={M:5d} K={K:5d} N={N:5d}  {kernel} {rows[-1]['ours_tflops']:6.2f}  matmul "
+              f"{rows[-1]['matmul_tflops']:6.2f}  {rows[-1]['pct_of_matmul']:5.1f}%", flush=True)
+        del lin, wd
+        torch.cuda.empty_cache()
+    R["shapes"] = rows
+    for name, sel in (("m1024_1280", lambda r: r["m"] != 256), ("m256", lambda r: r["m"] == 256)):
+        rs = [r for r in rows if sel(r)]
+        R[f"{name}_pct_of_matmul_min"] = min(r["pct_of_matmul"] for r in rs)
+        # aggregate: matmul's total time over ours across the shapes (the FLOP-weighted rate ratio)
+        R[f"{name}_pct_of_matmul_overall"] = round(100 * sum(r["matmul_ms"] for r in rs) / sum(r["ours_ms"] for r in rs), 1)
+
+
 def add_engine_fields(R):
     """The FLOP-rate fields on a run's results, per 512 window pass with 256 text tokens: tile512 over its median
     pass; a walk step over its wall time per window pass (its passes batch windows, and its wall time includes the
@@ -307,7 +354,7 @@ def add_engine_fields(R):
             R[k] = engine_fields(R[k], (w // 16) * (h // 16), 256, key="resident_step_s")
 
 
-WHATS = dict(tile512=do_tile512, pano=do_pano, step=do_step, blocks=do_blocks, bw=do_bw)
+WHATS = dict(tile512=do_tile512, pano=do_pano, step=do_step, blocks=do_blocks, bw=do_bw, gemm=do_gemm)
 
 
 def main():
@@ -316,10 +363,12 @@ def main():
     ap.add_argument("--what", choices=list(WHATS), required=True)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    if a.painter == "engine" and not os.environ.get("VECWORLD_KERNEL"):
-        sys.exit("--painter engine needs its flags: set VECWORLD_KERNEL (e.g. naive)")
+    if a.painter == "engine" and os.environ.get("VECWORLD_KERNEL", "off") in ("off", "reference"):
+        sys.exit("--painter engine needs its flags: set VECWORLD_KERNEL (e.g. mma)")
+    if a.what == "gemm" and a.painter != "engine":
+        sys.exit("--what gemm times an engine kernel: use --painter engine")
     if a.painter == "reference":
-        os.environ.pop("VECWORLD_KERNEL", None)       # the reference is diffusers all the way
+        os.environ["VECWORLD_KERNEL"] = "off"         # the reference is diffusers all the way (the painter defaults to mma)
     pw = power()
     if pw != "ac":
         sys.exit("on battery: speed numbers are invalid; plug in and rerun")

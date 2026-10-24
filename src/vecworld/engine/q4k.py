@@ -6,11 +6,16 @@ import torch
 from gguf import GGMLQuantizationType
 
 QK_K, Q4K_BYTES = 256, 144          # weights and bytes per Q4_K super-block
-KERNELS = ("naive", "tiled")       # later stages add "mma", "w4a8"
+KERNELS = ("naive", "tiled", "mma")       # a later stage adds "w4a8"
 # Below this many rows (tokens x windows) "tiled" runs the naive kernel: a 128-row tile would be mostly padding. FLUX's
 # modulation linears run at M = 1 per window (4.0 ms tiled vs 0.7 ms naive for 3072 -> 18432); the crossover measured
 # at M = 24..32 (docs/engine/02-q4k-tiled.md).
 TILED_MIN_M = 32
+# The same for "mma": its 128-row tensor-core tile at M = 1 costs 0.84 ms on 3072 -> 18432 against naive's 0.65; they
+# cross at M = 6..8 (docs/engine/03-q4k-mma.md). In FLUX only the modulation linears (M = windows per pass) are this
+# small.
+MMA_MIN_M = 7
+SMALL_M = {"tiled": TILED_MIN_M, "mma": MMA_MIN_M}     # below this M a kernel hands the call to naive
 
 
 @dataclass(frozen=True)
@@ -79,7 +84,7 @@ class Q4KLinear(torch.nn.Module):
         lead = x.shape[:-1]
         x2 = _aligned_activation(x.reshape(-1, self.in_features).to(torch.bfloat16).contiguous())
         b = None if self.bias is None else self.bias.to(torch.bfloat16).contiguous()
-        kernel = "naive" if self.kernel == "tiled" and x2.shape[0] < TILED_MIN_M else self.kernel
+        kernel = "naive" if x2.shape[0] < SMALL_M.get(self.kernel, 0) else self.kernel
         if self.qweight.data_ptr() % 16:
             # Loud on purpose: a misaligned weight means whatever laid it out (e.g. a slot buffer carving views) is
             # wrong. Copying it here would hide that behind a weight-sized copy on every call.

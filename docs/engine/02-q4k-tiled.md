@@ -6,7 +6,7 @@ comes from*. Each block of threads stages a tile of x and a tile of decoded weig
 weight is decoded once per tile instead of once per output. It still runs on CUDA cores, not tensor cores; that
 comes in Task 5.
 
-Turn it on with `VECWORLD_KERNEL=tiled`.
+Turn it on with `VECWORLD_KERNEL=tiled`. (Unset, the painter runs the `mma` kernel since Task 5.)
 
 ## The problem: the naive kernel re-reads and re-decodes everything
 

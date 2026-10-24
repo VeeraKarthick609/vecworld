@@ -84,6 +84,9 @@ FLUX_TEXT_LEN = 256        # T5 tokens (schnell's max_sequence_length)
 FLUX_WIN = 32              # window size in packed tokens (512 px), the full panorama height
 FLUX_STRIDE = 16           # 8 windows round the cylinder, each column covered twice
 FLUX_STEPS = 4
+# The engine kernel FLUX's Q4_K linears run on when VECWORLD_KERNEL is unset (vecworld.engine.q4k.KERNELS): the
+# tensor-core kernel, which passed every reference gate (Task 5). VECWORLD_KERNEL=off runs the diffusers path.
+FLUX_KERNEL = "mma"
 FLUX_BATCH = 4             # windows per transformer pass (peak 1.4 GB allocated on AC; Task 6 re-batches)
 FLUX_BG_STRENGTH = 0.15    # a walk step releases its background at this sigma (0.25: SSIM 0.58 outside the focus, 0.15: 0.67)
 # Behind the camera (from a quarter turn off the walking direction, feathered over FLUX_BACK_FEATHER) the dolly

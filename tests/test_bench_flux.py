@@ -35,3 +35,12 @@ def test_engine_row_fields():
     assert row["achieved_tflops"] == 6.45                                            # the baseline's numbers
     assert row["pct_bf16_peak"] == 33.8
     assert bench.bf16_peak() == 19.11                                                # bench/baseline.json blocks
+
+
+def test_gemm_bench_covers_the_flux_linear_shapes():
+    """--what gemm times the brief's FLUX shapes (M, K, N): the double blocks' image (M = 1024) and text (M = 256)
+    streams, and the single blocks' joined stream (M = 1280)."""
+    four = [(3072, 9216), (3072, 3072), (3072, 12288), (12288, 3072)]
+    assert bench.GEMM_SHAPES == ([(1024, k, n) for k, n in four] + [(256, k, n) for k, n in four]
+                                 + [(1280, 3072, 21504), (1280, 15360, 3072)])
+    assert bench.WHATS["gemm"] is bench.do_gemm

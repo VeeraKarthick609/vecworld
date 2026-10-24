@@ -11,7 +11,7 @@ pytestmark = pytest.mark.gpu
 
 # The GEMM stages built so far. Every unit test runs on each; "naive" (Task 3) is the reference the later ones are
 # also checked against directly.
-KERNELS = ["naive", "tiled"]
+KERNELS = ["naive", "tiled", "mma"]
 
 # One real Q4_K tensor per in_features the file holds (3072, 12288, 15360).
 REAL = ["double_blocks.0.img_attn.proj.weight", "double_blocks.0.img_mlp.2.weight", "single_blocks.0.linear2.weight"]
@@ -130,9 +130,33 @@ def test_q4k_tiled_small_m_runs_naive(gg, monkeypatch):
     assert calls == ["q4k_gemm_naive", "q4k_gemm_naive", "q4k_gemm_tiled", "q4k_gemm_tiled"]
 
 
+def test_q4k_mma_small_m_runs_naive(gg, monkeypatch):
+    """Q4KLinear on "mma" sends M < MMA_MIN_M to the naive kernel (a 128-row tensor-core tile at M = 1 does 128x the
+    work: the M = 1 modulation linears are faster on naive, measured in docs/engine/03-q4k-mma.md), and M >= it to
+    the mma kernel. (The raw mma kernel is checked at small M in test_q4k_gemm_matches_naive.)"""
+    import vecworld.engine.ext as ext_mod
+    from vecworld.engine.q4k import MMA_MIN_M, Q4KLinear
+
+    real, calls = ext_mod.load_ext(), []
+
+    class Spy:
+        def __getattr__(self, name):
+            calls.append(name)
+            return getattr(real, name)
+
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: Spy())
+    lin = Q4KLinear(rows(gg[REAL[0]], 64), None, "mma").cuda()
+    for m in (1, MMA_MIN_M - 1, MMA_MIN_M, 1280):
+        lin(torch.randn(m, 3072, device="cuda", dtype=torch.bfloat16))
+    assert MMA_MIN_M == 7
+    assert calls == ["q4k_gemm_naive", "q4k_gemm_naive", "q4k_gemm_mma", "q4k_gemm_mma"]
+
+
 # Every later stage against the naive reference directly, on the same real weights. Both decode each weight
 # bit-exactly and sum in fp32; only the summation order differs, so the bf16 outputs agree to about one bf16 step of
 # the largest output (2^-8 = 3.9e-3 relative to it). A decode or indexing bug is orders of magnitude above this bar.
+# "mma" also rounds each decoded weight to bf16 (the tensor cores' input type, as diffusers' path does): measured
+# 2.9e-3 .. 6.3e-3 against naive (tiled 5.7e-4 .. 3.5e-3), still under the bar.
 NAIVE_BAR = 8e-3
 
 
@@ -330,15 +354,12 @@ def _bench():
 
 
 def _with_painter(kernel: str | None, monkeypatch, fn):
-    """fn(painter, embedding) on a FluxPainter built with VECWORLD_KERNEL=kernel (None: the diffusers path), freed
-    afterwards: two painters don't fit in RAM side by side."""
+    """fn(painter, embedding) on a FluxPainter built with VECWORLD_KERNEL=kernel (None: "off", the diffusers path),
+    freed afterwards: two painters don't fit in RAM side by side."""
     from vecworld.config import FLUX_STYLE
     from vecworld.flux.painter import FluxPainter
 
-    if kernel is None:
-        monkeypatch.delenv("VECWORLD_KERNEL", raising=False)
-    else:
-        monkeypatch.setenv("VECWORLD_KERNEL", kernel)
+    monkeypatch.setenv("VECWORLD_KERNEL", kernel or "off")
     p = FluxPainter()
     try:
         assert p.kernel == kernel

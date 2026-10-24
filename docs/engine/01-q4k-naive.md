@@ -5,7 +5,8 @@ weights, without building a bf16 weight in VRAM. It is the **correctness referen
 (tiled, `mma`, W4A8) is tested against. It is **not a speedup**: one 512 window pass takes about 23 s against the
 baseline's 2.74 s.
 
-Turn it on with `VECWORLD_KERNEL=naive`. Unset, the painter is the diffusers reference.
+Turn it on with `VECWORLD_KERNEL=naive`. (Unset, the painter runs the `mma` kernel since Task 5; `off` is the
+diffusers reference.)
 
 ## The problem: 1.08 s of every 2.74 s step is unpacking weights
 
