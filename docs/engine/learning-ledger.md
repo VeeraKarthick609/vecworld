@@ -14,7 +14,24 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 
 ## Entry 1: Making FLUX faster: ops/sec on a 4 GB GPU
 
-*2026-10-24. Study time: about 45 minutes. Prerequisites: matrix multiply, a rough idea of what a GPU thread and warp are.*
+*2026-10-24. Study time: about 45 minutes. Prerequisites: matrix multiply, a rough idea of what a GPU thread and warp are. Updated 2026-10-24 with the walkthrough's plain-language versions.*
+
+**Tags.** Every section carries one tag. **Must**: be able to explain it in an interview. **Understand**: know what it is and why it matters; the details can wait until the task that needs them. **Skip**: skip it for now; read the one-line takeaway only.
+
+### Interview revision list
+
+**Must.**
+- The roofline: arithmetic intensity (AI) and the ridge point (1.4).
+- GEMM cost: 2MKN FLOPs and its bytes (1.4).
+- Counting FLOPs as weights × the tokens that actually meet them (1.6).
+- Quantization basics: a scale, a zero-point or min, and per-group scales (Technique 1).
+- W4A16 vs W8A8 vs W4A8 (Technique 2).
+- Why 4-bit weights save memory but not compute, except at M=1, where a GEMM is memory-bound (Techniques 1 and 2).
+- Batching amortizes per-pass costs (Technique 3).
+
+**Understand.** The exact Q4_K bytes, `mma` tile shapes, the min-term algebra, CUDA graphs, block caching and glue fusion.
+
+**Skip for now.** INT8/fp16 throughput ratios per GPU generation, and SmoothQuant internals.
 
 **Contents**
 - Part 1: Foundations (FLOPs, bandwidth, roofline, FLUX's FLOP count, today's achieved TFLOPS)
@@ -29,6 +46,8 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 - Part 4: Open decisions
 
 ### The hardware, in one table
+
+`Understand`
 
 RTX 3050 Ti Laptop GPU (GA107, Ampere), in the laptop `mrjarvis`.
 
@@ -54,6 +73,8 @@ RTX 3050 Ti Laptop GPU (GA107, Ampere), in the laptop `mrjarvis`.
 
 ### 1.1 FLOPs vs FLOP/s
 
+`Must`
+
 - A **FLOP** is one floating-point operation (an add or a multiply). It is a count of **work**.
 - **FLOP/s** (FLOPS) is a **rate**: work per second. TFLOPS means 10¹² FLOP/s.
 - A multiply-accumulate (`c += a*b`, an "FMA" or "MAC") counts as **2 FLOPs**. So multiplying an `M×K` matrix by a `K×N` matrix costs `2·M·K·N` FLOPs.
@@ -61,6 +82,8 @@ RTX 3050 Ti Laptop GPU (GA107, Ampere), in the laptop `mrjarvis`.
 The core relation is time = work ÷ rate. If a FLUX step costs W FLOPs and we run at R FLOP/s, the step takes W/R seconds. You can make it faster in only two ways: do less work (smaller W: caching, skipping) or do it at a higher rate (bigger R: better kernels, lower precision, less waiting).
 
 ### 1.2 What peak throughput this GPU has
+
+`Understand`. Takeaway: our bf16 ceiling is the measured 19.1 TFLOPS; INT8 is faster. The per-generation ratios in the table are `Skip`.
 
 **Tensor cores** are units inside each SM that execute a small matrix multiply (for example 16×8×16) as one instruction. They are much faster than the ordinary FP32 "CUDA cores", but only for matrix shapes and specific data types.
 
@@ -75,6 +98,8 @@ A note on the 19.1. Ampere GeForce parts do 512 bf16 FLOP per SM per clock with 
 
 ### 1.3 Memory bandwidth
 
+`Must`
+
 **Memory bandwidth** is how many bytes per second can move between VRAM and the SMs: about 192 GB/s here (est.). Other links in our chain are much slower:
 
 ```
@@ -84,6 +109,8 @@ SSD --2.0-3.0 GB/s--> RAM (pinned) --13.5 GB/s--> VRAM --~192 GB/s (est.)--> SMs
 Every byte of weight a kernel needs must cross the VRAM→SM link at least once. For very large weight sets it must also cross the PCIe link (13.5 GB/s) and, from Task 8 on, the SSD link (2–3 GB/s).
 
 ### 1.4 Arithmetic intensity and the roofline
+
+`Must`
 
 **Arithmetic intensity (AI)** = FLOPs done ÷ bytes moved from memory, in FLOP/byte. It says how much work you get per byte you fetch.
 
@@ -97,7 +124,24 @@ attainable FLOP/s = min( peak FLOP/s ,  AI × bandwidth )
 - If AI is high, you hit the flat part (peak compute). That is **compute-bound**: the data arrives faster than you can use it.
 - The **ridge point** where they meet is peak ÷ bandwidth = 19.1 TFLOPS ÷ 192 GB/s ≈ **100 FLOP/byte (est.)**. A kernel needs more than about 100 FLOP per byte to use the tensor cores fully.
 
-**AI of a GEMM** (General Matrix Multiply). An `M×K` activation times a `K×N` weight costs `2MKN` FLOPs. It moves about `K·N·b_w` bytes of weight plus `M·K·2 + M·N·2` bytes of bf16 activations in and out, where `b_w` is bytes per weight. When the weight dominates, AI ≈ `2M / b_w`. **The token count M sets the intensity.** Our cases:
+**AI of a GEMM** (General Matrix Multiply). An `M×K` activation times a `K×N` weight costs `2MKN` FLOPs. It moves about `K·N·b_w` bytes of weight plus `M·K·2 + M·N·2` bytes of bf16 activations in and out, where `b_w` is bytes per weight. When the weight dominates, AI ≈ `2M / b_w`. **The token count M sets the intensity.**
+
+**Where the bytes go, for one real GEMM** (K=3072, N=12288, M=1280, all bf16 at 2 B):
+
+| Part | Elements | Bytes | Grows with M? |
+|---|---|---|---|
+| Weight W (K×N) | 37.7 M | 75.5 MB | no: read once, shared by every token |
+| Input X (M×K) | 3.9 M | 7.9 MB | yes |
+| Output Y (M×N) | 15.7 M | 31.5 MB | yes |
+| **Total** | | **≈ 115 MB** | |
+
+FLOPs = 2 × 1280 × 3072 × 12288 = 96.6 G, so AI ≈ 96.6 G / 115 MB ≈ **840 FLOP/B**.
+
+**Check: what does batching 4 windows do to AI?** M becomes 5120. FLOPs grow 4× (386 G). Bytes grow only about 2×: the weight is still 75.5 MB, but the activations grow with M (X = 31.5 MB, Y = 126 MB), so the total is about 233 MB. That gives **AI ≈ 1660: about 2×, not 4×.** `2M/b_w` holds only while the weight dominates the bytes, and at M=1280 the activations are already about a third of them.
+
+We were already compute-bound at M=1280, so batching doesn't change the regime. It helps because each pass's fixed costs (today the dequant, later the launches and SSD reads) are paid once for more tokens. See Technique 3.
+
+Our cases:
 
 | Kernel | M | Weight format | AI (FLOP/B) | Regime |
 |---|---|---|---|---|
@@ -139,6 +183,8 @@ Achieved rates for D and S use the measured block times with the separately meas
 
 ### 1.5 Compute-bound vs memory-bound, as a habit
 
+`Must`
+
 Before optimising a kernel, find which side of the ridge it sits on:
 
 - **Compute-bound** (big GEMMs, attention): use faster math units (tensor cores, lower precision like INT8) and keep them fed (tiling, double buffering).
@@ -147,6 +193,34 @@ Before optimising a kernel, find which side of the ridge it sits on:
 Making a memory-bound kernel do fewer FLOPs gains nothing. Making a compute-bound kernel read fewer bytes gains nothing either. That is why the roofline matters.
 
 ### 1.6 FLUX's FLOPs per step, from the real shapes
+
+`Must`
+
+> **Plain version (read this first).**
+>
+> **The idea in one line:** the work in a step ≈ 2 × (the weights a token passes through) × (the number of tokens). Everything else is counting those two correctly.
+>
+> ```
+> tokens in ──► [19 double blocks] ──► [38 single blocks] ──► image out
+> ```
+>
+> - Every token passes through P ≈ 113 M weights per block, double or single.
+> - 57 blocks × 2 × P ≈ 12.9 G operations per token.
+> - 512 px → 1024 image tokens + 256 text tokens = N = 1280.
+> - 12.9 G × 1280 ≈ 16.5 T (weights) + ~1.2 T (attention) ≈ **17.7 TFLOP per step**.
+>
+> Three takeaways:
+> 1. 17.7 / 2.74 s = 6.45 TFLOP/s against a 19.1 peak, so **we use about 34% of the GPU**. That gap is what the engine chases.
+> 2. The spike's "30 TFLOP" multiplied all weights by all tokens. Image tokens never meet text weights, and modulation sees 1 row, not 1280. **Count only the weights and tokens that actually meet.**
+> 3. Modulation is 27% of the weights and about 0% of the math, yet it is unpacked every step (~0.29 s of 2.74 s). It is a cheap target.
+>
+> ```
+>               share of WEIGHTS              share of MATH
+> modulation    ███████ 27%                   ▏ ~0%
+> token-facing  ████████████████████ 73%      ████████████████████████ ~100%
+> ```
+>
+> The detail below shows where each of these numbers comes from.
 
 **Architecture.** Hidden size `h = 3072` (24 heads × 128), MLP width 12288. There are 19 **double blocks**, where image and text tokens have separate weights but attend jointly, and 38 **single blocks**, where all tokens share weights. Every block has a **modulation** linear (AdaLN, adaptive layer norm). It turns the per-image conditioning vector (timestep + pooled CLIP) into shift, scale and gate values, so it sees **one row per image**, not one per token.
 
@@ -200,6 +274,8 @@ total                                    ≈ 17.7 TFLOP per step
 
 ### 1.7 Today's achieved TFLOPS
 
+`Must`
+
 ```
 512 px, measured step 2.74 s:     17.7 TFLOP / 2.74 s  = 6.45 TFLOPS  = 34% of the measured 19.1 peak
 512 px, resident compute 2.59 s:  17.7 / 2.59          = 6.8 TFLOPS   = 36%
@@ -213,6 +289,8 @@ The bigger image runs closer to the roof because dequant is a fixed cost per ste
 **Rounding and assumptions.** The FLOP counts are exact for the matmuls and leave out softmax, norms and embedders (under 0.1%). "Peak" is our measured 19.1, not a datasheet number; against a datasheet-style estimate of 17–20 TFLOPS the percentage moves by a few points. If someone runs with 512 text tokens (21.5 TFLOP) the step will be slower too, so do not divide 21.5 by 2.74.
 
 ### 1.8 Why "achieved TFLOPS as % of peak" is a good headline
+
+`Must`
 
 - **It normalises.** s/step changes with resolution, batch and text length; % of peak does not. 34% at 512 and 43% at 1024×512 are directly comparable.
 - **It shows the headroom.** 34% means that, at best, we could be about 3× faster without doing less work. A team at 85% has nowhere to go except changing the work (lower precision, caching).
@@ -235,6 +313,8 @@ The bigger image runs closer to the roof because dequant is a fixed cost per ste
 
 ## Part 2: The six techniques
 
+`Must` for the breakdown below; each technique has its own tag.
+
 Today's 512 px step, measured, weights resident (2.59 s), plus 0.15 s offload overhead = 2.74 s:
 
 | Part | Time | Share |
@@ -247,11 +327,13 @@ Today's 512 px step, measured, weights resident (2.59 s), plus 0.15 s offload ov
 
 ### Technique 1: Fused Q4_K dequant + tensor-core GEMM (W4A16)
 
-*W4A16 means 4-bit weights, 16-bit activations.* Plan Tasks 3 (naive), 4 (tiled), 5 (`mma`).
+`Must` for the idea; the layout and `mma` details are `Understand`. *W4A16 means 4-bit weights, 16-bit activations.* Plan Tasks 3 (naive), 4 (tiled), 5 (`mma`).
+
+> **Q4_K in one paragraph.** Q4_K stores each weight as a 4-bit number (0–15) plus a small "ruler" shared by every 32 weights. Real weight = ruler × number (minus an offset). That is 4.5 bits per weight, 3.6× smaller than bf16. Today we unpack the whole layer to bf16 before each multiply; the fused kernel unpacks 32 at a time in registers instead.
 
 **The problem, in our numbers.** diffusers' GGUF path keeps weights in Q4_K on the GPU. On every linear call it unpacks the *whole* weight to a bf16 tensor in VRAM with a chain of PyTorch ops, then hands that to cuBLAS. That takes **1.08 s per step, 42% of the step**. The minimum traffic for that unpack is reading 6.66 GB of Q4_K and writing 23.7 GB of bf16 (11.83 B × 2 B): 30.3 GB ÷ 192 GB/s ≈ 0.16 s (est.). The measured 1.08 s is about 7× that, because each PyTorch op writes its intermediate result to VRAM and the next op reads it back. Then the GEMM reads the 23.7 GB again. Every step, for every weight, even though the weights never change.
 
-**The Q4_K super-block.** Q4_K (llama.cpp's "k-quant") stores 256 weights in a 144-byte super-block, 4.5 bits per weight:
+**Understand later (Task 3): the Q4_K super-block in full.** Q4_K (llama.cpp's "k-quant") stores 256 weights in a 144-byte super-block, 4.5 bits per weight:
 
 ```
  Q4_K super-block: 256 weights in 144 bytes
@@ -317,7 +399,13 @@ The baseline doc's "~1.5 s floor" assumes cuBLAS-level GEMMs. Matching cuBLAS is
 
 ### Technique 2: W4A8 on the INT8 tensor cores
 
-*W4A8 means 4-bit weights, 8-bit integer activations.* Not in the plan.
+`Must` for the short version; the rescale algebra is `Understand`; SmoothQuant internals are `Skip`. *W4A8 means 4-bit weights, 8-bit integer activations.* Not in the plan.
+
+> **Short version.**
+> - **W4A16 (Technique 1):** 4-bit storage, bf16 math. It saves memory and memory traffic, not math. The multiply runs at the bf16 tensor-core rate either way. The exception is M=1 (GEMV), which is memory-bound, so smaller weights do speed it up.
+> - **W4A8:** also quantize activations to INT8 on the fly (one scale per token), and run on the INT8 tensor cores. The theoretical ceiling is about 4× our bf16-with-fp32-accumulate rate, or 2× fp16-with-fp16-accumulate. The real gain is lower (est. 1.8–2.5× on the GEMM).
+> - **A nice fit:** Ampere's INT8 `mma.m16n8k32` consumes exactly 32 values of K, which is one Q4_K sub-block, so one ruler per instruction.
+> - **Risks:** activation outliers. Fixes: per-token scales, SmoothQuant, or keeping sensitive layers at bf16. It must re-pass the quality gates, including the `walk_sheet.py` seam check on walks.
 
 **The problem, in our numbers.** After Technique 1 the step is mostly bf16 GEMM, about 1.25–1.6 s of a ~1.9 s step (est.), already compute-bound. The bf16 roof is 19.1 TFLOPS. The INT8 tensor cores on GeForce Ampere run at about 4× that rate, ~76 TOPS (est.). The only way through the roof is to do the multiply in a cheaper number format.
 
@@ -358,7 +446,7 @@ The baseline doc's "~1.5 s floor" assumes cuBLAS-level GEMMs. Matching cuBLAS is
 
 ### Technique 3: Window batching
 
-Plan Task 6. A panorama is painted as several overlapping windows (8 for the full pano). Batching runs several windows through each transformer pass together.
+`Must`. Plan Task 6. A panorama is painted as several overlapping windows (8 for the full pano). Batching runs several windows through each transformer pass together.
 
 **The problem, in our numbers.** Every pass over the 57 blocks costs some things once per pass, whatever the number of windows: today that is the 1.08 s dequant and the 0.15 s offload overhead. One window at a time pays them 8 times per step.
 
@@ -410,7 +498,7 @@ Batch 4 already logged allocator OOM retries in the baseline. Technique 6 (fused
 
 ### Technique 4: CUDA graphs
 
-Not in the plan.
+`Understand`. Not in the plan.
 
 **The problem.** Every GPU kernel is started by the CPU: Python → PyTorch dispatch → CUDA driver → GPU queue. That costs roughly 5–20 µs of CPU per op in eager PyTorch (est.) and a few µs on the GPU between kernels. If the CPU can't enqueue kernels faster than the GPU finishes them, the GPU sits idle in the gaps.
 
@@ -461,7 +549,7 @@ At ~10 µs each, 3,000 launches is about 0.03 s of CPU time against a ~1.9 s GPU
 
 ### Technique 5: Block caching (TeaCache / First-Block-Cache style)
 
-Not in the plan.
+`Understand`. Not in the plan.
 
 **The problem.** Between two denoising steps the input changes, but sometimes most blocks' *contribution* (the residual they add) barely changes. If we can detect that cheaply, we can skip recomputing them.
 
@@ -505,7 +593,7 @@ Not in the plan.
 
 ### Technique 6: Fused attention and norm/glue kernels
 
-Not in the plan as a task.
+`Understand`. Not in the plan as a task.
 
 **The problem.** "Glue" means every non-GEMM op around the matmuls: LayerNorm, the AdaLN modulate (`x·(1+scale)+shift`), QK RMSNorm, RoPE, GELU, gating (`gate·y`), residual adds, and the split/concat of text and image tokens. Each is memory-bound (~1 FLOP/byte): it reads a whole activation from VRAM and writes it back. One [1280, 3072] bf16 tensor is 7.9 MB; the MLP hidden state is 31.5 MB.
 
@@ -552,6 +640,8 @@ As the GEMMs speed up, glue becomes a larger share of the step.
 
 ## Part 3: Putting it together
 
+`Must` for the two reality checks at the end; the factor arithmetic is `Understand`.
+
 | # | Technique | Expected speedup on the step (est.) | Quality risk | Effort | In the plan? |
 |---|---|---|---|---|---|
 | 1 | Fused Q4_K + tensor-core GEMM (W4A16) | **1.45×** (1.25–1.7) | none (same maths; PSNR ≥ 30 dB gate) | high | yes, Tasks 3–5 |
@@ -584,6 +674,8 @@ Sanity check: 17.7 TFLOP at 1.40 s is 12.6 TFLOPS, 66% of the measured bf16 peak
 
 ## Part 4: Open decisions (for you)
 
+`Skip` for interview revision; these are project decisions, not study.
+
 **Decision 1: quality policy for speedups.**
 
 - **A. Quality fixed.** Every speedup must produce the same picture, within the PSNR gates already in the plan. Do Techniques 1, 3, 4 and 6. Add 2 only if it passes a quality gate (same seed, PSNR against W4A16, plus your eye on contact sheets). Expected: ~1.4 s per window-step stacked, 1.6–2.0 s realistic (est.); ~1.0 s if W4A8 passes.
@@ -601,3 +693,13 @@ It matters for speed too: the recipe decides how many windows and denoising pass
 ---
 
 *Next entry suggestion: after Task 3's bench, record the naive kernel's numbers against these predictions and note where the estimates were wrong.*
+
+---
+
+## Learner preferences
+
+Recorded at the 2026-10-24 walkthrough. They apply to every future entry and walkthrough.
+
+- Plain language first, numbers second. Open each idea with a one-line version before the detail.
+- One concept per walkthrough.
+- When the learner says "skip", reduce that part to a one-line takeaway, and keep the detail only under an "Understand later" label.
