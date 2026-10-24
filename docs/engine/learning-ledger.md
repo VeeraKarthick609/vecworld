@@ -28,6 +28,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 - W4A16 vs W8A8 vs W4A8 (Technique 2).
 - Why 4-bit weights save memory but not compute, except at M=1, where a GEMM is memory-bound (Techniques 1 and 2).
 - Batching amortizes per-pass costs (Technique 3).
+- Where a 2.74 s step goes (Part 2): ~40% wasted unpacking, ~40% real math already near the ceiling, ~15% small-op overhead; each is fixed a different way.
 
 **Understand.** The exact Q4_K bytes, `mma` tile shapes, the min-term algebra, CUDA graphs, block caching and glue fusion.
 
@@ -314,6 +315,34 @@ The bigger image runs closer to the roof because dequant is a fixed cost per ste
 ## Part 2: The six techniques
 
 `Must` for the breakdown below; each technique has its own tag.
+
+> **Plain version: where the 2.74 s of a step goes** (`Must`)
+>
+> ```
+> one step ≈ 2.74 s
+> ┌──────────────────────────┬─┬─────────────────────────┬──────────┬────────┐
+> │ dequant 1.08 s           │A│ GEMM ~1.05 s            │glue ~0.4 │offload │
+> │ unpacking weights        │ │ the real multiplies     │small ops │0.15 s  │
+> └──────────────────────────┴─┴─────────────────────────┴──────────┴────────┘
+>                             └ attention 0.06 s
+> ```
+>
+> 1. **Dequant, 1.08 s (42%).** Every step unpacks all 11.8 B 4-bit weights to bf16. It does no useful math: it only copies bytes, and it is the biggest line. About 0.29 s of it is modulation weights (§1.6). **Fix:** the fused Q4_K kernel unpacks 32 weights at a time in registers, bringing this to about 0 (Technique 1). It is the biggest and surest win.
+> 2. **Attention (SDPA), 0.06 s (2.5%).** Tokens look at each other. 1.15 TFLOP / 0.065 s ≈ 17.7 TFLOP/s, close to the 19.1 roof. It is already near-optimal, so leave it alone.
+> 3. **GEMM, ~1.05 s (est.).** The real 16.5 TFLOP of weight multiplies. This is an estimate because the measurement lumps it with glue. It assumes cuBLAS runs at ~16 TFLOP/s on the M=1280 shapes and ~12 on the M=256 text shapes (small matrices fill the GPU less well). That is already about 80% of the bf16 roof (16.5 / 1.05 ≈ 15.7 TFLOP/s), so bf16 can't go much faster. The only options are faster math (W4A8 on the INT8 tensor cores, up to ~4× our bf16-with-fp32-accumulate rate in theory, Technique 2) or less math (block caching, Technique 5).
+> 4. **Glue, ~0.4 s (est., 0.25–0.55).** Norms, modulate `x·(1+scale)+shift`, GELU, RoPE, residual adds and reshapes. Each reads and writes the whole activation for about 1 operation per number, so it is memory-bound. It also launches thousands of tiny kernels, each with fixed overhead. It is a range because it is 1.44 s minus the GEMM estimate. **Fix:** fusion, e.g. norm + modulate + add in one pass (Technique 6), and CUDA graphs, which record the launches once and replay them (Technique 4).
+> 5. **Offload, 0.15 s.** The measured 2.74 s step is 0.15 s above the 2.59 s resident compute; the four lines above add up to that 2.59 s (2.58 after rounding).
+>
+> | Line | Now | After the engine (rough, est.) | How |
+> |---|---|---|---|
+> | Dequant | 1.08 s | ~0 | fused Q4_K kernel (Technique 1) |
+> | Attention | 0.06 s | 0.06 s | already near-optimal |
+> | GEMM | ~1.05 s | ~0.4–0.8 s: ~0.4–0.6 if our W4A16 kernel matches cuBLAS, 0.6–0.8 from a first-kernel 1.25–1.6 s | W4A8 INT8, if it passes the quality gate (Technique 2) |
+> | Glue | ~0.4 s | ~0.1–0.15 s | fusion + CUDA graphs (Techniques 6, 4) |
+>
+> Block caching (Technique 5, Option B only) would then skip whole steps of what remains.
+>
+> **One-line takeaway:** the step is ~40% wasted unpacking, ~40% real math already near the ceiling and ~15% small-op overhead (plus ~5% offload), and each part is fixed a different way.
 
 Today's 512 px step, measured, weights resident (2.59 s), plus 0.15 s offload overhead = 2.74 s:
 
