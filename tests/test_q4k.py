@@ -8,6 +8,10 @@ import torch
 
 pytestmark = pytest.mark.gpu
 
+# The GEMM stages built so far. Every unit test runs on each; "naive" (Task 3) is the reference the later ones are
+# also checked against directly.
+KERNELS = ["naive", "tiled"]
+
 # One real Q4_K tensor per in_features the file holds (3072, 12288, 15360).
 REAL = ["double_blocks.0.img_attn.proj.weight", "double_blocks.0.img_mlp.2.weight", "single_blocks.0.linear2.weight"]
 
@@ -54,35 +58,92 @@ def test_q4k_dequant_matches_gguf(gg, name):
     assert torch.equal(ours, ref)
 
 
+@pytest.mark.parametrize("kernel", KERNELS)
 @pytest.mark.parametrize("name", REAL)
-def test_q4k_gemm_matches_reference(gg, name):
+def test_q4k_gemm_matches_reference(gg, name, kernel):
     from vecworld.engine.q4k import Q4KLinear
 
     t = gg[name]
     g = torch.Generator().manual_seed(0)
     x = torch.randn(256, t.shape[1], generator=g).to("cuda", torch.bfloat16)
     bias = (torch.randn(t.shape[0], generator=g) * 0.1).to("cuda", torch.bfloat16)
-    lin = Q4KLinear(t, bias, "naive").cuda()
+    lin = Q4KLinear(t, bias, kernel).cuda()
     ref = x.float() @ deq(t).cuda().T + bias.float()
     out = lin(x)
     assert out.dtype == torch.bfloat16 and out.shape == (256, t.shape[0])
     assert rel_err(out, ref) < 2e-2
 
 
+@pytest.mark.parametrize("kernel", KERNELS)
 @pytest.mark.parametrize("m", [1, 7, 333, 1792])
-def test_q4k_gemm_ragged(gg, m):
+def test_q4k_gemm_ragged(gg, m, kernel):
     """Ragged M (tokens x windows) and an out_features that is no tile multiple (1000), with leading dims."""
     from vecworld.engine.q4k import Q4KLinear
 
     t = rows(gg[REAL[0]], 1000)
     g = torch.Generator().manual_seed(m)
     x = torch.randn(1, m, t.shape[1], generator=g).to("cuda", torch.bfloat16)
-    lin = Q4KLinear(t, None, "naive").cuda()
+    lin = Q4KLinear(t, None, kernel).cuda()
     out = lin(x)
     ref = x.float() @ deq(t).cuda().T
     assert out.shape == (1, m, 1000)
     assert rel_err(out, ref) < 2e-2
     assert torch.isfinite(out).all()
+
+
+# Every later stage against the naive reference directly, on the same real weights. Both decode each weight
+# bit-exactly and sum in fp32; only the summation order differs, so the bf16 outputs agree to about one bf16 step of
+# the largest output (2^-8 = 3.9e-3 relative to it). A decode or indexing bug is orders of magnitude above this bar.
+NAIVE_BAR = 8e-3
+
+
+@pytest.mark.parametrize("kernel", [k for k in KERNELS if k != "naive"])
+@pytest.mark.parametrize("name, m, n", [(REAL[0], 256, None), (REAL[1], 256, None), (REAL[2], 256, None),
+                                        (REAL[0], 1, 1000), (REAL[0], 7, 1000), (REAL[0], 333, 1000),
+                                        (REAL[0], 1792, 1000), (REAL[0], 31, 1000), (REAL[0], 128, 1000),
+                                        (REAL[0], 129, 1000)])
+def test_q4k_gemm_matches_naive(gg, name, m, n, kernel):
+    from vecworld.engine.ext import load_ext
+
+    t = gg[name] if n is None else rows(gg[name], n)
+    g = torch.Generator().manual_seed(m)
+    x = torch.randn(m, t.shape[1], generator=g).to("cuda", torch.bfloat16)
+    bias = (torch.randn(t.shape[0], generator=g) * 0.1).to("cuda", torch.bfloat16)
+    packed = torch.from_numpy(np.ascontiguousarray(t.data)).cuda()
+    ext = load_ext()
+    ref = ext.q4k_gemm_naive(x, packed, bias)
+    out = getattr(ext, f"q4k_gemm_{kernel}")(x, packed, bias)      # the kernel itself, whatever Q4KLinear picks
+    assert out.shape == ref.shape == (m, t.shape[0])
+    err = rel_err(out, ref.float())
+    print(f"\n{kernel} vs naive, {t.name} M={m}: max-rel {err:.2e}")
+    assert err < NAIVE_BAR
+
+
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_q4k_gemm_misaligned(gg, kernel):
+    """The kernels read x and the packed weight with 16-byte vector loads. The extension rejects a view whose base
+    address is not 16-byte aligned (instead of a misaligned-address fault or a silent wrong read); Q4KLinear copies
+    such a view to an aligned buffer and computes the right answer."""
+    from vecworld.engine.ext import load_ext
+    from vecworld.engine.q4k import Q4KLinear
+
+    t = rows(gg[REAL[0]], 64)
+    gemm = getattr(load_ext(), f"q4k_gemm_{kernel}")
+    packed = torch.from_numpy(np.ascontiguousarray(t.data)).cuda()
+    x = torch.randn(64, t.shape[1], device="cuda", dtype=torch.bfloat16)     # 64 rows: "tiled" runs tiled
+    xm = torch.empty(x.numel() + 1, device="cuda", dtype=torch.bfloat16)[1:].view_as(x)      # 2 bytes off
+    xm.copy_(x)
+    wm = torch.empty(packed.numel() + 4, device="cuda", dtype=torch.uint8)[4:].view_as(packed)  # 4 bytes off
+    wm.copy_(packed)
+    assert xm.is_contiguous() and wm.is_contiguous()
+    with pytest.raises(RuntimeError, match="aligned"):
+        gemm(xm, packed)
+    with pytest.raises(RuntimeError, match="aligned"):
+        gemm(x, wm)
+    lin = Q4KLinear(t, None, kernel).cuda()
+    lin.qweight.data = wm
+    ref = x.float() @ deq(t).cuda().T
+    assert rel_err(lin(xm), ref) < 2e-2
 
 
 def test_swap_skips_non_q4k(gg):
@@ -148,7 +209,7 @@ def test_swap_rejects_unknown_kernel(gg):
 # gate is per block (max-rel < 2e-2, reusable by kernel name); the whole pass is held to rel L2 < 0.06 and the
 # picture to 28 dB, with a sheet to judge by eye.
 
-BLOCK_KERNELS = ["naive"]          # later stages add theirs: the same gate holds every kernel to diffusers
+BLOCK_KERNELS = KERNELS            # the same gate holds every kernel to diffusers
 
 
 @pytest.fixture(scope="module")
@@ -256,13 +317,23 @@ def _forward(p, e) -> torch.Tensor:
     return p._forward(g, [e], 1.0).cpu()
 
 
-def test_flux_forward_matches_reference(monkeypatch):
-    """One whole forward pass (57 blocks, no denoise loop), same inputs, naive vs diffusers: relative L2 < 0.06
+_REFERENCE: dict = {}               # the diffusers results, computed once per module for every kernel
+
+
+def _reference(fn, monkeypatch):
+    if fn.__name__ not in _REFERENCE:
+        _REFERENCE[fn.__name__] = _with_painter(None, monkeypatch, fn)
+    return _REFERENCE[fn.__name__]
+
+
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_flux_forward_matches_reference(monkeypatch, kernel):
+    """One whole forward pass (57 blocks, no denoise loop), same inputs, `kernel` vs diffusers: relative L2 < 0.06
     (naive 4.2%; the exact fp32 path 4.5%). Max-rel is printed, not gated (0.127: compounding, see the note above)."""
-    ref = _with_painter(None, monkeypatch, _forward)
-    ours = _with_painter("naive", monkeypatch, _forward)
+    ref = _reference(_forward, monkeypatch)
+    ours = _with_painter(kernel, monkeypatch, _forward)
     l2 = float((ours - ref).norm() / ref.norm())
-    print(f"\nforward naive vs reference: rel L2 {l2:.2e}, max-rel {rel_err(ours, ref):.2e}")
+    print(f"\nforward {kernel} vs reference: rel L2 {l2:.2e}, max-rel {rel_err(ours, ref):.2e}")
     assert torch.isfinite(ours).all()
     assert l2 < 0.06
 
@@ -277,17 +348,18 @@ def _paint(p, e) -> np.ndarray:
     return ((px.permute(1, 2, 0).cpu().numpy() + 1) * 127.5).round().astype(np.uint8)
 
 
-def test_flux_image_matches_reference(monkeypatch, tmp_path):
-    """The 4-step sanity gate: same seed at 512, naive vs diffusers, PSNR >= 28 dB (see the note above). The sheet
-    (reference | naive | 4x |difference|) is saved for an eye check."""
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_flux_image_matches_reference(monkeypatch, tmp_path, kernel):
+    """The 4-step sanity gate: same seed at 512, `kernel` vs diffusers, PSNR >= 28 dB (see the note above). The
+    sheet (reference | kernel | 4x |difference|) is saved for an eye check."""
     from PIL import Image
 
-    ref = _with_painter(None, monkeypatch, _paint)
-    ours = _with_painter("naive", monkeypatch, _paint)
+    ref = _reference(_paint, monkeypatch)
+    ours = _with_painter(kernel, monkeypatch, _paint)
     diff = np.clip(np.abs(ref.astype(np.int16) - ours.astype(np.int16)) * 4, 0, 255).astype(np.uint8)
-    sheet = tmp_path / "q4k_naive_vs_reference.png"
+    sheet = tmp_path / f"q4k_{kernel}_vs_reference.png"
     Image.fromarray(np.concatenate([ref, ours, diff], 1)).save(sheet)
     mse = np.mean((ref.astype(np.float64) - ours.astype(np.float64)) ** 2)
     psnr = 10 * np.log10(255 ** 2 / max(mse, 1e-12))
-    print(f"\nPSNR naive vs reference: {psnr:.2f} dB; sheet: {sheet}")
+    print(f"\nPSNR {kernel} vs reference: {psnr:.2f} dB; sheet: {sheet}")
     assert psnr >= 28

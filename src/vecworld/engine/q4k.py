@@ -6,7 +6,11 @@ import torch
 from gguf import GGMLQuantizationType
 
 QK_K, Q4K_BYTES = 256, 144          # weights and bytes per Q4_K super-block
-KERNELS = ("naive",)                # later stages add "tiled", "mma", "w4a8"
+KERNELS = ("naive", "tiled")       # later stages add "mma", "w4a8"
+# Below this many rows (tokens x windows) "tiled" runs the naive kernel: a 128-row tile would be mostly padding. FLUX's
+# modulation linears run at M = 1 per window (4.0 ms tiled vs 0.7 ms naive for 3072 -> 18432); the crossover measured
+# at M = 24..32 (docs/engine/02-q4k-tiled.md).
+TILED_MIN_M = 32
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,12 @@ def _packed(weight: GGUFTensor) -> torch.Tensor:
     return t
 
 
+def _aligned(t: torch.Tensor) -> torch.Tensor:
+    """t, or an aligned copy of it: the kernels read x and the packed weight with 16-byte vector loads. Fresh CUDA
+    allocations are always aligned; only a view that starts mid-allocation needs the copy."""
+    return t if t.data_ptr() % 16 == 0 else t.clone()
+
+
 class Q4KLinear(torch.nn.Module):
     """A linear layer computed straight from its packed Q4_K super-blocks: forward(x bf16 [..., in]) ->
     bf16 [..., out]. kernel picks the stage (KERNELS).
@@ -65,9 +75,10 @@ class Q4KLinear(torch.nn.Module):
         from vecworld.engine.ext import load_ext
 
         lead = x.shape[:-1]
-        x2 = x.reshape(-1, self.in_features).to(torch.bfloat16).contiguous()
+        x2 = _aligned(x.reshape(-1, self.in_features).to(torch.bfloat16).contiguous())
         b = None if self.bias is None else self.bias.to(torch.bfloat16).contiguous()
-        y = load_ext().q4k_gemm_naive(x2, self.qweight, b)
+        kernel = "naive" if self.kernel == "tiled" and x2.shape[0] < TILED_MIN_M else self.kernel
+        y = getattr(load_ext(), f"q4k_gemm_{kernel}")(x2, _aligned(self.qweight), b)
         return y.reshape(*lead, self.out_features)
 
     def extra_repr(self) -> str:
