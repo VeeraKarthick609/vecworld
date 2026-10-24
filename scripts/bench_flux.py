@@ -1,6 +1,9 @@
-"""FLUX bench harness. --painter reference benches the game's FluxPainter (diffusers + GGUF + group offload).
+"""FLUX bench harness. --painter reference benches the game's FluxPainter (diffusers + GGUF + group offload);
+--painter engine benches the same painter with the engine flags (VECWORLD_KERNEL=naive, ...) taken from the
+environment. Engine results also carry the step's FLOP count, achieved TFLOP/s and % of the measured bf16 peak.
 
   uv run python scripts/bench_flux.py --painter reference --what pano --out bench/x.json
+  VECWORLD_KERNEL=naive uv run python scripts/bench_flux.py --painter engine --what tile512 --out bench/t3-naive.json
 
 tile512, pano and step run the real painter (its T5 and CLIP included; T5 is encoded once, before timing, and
 its cold encode is recorded). blocks and bw measure the bare transformer and the machine. Speed numbers are only
@@ -11,6 +14,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PROMPT = "a dirt path through a sunlit old forest clearing, open ground in the foreground, big trees, ferns"
+
+
+def flop_per_step(n_img: int, n_txt: int) -> float:
+    """One transformer pass's FLOPs by the exact count (learning ledger section 1.6): 57 blocks x 2 x P weights per
+    token (P = 113,246,208, the weights every token meets per block; modulation's one row dropped) plus attention,
+    4 N^2 h per block, h = 3072. 17.67e12 at N = 1024 + 256."""
+    n = n_img + n_txt
+    return 114 * 113_246_208 * n + 700_416 * n ** 2
+
+
+def bf16_peak() -> float:
+    """The measured bf16 matmul peak in TFLOP/s (bench/baseline.json, blocks)."""
+    return json.loads((ROOT / "bench/baseline.json").read_text())["results"]["blocks"]["bf16_matmul_tflops"]
+
+
+def engine_fields(res: dict, n_img: int, n_txt: int, peak_tflops: float | None = None,
+                  key: str = "s_per_pass_median") -> dict:
+    """res with the pass's FLOP count, the TFLOP/s achieved over res[key] seconds and that as % of the bf16 peak
+    (bf16_peak() unless given)."""
+    peak = bf16_peak() if peak_tflops is None else peak_tflops
+    f = flop_per_step(n_img, n_txt)
+    tf = f / res[key] / 1e12
+    return {**res, "flop_per_step": f, "achieved_tflops": round(tf, 2), "pct_bf16_peak": round(100 * tf / peak, 1)}
 
 
 def power():
@@ -73,12 +99,17 @@ def bench(fn, n=5):
 
 
 def load_transformer():
+    """The bare transformer; with VECWORLD_KERNEL set (--painter engine), its Q4_K linears on that kernel."""
     import torch
     from diffusers import FluxTransformer2DModel, GGUFQuantizationConfig
     from vecworld.config import FLUX_BASE, FLUX_GGUF
-    return FluxTransformer2DModel.from_single_file(
+    tr = FluxTransformer2DModel.from_single_file(
         str(FLUX_GGUF), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
-        torch_dtype=torch.bfloat16, config=FLUX_BASE, subfolder="transformer"), str(FLUX_GGUF)
+        torch_dtype=torch.bfloat16, config=FLUX_BASE, subfolder="transformer")
+    if os.environ.get("VECWORLD_KERNEL"):
+        from vecworld.engine.swap import gguf_linears, swap_linears
+        swap_linears(tr, gguf_linears(tr), os.environ["VECWORLD_KERNEL"])
+    return tr, str(FLUX_GGUF)
 
 
 def load_painter(R, mon):
@@ -144,7 +175,16 @@ def do_step(R, mon):
     from vecworld.roam.spot import focus_half
     p, prompt, passes = load_painter(R, mon)
     prev = dolly(p.panorama(prompt, seed=21), 1.6)
+    wins, fwd = [0], p._forward
+
+    def counted(tiles, embs, s):                  # a pass carries up to FLUX_BATCH windows
+        wins[0] += tiles.shape[0]
+        return fwd(tiles, embs, s)
+
+    p._forward = counted
     img, R["step"] = timed(lambda: p.step(prev, prompt, None, 0.5, seed=22, focus_half=focus_half(1.6)), passes, mon)
+    R["step"]["window_passes"] = wins[0]
+    R["step"]["s_per_window_pass"] = round(R["step"]["s"] / max(wins[0], 1), 2)   # wall time incl. VAE and text
     (ROOT / "bench").mkdir(exist_ok=True); img.save(ROOT / "bench/last_step.png")
 
 
@@ -253,6 +293,20 @@ def do_bw(R, mon):
         R[key] = round(total / (time.perf_counter() - t) / 1e9, 2)
 
 
+def add_engine_fields(R):
+    """The FLOP-rate fields on a run's results, per 512 window pass with 256 text tokens: tile512 over its median
+    pass; a walk step over its wall time per window pass (its passes batch windows, and its wall time includes the
+    VAE and text: a lower bound on the kernel's rate); blocks over each size's resident step."""
+    from vecworld.config import FLUX_TEXT_LEN, FLUX_WIN
+    if "tile512" in R:
+        R["tile512"] = engine_fields(R["tile512"], FLUX_WIN * FLUX_WIN, FLUX_TEXT_LEN)
+    if "step" in R:
+        R["step"] = engine_fields(R["step"], FLUX_WIN * FLUX_WIN, FLUX_TEXT_LEN, key="s_per_window_pass")
+    for k, (w, h) in (("512x512", (512, 512)), ("1024x512", (1024, 512))):
+        if k in R:
+            R[k] = engine_fields(R[k], (w // 16) * (h // 16), 256, key="resident_step_s")
+
+
 WHATS = dict(tile512=do_tile512, pano=do_pano, step=do_step, blocks=do_blocks, bw=do_bw)
 
 
@@ -262,17 +316,21 @@ def main():
     ap.add_argument("--what", choices=list(WHATS), required=True)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    if a.painter == "engine":
-        sys.exit("painter 'engine' is not built yet")
+    if a.painter == "engine" and not os.environ.get("VECWORLD_KERNEL"):
+        sys.exit("--painter engine needs its flags: set VECWORLD_KERNEL (e.g. naive)")
+    if a.painter == "reference":
+        os.environ.pop("VECWORLD_KERNEL", None)       # the reference is diffusers all the way
     pw = power()
     if pw != "ac":
         sys.exit("on battery: speed numbers are invalid; plug in and rerun")
     import torch
     mon = Mon()
-    R = {"what": a.what, "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
+    R = {"what": a.what, "painter": a.painter, "kernel": os.environ.get("VECWORLD_KERNEL"), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
     t0 = time.time()
     WHATS[a.what](R, mon)
     R["wall_s"] = round(time.time() - t0, 1)
+    if a.painter == "engine":
+        add_engine_fields(R)
     mon.stop = True
     R["gpu_power_end"] = " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))
     out = {"power": power(), "git": git_sha(), "results": R}

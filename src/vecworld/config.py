@@ -114,7 +114,7 @@ FLUX_STEP_RECIPES = {
     "sharp": {"release": "graded", "side": 0.75, "back": 0.9, "focus": 1.0, "feather": 0.25},
     "fresh": {"release": "fresh"},
 }
-FLUX_STEP_RECIPE = "sharp"   # Task 2b recommendation; the A/B sheets are the user's to judge
+FLUX_STEP_RECIPE = "sharp"   # the user's pick after the Task 2b A/B sheets (2026-10-24): final
 
 
 def check_recipe(name: str) -> dict:

@@ -1,0 +1,32 @@
+{
+ "power": "ac",
+ "git": "6f01119-dirty",
+ "results": {
+  "what": "step",
+  "painter": "engine",
+  "kernel": "naive",
+  "gpu_power": "80.00 1 8",
+  "load_s": 31.5,
+  "rss_after_setup_gb": 7.62,
+  "t5_encode_cold_s": 6.36,
+  "mon_t5": {
+   "rss_gb": 8.2,
+   "smi_mib": 1296
+  },
+  "step": {
+   "s": 945.1,
+   "passes": 10,
+   "s_per_pass_median": 94.37,
+   "peak_alloc_gb": 1.33,
+   "rss_gb": 8.67,
+   "smi_mib": 1710,
+   "window_passes": 40,
+   "s_per_window_pass": 23.63,
+   "flop_per_step": 17672448245760,
+   "achieved_tflops": 0.75,
+   "pct_bf16_peak": 3.9
+  },
+  "wall_s": 1730.8,
+  "gpu_power_end": "90.00 4 8"
+ }
+}

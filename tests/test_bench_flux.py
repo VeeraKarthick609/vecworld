@@ -18,3 +18,20 @@ def test_tile512_runs_one_window_per_step():
     out = bench.run_tile512(p, p._embed([("a forest", 1.0)]), FLUX_STEPS)
     assert out.shape == (1, 64, FLUX_WIN, FLUX_WIN) and torch.isfinite(out).all()
     assert [c.shape[0] for c in tr.calls] == [1] * FLUX_STEPS           # one 512x512 window, once per step
+
+
+def test_flop_per_step_matches_ledger():
+    """Ledger section 1.6: 57 blocks x 2 x P weights per token plus attention, 17.67 TFLOP at N = 1024 + 256."""
+    f = bench.flop_per_step(1024, 256)
+    assert f == 114 * 113_246_208 * 1280 + 700_416 * 1280 ** 2
+    assert abs(f - 17.67e12) < 0.01e12
+
+
+def test_engine_row_fields():
+    """An engine result gets the FLOP count, achieved TFLOP/s and % of the measured bf16 peak from its pass time."""
+    row = bench.engine_fields({"s_per_pass_median": 2.74, "passes": 4}, n_img=1024, n_txt=256, peak_tflops=19.1)
+    assert row["s_per_pass_median"] == 2.74 and row["passes"] == 4                  # timings kept
+    assert row["flop_per_step"] == bench.flop_per_step(1024, 256)
+    assert row["achieved_tflops"] == 6.45                                            # the baseline's numbers
+    assert row["pct_bf16_peak"] == 33.8
+    assert bench.bf16_peak() == 19.11                                                # bench/baseline.json blocks

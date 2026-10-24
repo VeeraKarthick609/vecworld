@@ -13,6 +13,8 @@ crossfade. The differences:
 - Text: T5-XXL sequence embeddings (vecworld.flux.text, GPU block by block, cached) plus CLIP-L pooled (GPU).
   A Prompt's texts blend as a weighted sum of both.
 - The transformer is the 4-bit GGUF through diffusers, streamed block by block with diffusers' group offload.
+  With VECWORLD_KERNEL set (e.g. "naive"), its Q4_K linears run on the engine's hand-written kernel instead of
+  diffusers' dequantize-then-matmul (vecworld.engine); every other layer stays on the diffusers path.
 """
 import math
 import os
@@ -131,6 +133,9 @@ class FluxPainter(Painter):
 
     The transformer's CPU weights are page-locked where they lie; close() (also run when the painter is freed)
     releases them, after which the painter can't paint.
+
+    VECWORLD_KERNEL (read at construction; unset or empty: the diffusers reference) names the engine kernel the
+    transformer's Q4_K linears run on (vecworld.engine.q4k.KERNELS); self.kernel records it.
     """
 
     style = FLUX_STYLE
@@ -144,10 +149,24 @@ class FluxPainter(Painter):
 
         from vecworld.flux.text import T5Text
 
+        self.kernel = os.environ.get("VECWORLD_KERNEL") or None
+        if self.kernel is not None:
+            from vecworld.engine.q4k import KERNELS
+
+            if self.kernel not in KERNELS:      # before the minute-long load, not after it
+                raise ValueError(f"VECWORLD_KERNEL={self.kernel!r}; built kernels: {', '.join(KERNELS)}")
         dev, bf16 = torch.device("cuda"), torch.bfloat16
         tr = FluxTransformer2DModel.from_single_file(
             _read_gguf(str(FLUX_GGUF)), quantization_config=GGUFQuantizationConfig(compute_dtype=bf16),
             torch_dtype=bf16, config=FLUX_BASE, subfolder="transformer")
+        if self.kernel is not None:
+            # Before pinning and group offload: the Q4KLinears' parameters share the GGUF parameters' storage, so
+            # they are pinned in place and streamed like the parameters they replace.
+            from vecworld.engine.ext import load_ext
+            from vecworld.engine.swap import gguf_linears, swap_linears
+
+            load_ext()
+            self.swapped = swap_linears(tr, gguf_linears(tr), self.kernel)
         self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
         tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"), offload_type="block_level",
                                 num_blocks_per_group=1, use_stream=True)
@@ -168,6 +187,7 @@ class FluxPainter(Painter):
         self.stage: Callable[[str], None] | None = None
         self.recipe = FLUX_STEP_RECIPE
         self._pinned: list[int] = getattr(self, "_pinned", [])
+        self.kernel: str | None = getattr(self, "kernel", None)
         self._closed = False
         self._dev, self._dtype = dev, dtype
         self._sf, self._shift = vae.config.scaling_factor, vae.config.shift_factor
