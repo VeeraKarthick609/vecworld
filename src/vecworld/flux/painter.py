@@ -25,7 +25,7 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 
-from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
+from vecworld.config import (FLUX_A16_KEEP, FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
                              FLUX_GGUF, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
                              FLUX_STYLE, FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
 from vecworld.dream.gpu import check_stop
@@ -136,8 +136,9 @@ class FluxPainter(Painter):
     The transformer's CPU weights are page-locked where they lie; close() (also run when the painter is freed)
     releases them, after which the painter can't paint.
 
-    VECWORLD_KERNEL (read at construction, see vecworld.engine.engine_kernel(); unset: "mma", "off": diffusers) names
-    the engine kernel the transformer's Q4_K linears run on; self.kernel records it (None: diffusers).
+    VECWORLD_KERNEL (read at construction, see vecworld.engine.engine_kernel(); unset: config.FLUX_KERNEL, "w4a8" with
+    config.FLUX_A16_KEEP on "mma"; "off": diffusers) names the engine kernel the transformer's Q4_K linears run on;
+    self.kernel records it (None: diffusers).
     """
 
     style = FLUX_STYLE
@@ -163,7 +164,8 @@ class FluxPainter(Painter):
             # they are pinned in place and streamed like the parameters they replace.
             from vecworld.engine.swap import gguf_linears, swap_linears
 
-            self.swapped = swap_linears(tr, gguf_linears(tr), self.kernel)
+            keep = FLUX_A16_KEEP if self.kernel == "w4a8" else ()     # W4A8's per-layer policy only
+            self.swapped = swap_linears(tr, gguf_linears(tr), self.kernel, keep_a16=keep)
         self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
         tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"), offload_type="block_level",
                                 num_blocks_per_group=1, use_stream=True)

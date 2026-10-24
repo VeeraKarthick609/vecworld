@@ -1,5 +1,6 @@
 // Q4_K kernels. Stage 1 (Task 3): the naive correctness reference. Stage 2 (Task 4): tiled through shared memory.
 // Stage 3 (Task 5): tensor cores (bf16 mma.sync), decoding Q4_K into the B fragments in registers.
+// Stage 4 (Task 5b): W4A8, per-token INT8 activations x the Q4_K codes on the INT8 tensor cores (mma.sync s8).
 //
 // A Q4_K super-block holds 256 weights of one row in 144 bytes:
 //   d (fp16) | dmin (fp16) | scales[12]: 8 x 6-bit sc, 8 x 6-bit m | qs[128]: 256 x 4-bit codes
@@ -514,6 +515,287 @@ __global__ void __launch_bounds__((BM / WM) * (BN / WN) * 32, MIN_BLOCKS)
 
 }  // namespace mma
 
+// W4A8 (Task 5b): the activations quantized to INT8 per token, the Q4_K codes used as INT8 as they are, on the INT8
+// tensor cores (mma.sync.m16n8k32 s8 x s8 -> s32). One instruction's k = 32 is exactly one Q4_K sub-block, so for
+// token m, weight row n and sub-block j (x_i = s_m * xq_i, w_i = (d * sc_j) * q_i - dmin * m_j):
+//
+//   sum_i x_i w_i = s_m * [ (d * sc_j) * sum_i xq_i q_i  -  (dmin * m_j) * xsum_j ]      xsum_j = sum_i xq_i
+//                                   \__ s32, one mma __/                 \__ from quantize_act __/
+//
+// summed over the sub-blocks in fp32, times s_m in the epilogue (docs/engine/04-w4a8.md).
+//
+// The tiling is the mma kernel's (K step BK = 64: one run, two sub-blocks; cp.async, 2 stages; grouped tile order;
+// zero-filled ragged edges; warps side by side along N). What changes:
+//   - x is int8: a stage row is 64 bytes (4 chunks of 16), XOR-swizzled by (row / 2) % 4 so ldmatrix's 8 rows hit
+//     all 32 banks. ldmatrix.x4 on a 16 x 32 int8 tile hands out exactly the s8 A fragment (PTX ISA, "Matrix
+//     Fragments for mma.m16n8k32": a lane (g, t) holds rows g and g + 8 at k = 4t .. 4t+3 and 16 + 4t .. 16 + 4t+3,
+//     the same 16-byte pieces as the bf16 m16n8k16 tile, which is also 16 rows x 32 bytes).
+//   - B needs no decode: its s8 fragment is column g at k = 4t .. 4t+3 and 16 + 4t .. 16 + 4t+3, i.e. words t and
+//     4 + t of the 32-byte run, low nibbles for sub-block 2r, high nibbles for 2r + 1: two 32-bit loads and masks.
+//   - The per-sub-block rescale works on the accumulator fragment (rows g, g + 8; columns 2t, 2t + 1), so each lane
+//     unpacks the scales of its own 2 columns per n8 tile, and reads xsum for its rows (a stage also holds xsum).
+//   - The int32 -> fp32 conversion is free: the mma's C input is 0x4B400000 (the float 2^23 + 2^22), so D's bits are
+//     that float plus the integer sum (|sum| <= 32 * 127 * 15 < 2^22), and one subtract gives it exactly.
+namespace w4a8 {
+
+using mma::cp_async16;
+using mma::cp_async_commit;
+using mma::cp_async_wait;
+using mma::ldmatrix_x4;
+using mma::smem_addr;
+
+constexpr int BK = 64;                       // weights per stage: one run (two sub-blocks)
+constexpr int A_ROW = BK;                    // bytes per x row per stage (int8; 4 chunks of 16)
+constexpr int W_ROW = 48;                    // header 16 + run 32, as in mma
+constexpr int XS_ROW = 8;                    // the row's two sub-block sums, int32
+constexpr int MAGIC = 0x4B400000;            // the float 2^23 + 2^22
+constexpr float MAGIC_F = 12582912.f;
+
+__device__ __forceinline__ void cp_async8(void* dst, const void* src, int src_bytes) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(smem_addr(dst)), "l"(src), "r"(src_bytes));
+}
+
+// D = A (16 x 32 s8) B (32 x 8 s8) + C, s32.
+__device__ __forceinline__ void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, int c) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%10, %10, %10, %10};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c));
+}
+
+template <int BM, int BN, int WM, int WN, int STAGES, int GROUP, int MIN_BLOCKS, typename OutT>
+__global__ void __launch_bounds__((BM / WM) * (BN / WN) * 32, MIN_BLOCKS)
+    gemm_w4a8_kernel(const int8_t* __restrict__ xq, const float* __restrict__ xs, const int* __restrict__ xsum,
+                     const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ bias, OutT* __restrict__ y,
+                     int M, int N, int K) {
+    constexpr int WARPS_N = BN / WN, T = (BM / WM) * WARPS_N * 32;
+    constexpr int MI = WM / 16, NI = WN / 8;
+    constexpr int A_STAGE = BM * A_ROW, W_STAGE = BN * W_ROW, XS_STAGE = BM * XS_ROW;
+    constexpr int A_CHUNKS = BM * (A_ROW / 16), W_CHUNKS = BN * 3;
+    static_assert(A_CHUNKS % T == 0, "x chunks per thread");
+    extern __shared__ __align__(16) uint8_t smem[];
+    uint8_t* As = smem;
+    uint8_t* Ws = smem + STAGES * A_STAGE;
+    uint8_t* Xs = Ws + STAGES * W_STAGE;
+
+    const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN, L = blockIdx.x;
+    const int first = L / (GROUP * num_n) * GROUP, gs = min(num_m - first, GROUP);
+    const int m0 = (first + L % (GROUP * num_n) % gs) * BM, n0 = L % (GROUP * num_n) / gs * BN;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int wm = warp / WARPS_N, wn = warp % WARPS_N, g = lane >> 2, t = lane & 3;
+    const int64_t row_bytes = int64_t(K / QK_K) * BLOCK_BYTES;
+    const int KT = K / BK, KS = K / 32;
+
+    auto load = [&](int kt, int st) {
+        uint8_t* a = As + st * A_STAGE;
+#pragma unroll
+        for (int i = 0; i < A_CHUNKS / T; ++i) {
+            const int idx = tid + i * T, r = idx >> 2, c = idx & 3;
+            const bool ok = m0 + r < M;
+            const int8_t* src = ok ? xq + int64_t(m0 + r) * K + kt * BK + c * 16 : xq;
+            cp_async16(a + r * A_ROW + ((c ^ ((r >> 1) & 3)) << 4), src, ok ? 16 : 0);
+        }
+        uint8_t* ws = Ws + st * W_STAGE;
+        const int64_t boff = int64_t(kt >> 2) * BLOCK_BYTES, roff = 16 + (kt & 3) * 32;
+#pragma unroll
+        for (int i = 0; i < (W_CHUNKS + T - 1) / T; ++i) {
+            const int idx = tid + i * T;
+            if (idx < W_CHUNKS) {
+                const int r = idx / 3, part = idx % 3;
+                const bool ok = n0 + r < N;
+                const uint8_t* src = ok ? w + int64_t(n0 + r) * row_bytes + boff + (part ? roff + (part - 1) * 16 : 0) : w;
+                cp_async16(ws + r * W_ROW + part * 16, src, ok ? 16 : 0);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < (BM + T - 1) / T; ++i) {
+            const int r = tid + i * T;
+            if (r < BM) {
+                const bool ok = m0 + r < M;
+                const int* src = ok ? xsum + int64_t(m0 + r) * KS + kt * 2 : xsum;
+                cp_async8(Xs + st * XS_STAGE + r * XS_ROW, src, ok ? 8 : 0);
+            }
+        }
+    };
+
+    float acc[MI][NI][4] = {};
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KT) load(s, s);
+        cp_async_commit();
+    }
+    for (int kt = 0; kt < KT; ++kt) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        if (kt + STAGES - 1 < KT) load(kt + STAGES - 1, (kt + STAGES - 1) % STAGES);
+        cp_async_commit();
+
+        const int st = kt % STAGES, r = kt & 3;
+        const uint8_t* a = As + st * A_STAGE;
+        const uint8_t* ws = Ws + st * W_STAGE;
+        const int* xst = reinterpret_cast<const int*>(Xs + st * XS_STAGE);
+        // This lane's accumulator columns 2t, 2t + 1 of each n8 tile: their (d * sc, dmin * m) for both sub-blocks.
+        SubScale sc[NI][2][2];                   // [n8 tile][column 2t + e][sub-block 2r + nib]
+#pragma unroll
+        for (int j = 0; j < NI; ++j)
+#pragma unroll
+            for (int e = 0; e < 2; ++e)
+                mma::run_scales(*reinterpret_cast<const uint4*>(ws + (wn * WN + j * 8 + 2 * t + e) * W_ROW), r,
+                                sc[j][e][0], sc[j][e][1]);
+        // B fragments (column g of each n8 tile): words t and 4 + t of the run, low nibbles then high nibbles.
+        uint32_t b[NI][2][2];
+#pragma unroll
+        for (int j = 0; j < NI; ++j) {
+            const uint32_t* run = reinterpret_cast<const uint32_t*>(ws + (wn * WN + j * 8 + g) * W_ROW + 16);
+            const uint32_t v0 = run[t], v1 = run[4 + t];
+            b[j][0][0] = v0 & 0x0F0F0F0Fu, b[j][0][1] = v1 & 0x0F0F0F0Fu;
+            b[j][1][0] = (v0 >> 4) & 0x0F0F0F0Fu, b[j][1][1] = (v1 >> 4) & 0x0F0F0F0Fu;
+        }
+#pragma unroll
+        for (int i = 0; i < MI; ++i) {
+            const int rb = wm * WM + i * 16 + g;
+            const int2 s0 = *reinterpret_cast<const int2*>(xst + rb * 2);           // row g: both sub-blocks
+            const int2 s1 = *reinterpret_cast<const int2*>(xst + (rb + 8) * 2);     // row g + 8
+            const float xsf[2][2] = {{float(s0.x), float(s1.x)}, {float(s0.y), float(s1.y)}};   // [nib][row half]
+#pragma unroll
+            for (int nib = 0; nib < 2; ++nib) {
+                uint32_t af[4];
+                const int row = wm * WM + i * 16 + (lane & 15), chunk = 2 * nib + (lane >> 4);
+                ldmatrix_x4(af, a + row * A_ROW + ((chunk ^ ((row >> 1) & 3)) << 4));
+#pragma unroll
+                for (int j = 0; j < NI; ++j) {
+                    int d[4];
+                    mma_s8(d, af, b[j][nib][0], b[j][nib][1], MAGIC);
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const SubScale s = sc[j][e & 1][nib];
+                        const float q = __int_as_float(d[e]) - MAGIC_F;       // the exact int32 sum
+                        acc[i][j][e] = fmaf(s.d_sc, q, acc[i][j][e]);
+                        acc[i][j][e] = fmaf(-s.dm, xsf[nib][e >> 1], acc[i][j][e]);
+                    }
+                }
+            }
+        }
+    }
+    cp_async_wait<0>();
+
+    // Epilogue: x token scale s_m, + bias, store (bf16 pairs, or fp32 for the tests).
+    const bool pair_ok = (N & 1) == 0;
+#pragma unroll
+    for (int j = 0; j < NI; ++j) {
+        const int n = n0 + wn * WN + j * 8 + 2 * t;
+        const float b0 = bias != nullptr && n < N ? __bfloat162float(bias[n]) : 0.f;
+        const float b1 = bias != nullptr && n + 1 < N ? __bfloat162float(bias[n + 1]) : 0.f;
+#pragma unroll
+        for (int i = 0; i < MI; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int m = m0 + wm * WM + i * 16 + g + 8 * h;
+                if (m >= M) continue;
+                const float sm = xs[m];
+                const float o0 = fmaf(acc[i][j][2 * h], sm, b0), o1 = fmaf(acc[i][j][2 * h + 1], sm, b1);
+                OutT* yp = y + int64_t(m) * N + n;
+                if constexpr (std::is_same_v<OutT, float>) {
+                    if (n < N) yp[0] = o0;
+                    if (n + 1 < N) yp[1] = o1;
+                } else if (pair_ok && n + 1 < N) {
+                    *reinterpret_cast<__nv_bfloat162*>(yp) = __floats2bfloat162_rn(o0, o1);
+                } else {
+                    if (n < N) yp[0] = __float2bfloat16(o0);
+                    if (n + 1 < N) yp[1] = __float2bfloat16(o1);
+                }
+            }
+    }
+}
+
+// quantize_act: one block per token. s = max|x| / 127 (IEEE division), xq = rint(x / s) (half to even, as
+// torch.round), clamped to +-127; a zero token gets s = 0, xq = 0. xsum[m, j] = sum of xq over sub-block j (32
+// values = 4 consecutive 8-value chunks, held by 4 neighbouring lanes). A row of up to QT * QREG * 8 = 16384 values
+// (every FLUX linear) is read once into registers; a longer one is read twice.
+constexpr int QT = 256, QREG = 8;
+
+__device__ __forceinline__ float amax8(uint4 v, float amax) {
+    const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u[e]));
+        amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+    }
+    return amax;
+}
+
+// Quantize chunk c (8 values, v) and write it; every lane of the warp calls this together (the xsum shuffles).
+__device__ __forceinline__ void quantize8(int c, bool ok, uint4 v, float s, int8_t* qr, int* sr) {
+    int sum = 0;
+    if (ok) {
+        const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+        uint32_t packed[2] = {0, 0};
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u[e]));
+            int q0 = 0, q1 = 0;
+            if (s > 0.f) {
+                q0 = int(fminf(fmaxf(rintf(__fdiv_rn(f.x, s)), -127.f), 127.f));
+                q1 = int(fminf(fmaxf(rintf(__fdiv_rn(f.y, s)), -127.f), 127.f));
+            }
+            sum += q0 + q1;
+            packed[e >> 1] |= ((uint32_t(q0) & 0xFF) | ((uint32_t(q1) & 0xFF) << 8)) << (16 * (e & 1));
+        }
+        *reinterpret_cast<uint2*>(qr + c * 8) = make_uint2(packed[0], packed[1]);
+    }
+    sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 1);
+    sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 2);
+    if (ok && (c & 3) == 0) sr[c >> 2] = sum;
+}
+
+__global__ void __launch_bounds__(QT) quantize_kernel(const __nv_bfloat16* __restrict__ x, int8_t* __restrict__ xq,
+                                                      float* __restrict__ s_out, int* __restrict__ xsum, int K) {
+    const int m = blockIdx.x, tid = threadIdx.x;
+    const uint4* xr = reinterpret_cast<const uint4*>(x + int64_t(m) * K);
+    const int chunks = K / 8;
+    const bool regs = chunks <= QT * QREG;
+    uint4 v[QREG];
+    float amax = 0.f;
+    if (regs) {
+#pragma unroll
+        for (int i = 0; i < QREG; ++i) {
+            const int c = tid + i * QT;
+            v[i] = c < chunks ? xr[c] : make_uint4(0, 0, 0, 0);
+            amax = amax8(v[i], amax);
+        }
+    } else {
+        for (int c = tid; c < chunks; c += QT) amax = amax8(xr[c], amax);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o));
+    __shared__ float red[QT / 32];
+    if ((tid & 31) == 0) red[tid >> 5] = amax;
+    __syncthreads();
+    amax = red[0];
+#pragma unroll
+    for (int i = 1; i < QT / 32; ++i) amax = fmaxf(amax, red[i]);
+    const float s = __fdiv_rn(amax, 127.f);
+    if (tid == 0) s_out[m] = s;
+    int8_t* qr = xq + int64_t(m) * K;
+    int* sr = xsum + int64_t(m) * (K / 32);
+    if (regs) {
+#pragma unroll
+        for (int i = 0; i < QREG; ++i) {
+            const int c = tid + i * QT;
+            if (i * QT < chunks) quantize8(c, c < chunks, v[i], s, qr, sr);   // uniform across the block
+        }
+    } else {
+        for (int c0 = 0; c0 < chunks; c0 += QT) {
+            const int c = c0 + tid;
+            quantize8(c, c < chunks, c < chunks ? xr[c] : make_uint4(0, 0, 0, 0), s, qr, sr);
+        }
+    }
+}
+
+}  // namespace w4a8
+
+
 void check_packed(const torch::Tensor& w, int64_t in) {
     TORCH_CHECK(w.is_cuda() && w.scalar_type() == torch::kUInt8 && w.dim() == 2 && w.is_contiguous(),
                 "packed Q4_K weight must be a contiguous CUDA uint8 [out, in / 256 * 144] tensor");
@@ -632,5 +914,91 @@ torch::Tensor q4k_gemm_mma(torch::Tensor x, torch::Tensor w, c10::optional<torch
         launch_mma<128, 128, 128, 16, 2, 4, 2>(x, w, b, y);
     else
         launch_mma<128, 64, 128, 16, 2, 4, 3>(x, w, b, y);   // 3 only caps registers (170); 2 blocks fit per SM
+    return y;
+}
+
+// W4A8 (Task 5b). quantize_act: bf16 x [M, K] -> (int8 xq [M, K], fp32 s [M], int32 xsum [M, K / 32]).
+std::vector<torch::Tensor> q4k_quantize_act(torch::Tensor x) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
+                "x must be a contiguous CUDA bf16 [M, K] tensor");
+    TORCH_CHECK(x.size(1) % QK_K == 0, "K must be a multiple of 256, got ", x.size(1));
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "x must be 16-byte aligned (vector loads)");
+    TORCH_CHECK(x.size(0) <= INT32_MAX, "M must fit in int32");
+    const int64_t M = x.size(0), K = x.size(1);
+    const c10::cuda::CUDAGuard guard(x.device());
+    auto xq = torch::empty({M, K}, x.options().dtype(torch::kInt8));
+    auto s = torch::empty({M}, x.options().dtype(torch::kFloat32));
+    auto xsum = torch::empty({M, K / 32}, x.options().dtype(torch::kInt32));
+    if (M == 0) return {xq, s, xsum};
+    w4a8::quantize_kernel<<<unsigned(M), w4a8::QT, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), xq.data_ptr<int8_t>(), s.data_ptr<float>(),
+        xsum.data_ptr<int>(), int(K));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {xq, s, xsum};
+}
+
+namespace {
+
+template <int BM, int BN, int WM, int WN, int STAGES, int GROUP, int MIN_BLOCKS, typename OutT>
+void launch_w4a8(const torch::Tensor& xq, const torch::Tensor& s, const torch::Tensor& xsum, const torch::Tensor& w,
+                 const __nv_bfloat16* b, torch::Tensor& y) {
+    const int64_t M = xq.size(0), K = xq.size(1), N = w.size(0);
+    auto kern = w4a8::gemm_w4a8_kernel<BM, BN, WM, WN, STAGES, GROUP, MIN_BLOCKS, OutT>;
+    constexpr int smem = STAGES * (BM * w4a8::A_ROW + BN * w4a8::W_ROW + BM * w4a8::XS_ROW);
+    static_assert(smem <= 48 * 1024, "more dynamic shared memory needs cudaFuncSetAttribute");
+    const int64_t tiles = (M + BM - 1) / BM * ((N + BN - 1) / BN);
+    TORCH_CHECK(tiles <= INT32_MAX, "too many tiles for the w4a8 grid");
+    kern<<<unsigned(tiles), (BM / WM) * (BN / WN) * 32, smem, at::cuda::getCurrentCUDAStream()>>>(
+        xq.data_ptr<int8_t>(), s.data_ptr<float>(), xsum.data_ptr<int>(), w.data_ptr<uint8_t>(), b,
+        reinterpret_cast<OutT*>(y.data_ptr()), int(M), int(N), int(K));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename OutT>
+void dispatch_w4a8(int64_t tile_n, const torch::Tensor& xq, const torch::Tensor& s, const torch::Tensor& xsum,
+                   const torch::Tensor& w, const __nv_bfloat16* b, torch::Tensor& y) {
+    if (tile_n == 128)
+        launch_w4a8<128, 128, 128, 16, 2, 4, 2, OutT>(xq, s, xsum, w, b, y);
+    else
+        launch_w4a8<128, 64, 128, 16, 2, 4, 3, OutT>(xq, s, xsum, w, b, y);
+}
+
+}  // namespace
+
+// y = (xq * s) W^T (+ bias) on the INT8 tensor cores: bf16 [M, out] (fp32 with out_fp32, for the tests). tile_n as
+// q4k_gemm_mma (0: q4k_mma_tile_n picks).
+torch::Tensor q4k_gemm_w4a8(torch::Tensor xq, torch::Tensor s, torch::Tensor xsum, torch::Tensor w,
+                            c10::optional<torch::Tensor> bias, int64_t tile_n, bool out_fp32) {
+    TORCH_CHECK(xq.is_cuda() && xq.scalar_type() == torch::kInt8 && xq.dim() == 2 && xq.is_contiguous(),
+                "xq must be a contiguous CUDA int8 [M, in] tensor");
+    const int64_t M = xq.size(0), K = xq.size(1), N = w.size(0);
+    check_packed(w, K);
+    TORCH_CHECK(w.device() == xq.device(), "xq and the weight are on different devices");
+    TORCH_CHECK(s.device() == xq.device() && s.scalar_type() == torch::kFloat32 && s.dim() == 1 && s.size(0) == M &&
+                    s.is_contiguous(), "s must be a contiguous fp32 [M] tensor on xq's device");
+    TORCH_CHECK(xsum.device() == xq.device() && xsum.scalar_type() == torch::kInt32 && xsum.dim() == 2 &&
+                    xsum.size(0) == M && xsum.size(1) == K / 32 && xsum.is_contiguous(),
+                "xsum must be a contiguous int32 [M, in / 32] tensor on xq's device");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(xq.data_ptr()) % 16 == 0, "xq must be 16-byte aligned (vector loads)");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(xsum.data_ptr()) % 8 == 0, "xsum must be 8-byte aligned (vector loads)");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
+                "the packed weight must be 16-byte aligned (vector loads)");
+    TORCH_CHECK(M <= INT32_MAX && N <= INT32_MAX, "M and out_features must fit in int32");
+    const __nv_bfloat16* b = nullptr;
+    if (bias.has_value() && bias->defined()) {
+        TORCH_CHECK(bias->device() == xq.device() && bias->scalar_type() == torch::kBFloat16 && bias->dim() == 1 &&
+                        bias->size(0) == N && bias->is_contiguous(),
+                    "bias must be a contiguous bf16 [out] tensor on xq's device");
+        b = reinterpret_cast<const __nv_bfloat16*>(bias->data_ptr());
+    }
+    TORCH_CHECK(tile_n == 0 || tile_n == 64 || tile_n == 128, "tile_n must be 0 (pick), 64 or 128, got ", tile_n);
+    const c10::cuda::CUDAGuard guard(xq.device());
+    auto y = torch::empty({M, N}, xq.options().dtype(out_fp32 ? torch::kFloat32 : torch::kBFloat16));
+    if (M == 0 || N == 0) return y;
+    if (tile_n == 0) tile_n = q4k_mma_tile_n(M, N);
+    if (out_fp32)
+        dispatch_w4a8<float>(tile_n, xq, s, xsum, w, b, y);
+    else
+        dispatch_w4a8<__nv_bfloat16>(tile_n, xq, s, xsum, w, b, y);
     return y;
 }

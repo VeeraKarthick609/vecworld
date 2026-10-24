@@ -84,9 +84,23 @@ FLUX_TEXT_LEN = 256        # T5 tokens (schnell's max_sequence_length)
 FLUX_WIN = 32              # window size in packed tokens (512 px), the full panorama height
 FLUX_STRIDE = 16           # 8 windows round the cylinder, each column covered twice
 FLUX_STEPS = 4
-# The engine kernel FLUX's Q4_K linears run on when VECWORLD_KERNEL is unset (vecworld.engine.q4k.KERNELS): the
-# tensor-core kernel, which passed every reference gate (Task 5). VECWORLD_KERNEL=off runs the diffusers path.
-FLUX_KERNEL = "mma"
+# The engine kernel FLUX's Q4_K linears run on when VECWORLD_KERNEL is unset (vecworld.engine.q4k.KERNELS). Since
+# Task 5b "w4a8": per-token INT8 activations x the Q4_K codes on the INT8 tensor cores, lossy, admitted by the walk
+# gate with FLUX_A16_KEEP below (docs/engine/04-w4a8.md). "mma" is the lossless W4A16 kernel (Task 5);
+# VECWORLD_KERNEL=off runs the diffusers path.
+FLUX_KERNEL = "w4a8"
+# Under w4a8, the linears (fnmatch patterns of module names) kept on "mma" (W4A16). The study (scripts/w4a8_study.py,
+# bench/t5b-study.json) ranked the text stream's MLP, the value projections and the text q / v projections worst;
+# with those kept the walk gate still failed (spot 1 seam 1.16, spot 3 1.14), so the ledger's suspects joined them:
+# the double blocks' MLP-out and attention-outs, and the first and last blocks of each kind. That walk passed (spot 1
+# 1.098 against the 1.1 limit; the lossless reference scores 1.082 there) with 70.3% of the token-facing FLOPs on INT8.
+FLUX_A16_KEEP: tuple[str, ...] = (
+    "transformer_blocks.*.ff_context.net.0.proj", "transformer_blocks.*.ff_context.net.2", "*.attn.to_v",
+    "transformer_blocks.*.attn.add_v_proj", "transformer_blocks.*.attn.add_q_proj",
+    "transformer_blocks.*.ff.net.2", "transformer_blocks.*.attn.to_out.0", "transformer_blocks.*.attn.to_add_out",
+    "transformer_blocks.0.*", "transformer_blocks.18.*", "single_transformer_blocks.0.*",
+    "single_transformer_blocks.37.*",
+)
 FLUX_BATCH = 4             # windows per transformer pass (peak 1.4 GB allocated on AC; Task 6 re-batches)
 FLUX_BG_STRENGTH = 0.15    # a walk step releases its background at this sigma (0.25: SSIM 0.58 outside the focus, 0.15: 0.67)
 # Behind the camera (from a quarter turn off the walking direction, feathered over FLUX_BACK_FEATHER) the dolly

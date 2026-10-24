@@ -1,6 +1,6 @@
 """FLUX bench harness. --painter reference benches the game's FluxPainter (diffusers + GGUF + group offload);
 --painter engine benches the same painter with the engine flags taken from the environment (VECWORLD_KERNEL unset
-is mma, as for the painter; --painter reference sets VECWORLD_KERNEL=off). Engine results
+is config.FLUX_KERNEL, as for the painter; --painter reference sets VECWORLD_KERNEL=off). Engine results
 also carry the step's FLOP count, achieved TFLOP/s and % of the measured bf16 peak.
 
   uv run python scripts/bench_flux.py --painter reference --what pano --out bench/x.json
@@ -103,7 +103,7 @@ def bench(fn, n=5):
 
 def load_transformer():
     """The bare transformer, its Q4_K linears on the kernel VECWORLD_KERNEL resolves to (vecworld.engine.engine_kernel,
-    the painter's own rule: unset is mma, "off" leaves diffusers)."""
+    the painter's own rule: unset is config.FLUX_KERNEL, "off" leaves diffusers)."""
     import torch
     from diffusers import FluxTransformer2DModel, GGUFQuantizationConfig
     from vecworld.config import FLUX_BASE, FLUX_GGUF
@@ -113,8 +113,9 @@ def load_transformer():
         str(FLUX_GGUF), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
         torch_dtype=torch.bfloat16, config=FLUX_BASE, subfolder="transformer")
     if kernel is not None:
+        from vecworld.config import FLUX_A16_KEEP
         from vecworld.engine.swap import gguf_linears, swap_linears
-        swap_linears(tr, gguf_linears(tr), kernel)
+        swap_linears(tr, gguf_linears(tr), kernel, keep_a16=FLUX_A16_KEEP if kernel == "w4a8" else ())
     return tr, str(FLUX_GGUF)
 
 
@@ -307,41 +308,55 @@ GEMM_SHAPES = [(1024, 3072, 9216), (1024, 3072, 3072), (1024, 3072, 12288), (102
 
 
 def do_gemm(R, mon):
-    """Per GEMM_SHAPES entry: VECWORLD_KERNEL's TFLOP/s on a real Q4_K weight of that shape (the first in the GGUF;
-    Q4KLinear's own dispatch) against torch.matmul on the same weight dequantized to bf16 beforehand: the median of
-    20 timed calls after warm-up, two rounds each, run alternately, and the better round kept."""
+    """Per GEMM_SHAPES entry, on a real Q4_K weight of that shape (the first in the GGUF): Q4KLinear on "mma" (W4A16)
+    and on "w4a8" (its quantize_act included; w4a8_gemm_ms is the INT8 GEMM alone, on x quantized beforehand), against
+    torch.matmul on the same weight dequantized to bf16 beforehand: the median of 20 timed calls after warm-up, two
+    rounds each, run alternately, and the better round kept. TFLOP/s are bf16-equivalent (2 M K N / time), whatever
+    the number format. VECWORLD_KERNEL doesn't change what is timed (both engine kernels always are)."""
     import gguf
     import numpy as np
     import torch
     from vecworld.config import FLUX_GGUF
-    from vecworld.engine.q4k import Q4KLinear, read_gguf
-    from vecworld.engine import engine_kernel
-    kernel = engine_kernel()
+    from vecworld.engine.ext import load_ext
+    from vecworld.engine.q4k import Q4KLinear, quantize_act, read_gguf
     tensors = read_gguf(FLUX_GGUF)
+    ext = load_ext()
     R["bf16_peak_tflops"] = bf16_peak()
     rows = []
     for M, K, N in GEMM_SHAPES:
         t = next(t for t in tensors.values() if t.type == gguf.GGMLQuantizationType.Q4_K and t.shape == (N, K))
-        lin = Q4KLinear(t, None, kernel).cuda()
+        mma, w8 = Q4KLinear(t, None, "mma").cuda(), Q4KLinear(t, None, "w4a8").cuda()
         wd = torch.from_numpy(gguf.quants.dequantize(np.asarray(t.data), t.type).reshape(N, K)).to("cuda", torch.bfloat16)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, generator=torch.Generator("cuda").manual_seed(0))
+        fns = {"mma": lambda: mma(x), "w4a8": lambda: w8(x), "matmul": lambda: x @ wd.T,
+               "quantize": lambda: quantize_act(x)}
         with torch.inference_mode():
-            ours, ref = bench(lambda: lin(x), 20), bench(lambda: x @ wd.T, 20)
-            ours, ref = min(ours, bench(lambda: lin(x), 20)), min(ref, bench(lambda: x @ wd.T, 20))
+            q = quantize_act(x)
+            fns["w4a8_gemm"] = lambda: ext.q4k_gemm_w4a8(*q, w8.qweight)
+            ms = {k: bench(f, 20) for k, f in fns.items()}
+            ms = {k: min(v, bench(fns[k], 20)) for k, v in ms.items()}
         f = 2 * M * K * N
-        rows.append(dict(m=M, k=K, n=N, weight=t.name, ours_ms=round(ours, 3), matmul_ms=round(ref, 3),
-                         ours_tflops=round(f / ours / 1e9, 2), matmul_tflops=round(f / ref / 1e9, 2),
-                         pct_of_matmul=round(100 * ref / ours, 1)))
-        print(f"M={M:5d} K={K:5d} N={N:5d}  {kernel} {rows[-1]['ours_tflops']:6.2f}  matmul "
-              f"{rows[-1]['matmul_tflops']:6.2f}  {rows[-1]['pct_of_matmul']:5.1f}%", flush=True)
-        del lin, wd
+        row = dict(m=M, k=K, n=N, weight=t.name, **{f"{k}_ms": round(v, 3) for k, v in ms.items()})
+        for k in ("mma", "w4a8", "w4a8_gemm", "matmul"):
+            row[f"{k}_tflops"] = round(f / ms[k] / 1e9, 2)
+        row["mma_pct_of_matmul"] = round(100 * ms["matmul"] / ms["mma"], 1)
+        row["w4a8_pct_of_matmul"] = round(100 * ms["matmul"] / ms["w4a8"], 1)
+        row["w4a8_speedup_over_mma"] = round(ms["mma"] / ms["w4a8"], 2)
+        rows.append(row)
+        print(f"M={M:5d} K={K:5d} N={N:5d}  mma {row['mma_tflops']:6.2f}  w4a8 {row['w4a8_tflops']:6.2f} "
+              f"(gemm {row['w4a8_gemm_tflops']:6.2f}, quantize {ms['quantize']:.3f} ms)  matmul "
+              f"{row['matmul_tflops']:6.2f}  w4a8/mma {row['w4a8_speedup_over_mma']:.2f}x", flush=True)
+        del mma, w8, wd, q
         torch.cuda.empty_cache()
     R["shapes"] = rows
     for name, sel in (("m1024_1280", lambda r: r["m"] != 256), ("m256", lambda r: r["m"] == 256)):
         rs = [r for r in rows if sel(r)]
-        R[f"{name}_pct_of_matmul_min"] = min(r["pct_of_matmul"] for r in rs)
-        # aggregate: matmul's total time over ours across the shapes (the FLOP-weighted rate ratio)
-        R[f"{name}_pct_of_matmul_overall"] = round(100 * sum(r["matmul_ms"] for r in rs) / sum(r["ours_ms"] for r in rs), 1)
+        for k in ("mma", "w4a8"):
+            R[f"{name}_{k}_pct_of_matmul_min"] = min(r[f"{k}_pct_of_matmul"] for r in rs)
+            # aggregate: matmul's total time over ours across the shapes (the FLOP-weighted rate ratio)
+            R[f"{name}_{k}_pct_of_matmul_overall"] = round(100 * sum(r["matmul_ms"] for r in rs)
+                                                           / sum(r[f"{k}_ms"] for r in rs), 1)
+        R[f"{name}_w4a8_speedup_over_mma_overall"] = round(sum(r["mma_ms"] for r in rs) / sum(r["w4a8_ms"] for r in rs), 2)
 
 
 def add_engine_fields(R):
@@ -369,11 +384,11 @@ def main():
     a = ap.parse_args()
     from vecworld.engine import engine_kernel
     if a.painter == "engine" and engine_kernel() is None:
-        sys.exit("--painter engine with VECWORLD_KERNEL=off is the reference: unset it (mma) or name a kernel")
+        sys.exit("--painter engine with VECWORLD_KERNEL=off is the reference: unset it (FLUX_KERNEL) or name a kernel")
     if a.what == "gemm" and a.painter != "engine":
         sys.exit("--what gemm times an engine kernel: use --painter engine")
     if a.painter == "reference":
-        os.environ["VECWORLD_KERNEL"] = "off"         # the reference is diffusers all the way (the painter defaults to mma)
+        os.environ["VECWORLD_KERNEL"] = "off"         # the reference is diffusers all the way (the painter defaults to an engine kernel)
     pw = power()
     if pw != "ac":
         sys.exit("on battery: speed numbers are invalid; plug in and rerun")

@@ -47,8 +47,9 @@ def test_gemm_bench_covers_the_flux_linear_shapes():
 
 
 def test_load_transformer_resolves_the_kernel_as_the_painter_does(monkeypatch):
-    """bench_flux.load_transformer uses vecworld.engine.engine_kernel: unset VECWORLD_KERNEL swaps in mma (as the
-    painter does), "off" leaves diffusers' linears, a name picks that kernel."""
+    """bench_flux.load_transformer uses vecworld.engine.engine_kernel: unset VECWORLD_KERNEL swaps in w4a8 (as the
+    painter does, with config.FLUX_A16_KEEP on mma), "off" leaves diffusers' linears, a name picks that kernel (the
+    keep-list applies to w4a8 only)."""
     import diffusers
 
     import vecworld.engine.swap as swap_mod
@@ -56,8 +57,13 @@ def test_load_transformer_resolves_the_kernel_as_the_painter_does(monkeypatch):
     swapped = []
     monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: "transformer")
     monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
-    monkeypatch.setattr(swap_mod, "swap_linears", lambda tr, gg, kernel: swapped.append(kernel))
-    for value, want in ((None, ["mma"]), ("off", []), ("reference", []), ("tiled", ["tiled"])):
+    monkeypatch.setattr(swap_mod, "swap_linears",
+                        lambda tr, gg, kernel, keep_a16=(): swapped.append((kernel, tuple(keep_a16))))
+    from vecworld.config import FLUX_A16_KEEP
+
+    keep = tuple(FLUX_A16_KEEP)
+    for value, want in ((None, [("w4a8", keep)]), ("off", []), ("reference", []), ("tiled", [("tiled", ())]),
+                        ("mma", [("mma", ())]), ("w4a8", [("w4a8", keep)])):
         swapped.clear()
         if value is None:
             monkeypatch.delenv("VECWORLD_KERNEL", raising=False)

@@ -6,7 +6,7 @@ import torch
 from gguf import GGMLQuantizationType
 
 QK_K, Q4K_BYTES = 256, 144          # weights and bytes per Q4_K super-block
-KERNELS = ("naive", "tiled", "mma")       # a later stage adds "w4a8"
+KERNELS = ("naive", "tiled", "mma", "w4a8")
 # Below this many rows (tokens x windows) "tiled" runs the naive kernel: a 128-row tile would be mostly padding. FLUX's
 # modulation linears run at M = 1 per window (4.0 ms tiled vs 0.7 ms naive for 3072 -> 18432); the crossover measured
 # at M = 24..32 (docs/engine/02-q4k-tiled.md).
@@ -15,7 +15,8 @@ TILED_MIN_M = 32
 # cross at M = 6..8 (docs/engine/03-q4k-mma.md). In FLUX only the modulation linears (M = windows per pass) are this
 # small.
 MMA_MIN_M = 7
-SMALL_M = {"tiled": TILED_MIN_M, "mma": MMA_MIN_M}     # below this M a kernel hands the call to naive
+# "w4a8" shares mma's tile and so its crossover; below it the M = 1 modulation linears stay exact (W4A16 naive).
+SMALL_M = {"tiled": TILED_MIN_M, "mma": MMA_MIN_M, "w4a8": MMA_MIN_M}     # below this M a kernel hands the call to naive
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,15 @@ def _packed(weight: GGUFTensor) -> torch.Tensor:
     if t.shape != (rows, cols // QK_K * Q4K_BYTES):
         raise ValueError(f"{weight.name}: {tuple(t.shape)} bytes don't hold a Q4_K {rows} x {cols} weight")
     return t
+
+
+def quantize_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """W4A8's activation side, one kernel: x bf16 [M, K] -> (xq int8 [M, K], s fp32 [M], xsum int32 [M, K // 32]).
+    Per token s = max|x_t| / 127 and xq = round(x_t / s) (half to even); xsum is the sum of xq over each 32-wide
+    sub-block, for the dmin * m_j term (docs/engine/04-w4a8.md). A zero token gets s = 0, xq = 0."""
+    from vecworld.engine.ext import load_ext
+
+    return tuple(load_ext().q4k_quantize_act(x))
 
 
 def _aligned_activation(x: torch.Tensor) -> torch.Tensor:
@@ -90,7 +100,10 @@ class Q4KLinear(torch.nn.Module):
             # wrong. Copying it here would hide that behind a weight-sized copy on every call.
             raise RuntimeError(f"Q4KLinear {self.weight_name}: the packed weight must be 16-byte aligned (vector "
                                f"loads); its address is {self.qweight.data_ptr() % 16} bytes off")
-        y = getattr(load_ext(), f"q4k_gemm_{kernel}")(x2, self.qweight, b)
+        if kernel == "w4a8":
+            y = load_ext().q4k_gemm_w4a8(*quantize_act(x2), self.qweight, b)
+        else:
+            y = getattr(load_ext(), f"q4k_gemm_{kernel}")(x2, self.qweight, b)
         return y.reshape(*lead, self.out_features)
 
     def extra_repr(self) -> str:

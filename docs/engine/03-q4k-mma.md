@@ -1,14 +1,15 @@
 # 03: The Q4_K kernel on tensor cores (Task 5, W4A16)
 
-**What this is:** the third stage of the engine's Q4_K GEMM, and since Task 5 the **default** for the FLUX painter
-and the game. The arithmetic is the same as in the naive and tiled kernels (`01-q4k-naive.md`, `02-q4k-tiled.md`):
+**What this is:** the third stage of the engine's Q4_K GEMM. It was the **default** for the FLUX painter and the
+game from Task 5 until Task 5b, which made `w4a8` the default (`04-w4a8.md`); it is still the lossless path
+(`VECWORLD_KERNEL=mma`) and runs the linears W4A8 keeps on bf16 (`config.FLUX_A16_KEEP`). The arithmetic is the same as in the naive and tiled kernels (`01-q4k-naive.md`, `02-q4k-tiled.md`):
 y = x W^T with W decoded from Q4_K. The difference is the unit that does the multiply-adds. The tiled kernel used the
 CUDA cores, at about 5 TFLOP/s. This one uses the **tensor cores** through `mma.sync.m16n8k16` (bf16 in, fp32
 accumulate), which the 3050 Ti runs at up to 19.1 TFLOP/s. The weights still never exist as a bf16 tensor in VRAM.
 Each warp decodes exactly the 4-bit codes its next tensor-core instruction needs, into registers, just before
 issuing it.
 
-It runs by default. `VECWORLD_KERNEL=off` (or `reference`) puts the diffusers path back; `naive` and `tiled` pick
+`VECWORLD_KERNEL=mma` selects it for every linear; `VECWORLD_KERNEL=off` (or `reference`) puts the diffusers path back; `naive` and `tiled` pick
 the earlier stages.
 
 ## The problem: 1.08 s of dequant, and then CUDA cores

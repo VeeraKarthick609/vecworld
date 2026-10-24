@@ -380,18 +380,20 @@ def test_a_linear_recipe_releases_behind_at_its_own_back_strength(monkeypatch):
     assert 0.6 in tr.sigmas
 
 
-def test_kernel_defaults_to_mma(monkeypatch):
-    """VECWORLD_KERNEL unset or empty: the FLUX painter (and so the game) runs its Q4_K linears on the mma kernel.
-    "off" (or "reference") keeps the diffusers path; a kernel name picks that kernel; anything else is refused before
-    the minute-long model load."""
+def test_kernel_defaults_to_w4a8(monkeypatch):
+    """VECWORLD_KERNEL unset or empty: the FLUX painter (and so the game) runs its Q4_K linears on config.FLUX_KERNEL,
+    since Task 5b w4a8 (with FLUX_A16_KEEP's linears on mma). "off" (or "reference") keeps the diffusers path; a kernel
+    name picks that kernel; anything else is refused before the minute-long model load."""
     import vecworld.flux.painter as painter_mod
+    from vecworld.config import FLUX_KERNEL
     from vecworld.engine import engine_kernel
 
     assert painter_mod.engine_kernel is engine_kernel      # one rule for the painter, the game and the bench
+    assert FLUX_KERNEL == "w4a8"
     monkeypatch.delenv("VECWORLD_KERNEL", raising=False)
-    assert engine_kernel() == "mma"
-    for value, kernel in (("", "mma"), ("off", None), ("reference", None), ("naive", "naive"), ("tiled", "tiled"),
-                          ("mma", "mma")):
+    assert engine_kernel() == "w4a8"
+    for value, kernel in (("", "w4a8"), ("off", None), ("reference", None), ("naive", "naive"), ("tiled", "tiled"),
+                          ("mma", "mma"), ("w4a8", "w4a8")):
         monkeypatch.setenv("VECWORLD_KERNEL", value)
         assert engine_kernel() == kernel, value
     monkeypatch.setenv("VECWORLD_KERNEL", "fastest")

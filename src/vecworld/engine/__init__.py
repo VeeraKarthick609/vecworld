@@ -10,7 +10,7 @@ KERNEL_OFF = ("off", "reference")    # VECWORLD_KERNEL values that keep the diff
 
 def engine_kernel() -> str | None:
     """The engine kernel VECWORLD_KERNEL asks for, the one rule for the painter, the game and the bench: unset or
-    empty, config.FLUX_KERNEL (the default, "mma"); "off" or "reference", None (diffusers' dequantize-then-matmul);
+    empty, config.FLUX_KERNEL (the default, "w4a8"); "off" or "reference", None (diffusers' dequantize-then-matmul);
     otherwise a name from q4k.KERNELS, checked here so a typo fails before the minute-long model load."""
     from vecworld.config import FLUX_KERNEL
 
