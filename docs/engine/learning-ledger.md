@@ -9,6 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv) | 5, 5b, 5c |
 
 ---
 
@@ -29,6 +30,22 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 - Why 4-bit weights save memory but not compute, except at M=1, where a GEMM is memory-bound (Techniques 1 and 2).
 - Batching amortizes per-pass costs (Technique 3).
 - Where a 2.74 s step goes (Part 2): ~40% wasted unpacking, ~40% real math already near the ceiling, ~15% small-op overhead; each is fixed a different way.
+- Entry 2, Task 5:
+  - Warps and fragments.
+  - `mma.sync` m16n8k16: 2,048 multiply-adds per warp instruction.
+  - Decode Q4_K straight into B-fragments in registers; it reached 92% of cuBLAS.
+  - `cp.async` double buffering.
+  - Two blocks per SM beat a deeper pipeline.
+  - The walk step gained only 7%, because batching had already spread the dequant.
+- Entry 2, Task 5b:
+  - Per-token INT8 scales contain outliers.
+  - `m16n8k32`'s k = 32 is one Q4_K sub-block.
+  - The kernel is issue-bound (~12 rescale slots per `mma`), so 1.5×, not 4×.
+  - Per-layer error didn't predict the failure; the residual-stream writes stay bf16.
+- Entry 2, Task 5c:
+  - M = 1 is memory-bound, so 4-bit weights do speed it up (3.6× fewer bytes): 35 → 11 ms at 86% of bandwidth.
+  - Re-measure before optimizing (0.29 s was stale; the real gain was 0.03 s).
+- Entry 2, Patterns so far: roofline first; data in registers; overlap loads with math; gate on the real output; measure before trusting estimates.
 
 **Understand.** The exact Q4_K bytes, `mma` tile shapes, the min-term algebra, CUDA graphs, block caching and glue fusion.
 
@@ -58,7 +75,7 @@ RTX 3050 Ti Laptop GPU (GA107, Ampere), in the laptop `mrjarvis`.
 | FP32 CUDA cores | 2560 (128 per SM) | spec sheet |
 | Tensor cores (3rd gen) | 80 (4 per SM) | spec sheet |
 | VRAM | 4 GB GDDR6, 128-bit bus | spec sheet |
-| VRAM bandwidth | about 192 GB/s (est.: 128 bit × 12 Gbps ÷ 8; not measured here) | spec sheet, est. |
+| VRAM bandwidth | about 192 GB/s on paper (128 bit × 12 Gbps ÷ 8); **187 GB/s measured** (512 MB `torch.sum`, Task 5c) | spec sheet; `05-modulation-gemv.md` |
 | L2 cache | 2 MB | spec sheet |
 | Shared memory | up to 100 KB per SM | Ampere GA10x docs |
 | bf16 matmul, 4096², measured | **19.1 TFLOPS** | baseline.json `bf16_matmul_tflops` |
@@ -213,7 +230,7 @@ Making a memory-bound kernel do fewer FLOPs gains nothing. Making a compute-boun
 > Three takeaways:
 > 1. 17.7 / 2.74 s = 6.45 TFLOP/s against a 19.1 peak, so **we use about 34% of the GPU**. That gap is what the engine chases.
 > 2. The spike's "30 TFLOP" multiplied all weights by all tokens. Image tokens never meet text weights, and modulation sees 1 row, not 1280. **Count only the weights and tokens that actually meet.**
-> 3. Modulation is 27% of the weights and about 0% of the math, yet it is unpacked every step (~0.29 s of 2.74 s). It is a cheap target.
+> 3. Modulation is 27% of the weights and about 0% of the math, yet it is unpacked every step (~0.29 s of 2.74 s). It is a cheap target. *(Update, 2026-10-25: that 0.29 s was dequant, which the fused kernels removed. By Task 5b modulation cost 35 ms, and Task 5c took it to 11 ms. See Entry 2, Task 5c.)*
 >
 > ```
 >               share of WEIGHTS              share of MATH
@@ -721,7 +738,274 @@ It matters for speed too: the recipe decides how many windows and denoising pass
 
 ---
 
-*Next entry suggestion: after Task 3's bench, record the naive kernel's numbers against these predictions and note where the estimates were wrong.*
+*Next entry suggestion: after Task 3's bench, record the naive kernel's numbers against these predictions and note where the estimates were wrong.* (Done in Entry 2.)
+
+---
+
+## Entry 2: Techniques from Tasks 5, 5b and 5c (tensor cores, W4A8, the modulation GEMV)
+
+*2026-10-25. Study time: about 40 minutes. Sources: `docs/engine/03-q4k-mma.md`, `04-w4a8.md`, `05-modulation-gemv.md`, `docs/engine/speed.md` and the Task 5, 5b and 5c implementer reports. All numbers are measured on AC unless marked (est.). Read Entry 1's Part 1 (roofline) first.*
+
+### Progress so far
+
+`Must`
+
+One 512 px window, one transformer pass (1024 image + 256 text tokens, 17.67 TFLOP). The walk step is a `sharp` walk step's wall time: 40 window passes in batches of 4, plus VAE and text.
+
+| Stage | Step s | Achieved TFLOP/s | % of 19.1 bf16 peak | Walk step s |
+|---|---|---|---|---|
+| Baseline: diffusers + GGUF dequant | **2.74** | 6.45 | 34% | 61.4 (Task 1 painter, same path) |
+| Task 3: naive Q4_K kernel (correctness reference) | 22.98 | 0.77 | 4.0% | 945.1 |
+| Task 4: tiled, shared memory, CUDA cores | 3.77 | 4.69 | 24.5% | 156.3 |
+| **Task 5: tensor cores, bf16 `mma` (W4A16)** | **1.40** | 12.62 | 66.1% | 57.4 |
+| **Task 5b: W4A8 on INT8 tensor cores (default)** | **1.15** | 15.37 (bf16-equivalent) | 80.4% | 48.9 |
+| **Task 5c: modulation on a Q4_K GEMV** | **1.12** | 15.78 (bf16-equivalent) | 82.6% | 47.6 |
+
+From Task 5b on, "TFLOP/s" counts the same 17.67 TFLOP even though 75% of it runs as INT8, so it is **bf16-equivalent**: how fast a bf16 engine would need to be to match. It can pass the bf16 roof without breaking physics.
+
+The step is 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step only 1.29× (61.4 → 47.6 s). Why the walk gains less is the first lesson of Task 5.
+
+**How the Entry 1 estimates did.**
+
+| Estimate (Entry 1) | Predicted | Measured | Why it differed |
+|---|---|---|---|
+| Technique 1 (fused W4A16) step | ~1.9 s (1.6–2.2) | **1.40 s** | the kernel reached 92% of cuBLAS; I assumed 65–85% |
+| Technique 2 (W4A8) GEMM speedup | 1.8–2.5× | **1.45–1.72×** | the kernel is issue-bound (Task 5b below) |
+| Technique 2 step factor | ×1.4 | **×1.22** (1.40 → 1.15) | the slower GEMM, plus 25% of the FLOPs kept on bf16 for quality |
+| Modulation "cheap target" | ~0.29 s | **~0.03 s** | the 0.29 s was dequant, which Task 3 already removed (Task 5c below) |
+
+---
+
+### Task 5: the Q4_K kernel on tensor cores (W4A16)
+
+`Must` for the plain version, warps, fragments, `mma` and double buffering. `Understand` for the decode trick, `ldmatrix` and swizzle. `Skip` the exact nibble-to-lane map.
+
+> **Plain version.** Task 4 removed the 1.08 s dequant but did its multiplies on the ordinary CUDA cores (~5 TFLOP/s), so it was *slower* than the baseline (3.77 s). Task 5 keeps "never unpack the weights to memory" and moves the multiply onto the tensor cores. Each group of 32 threads unpacks only the 4-bit weights its next tensor-core instruction needs, into registers, right before issuing it. The result is 2.74 → **1.40 s**, with the GEMM at **92% of cuBLAS** on weights cuBLAS was handed already unpacked.
+
+**Warps and fragments** (`Must`). A **warp** is 32 threads that issue each instruction together. `mma.sync.m16n8k16` (bf16 in, fp32 accumulate) is one *warp-wide* instruction: it multiplies a 16×16 tile of A (activations) by a 16×8 tile of B (weights) and adds the result into a 16×8 fp32 tile C. That is 2,048 multiply-adds in one instruction. No thread holds a whole tile. Each holds a **fragment**, a few registers at positions fixed by the PTX spec:
+
+```
+ lane = 4*g + t   (g = lane/4 = 0..7, t = lane%4 = 0..3)
+
+ A 16x16 bf16:  4 regs per lane = rows g and g+8, k = 2t, 2t+1, 2t+8, 2t+9
+ B 16x8  bf16:  2 regs per lane = column g,       k = 2t, 2t+1, 2t+8, 2t+9
+ C 16x8  fp32:  4 floats        = rows g and g+8, columns 2t, 2t+1
+
+            k:  0  1 | 2  3 | 4  5 | 6  7 | 8  9 |10 11 | ...
+ B column g:   t=0   | t=1  | t=2  | t=3  | t=0  | t=1  | ...   (4 lanes share one column)
+```
+
+**Decoding straight into B fragments** (`Understand`). A lane needs four weights of one weight row at k = 2t, 2t+1, 2t+8, 2t+9. In Q4_K's layout those are bytes 2t, 2t+1, 2t+8, 2t+9 of a 32-byte run. Low nibbles feed one k16 step and high nibbles another, so **two 16-bit shared-memory loads give the codes for two fragments**. All four k values sit inside one 32-weight sub-block, so one (d·sc, dmin·m) pair decodes them. Per weight:
+
+1. A byte permute builds the float 2²³ + q. A float with exponent 2²³ has a mantissa step of exactly 1, so q lands in the mantissa with **no int-to-float instruction**.
+2. One subtract recovers q exactly.
+3. `q·(d·sc) − dmin·m` in fp32, with gguf's own two roundings, so the weight is bit-exact.
+4. `cvt.rn.bf16x2` packs two weights into one register, which goes straight into `mma`.
+
+The kernel reads the GGUF bytes as they are (**no offline repacking**, unlike Entry 1's Marlin suggestion). That keeps one layout for the bit-exact dequant test, the naive fallback and the fast kernel.
+
+**`ldmatrix` and swizzle: avoiding bank conflicts** (`Understand`). Shared memory is split into 32 **banks** of 4 bytes. If several lanes hit the same bank in one request, the accesses serialize (a **bank conflict**). `ldmatrix.x4` loads A fragments: each lane gives the address of one 16-byte row piece, and the hardware deals the fragments out. An x row in shared memory is 64 bf16 = 128 bytes, which is exactly all 32 banks, so the same column of 8 rows lands in the **same 4 banks**, an 8-way conflict. **Swizzle** fixes it by storing 16-byte chunk c of row r at position c XOR (row bits):
+
+```
+ plain layout (chunk index per row)      XOR-swizzled (chunk c stored at c ^ (r % 8))
+ row 0:  0 1 2 3 4 5 6 7                 row 0:  0 1 2 3 4 5 6 7
+ row 1:  0 1 2 3 4 5 6 7                 row 1:  1 0 3 2 5 4 7 6
+ row 2:  0 1 2 3 4 5 6 7                 row 2:  2 3 0 1 6 7 4 5
+ ...                                     ...
+ ldmatrix reads chunk 0 of rows 0-7:     chunk 0 of rows 0-7 now sits in 8 different
+ all in one bank group -> 8-way          bank groups -> 1 pass, no conflict
+```
+
+The writer and the reader apply the same XOR, so it costs one instruction. The weight side needs none: a row's 48 bytes per stage (16 B header + 32 B run) is an odd multiple of 16 B, so 8 rows already spread over 16 banks.
+
+**`cp.async` double buffering** (`Must`). `cp.async` copies global memory to shared memory without passing through registers, and the thread doesn't wait for it. With two shared-memory **stages**, the warps compute on one while the next K-slice loads into the other:
+
+```
+ time ->
+ stage 0:  [load K0]           [load K2]           [load K4]
+ stage 1:            [load K1]           [load K3]
+ tensor:             [mma K0 ] [mma K1 ] [mma K2 ] [mma K3 ] ...
+           one __syncthreads per K step swaps the roles
+```
+
+**Choosing the tile by SM fill** (`Understand`). The main tile is 128×128 outputs per block. Its 8 warps sit side by side along N, each with a 128×16 strip, so **every weight is decoded exactly once per block**. With 2 warps along M, each weight was decoded twice, which cost ~5%. Two blocks fit per SM (2 × 44 KB of shared memory), so there are 40 slots on 20 SMs. Blocks run in **waves**, and a ragged last wave leaves SMs idle:
+
+```
+ M = 256, N = 3072 (a text-stream linear), 40 block slots:
+   128x128 tiles: 2 x 24 = 48 tiles  -> wave 1: 40, wave 2: 8 (32 slots idle)  -> ~60% busy (est.)
+   128x64  tiles: 2 x 48 = 96 tiles, each half the work -> 40 + 40 + 16       -> ~80% busy (est.)
+ rule in the launcher: under 160 tiles (4 waves), use 128x64
+```
+
+At M = 256 that keeps the kernel at 92–105% of cuBLAS. **The tuning lesson from the tile sweep:** two resident blocks per SM mattered more than pipeline depth or tile size. Three stages fit only one block per SM and measured worse (77–89% vs 90–99%), because the second block's loads hide the first one's math.
+
+**Where the last ~8% to cuBLAS goes** (`Understand`). Nsight Compute needs root here, so this was measured by ablation. A timing-only build that skips the decode (wrong results) ran at 96–104% of cuBLAS, so **the decode costs about 5–8%**: issue slots and registers next to the `mma`s, because each weight is decoded 10 times per pass (once per 128-row M tile). The other few percent is plain GEMM machinery (2 stages against cuBLAS's deeper pipelines).
+
+**The honest part: the walk step** (`Must`). The walk step went only **61.4 → 57.4 s (7%)** while the tile went 2.74 → 1.40 s (1.96×). A walk step batches 4 windows per pass, so the reference's per-pass dequant was *already* spread over 4 windows (Entry 1, Technique 3 predicted this overlap), and its batched GEMMs ran at cuBLAS speed. Our kernel never paid a per-pass dequant, so batching doesn't help it either: 1.44 s per window pass in the walk against 1.40 s in the tile.
+
+**In an interview.** "I wrote a W4A16 GEMM that decodes Q4_K straight into `mma.sync` B-fragments in registers. The fp16 weight never exists in memory, `cp.async` double-buffers the tiles, and swizzled `ldmatrix` feeds the activations. It reached 92% of cuBLAS on pre-dequantized weights. An ablation showed the decode costs the remaining 5–8%, and the tile sweep showed two resident blocks per SM mattered more than pipeline depth."
+
+<details><summary>Check yourself (Task 5)</summary>
+
+**Q1.** Why does `mma` at M = 1 run no faster than at M = 64 (0.84 ms at every M up to 64 on a 3072 → 18432 linear)?
+
+**A1.** A 16-row `mma` tile (128-row block tile) does the same work whatever M is, and the time is set by reading the 32 MB weight once. At M = 1, 127/128 of the tile is padding.
+
+**Q2.** Why did 3 pipeline stages measure *worse* than 2?
+
+**A2.** Three stages use enough shared memory that only one block fits per SM. With two blocks per SM, one block's loads overlap the other's math, which hides latency better than a deeper pipeline in one block.
+
+</details>
+
+> **Remember this:** keep the data in registers. Decode exactly what the next tensor-core instruction needs, overlap the next load with this math, and the "4-bit tax" shrinks to ~8% of a cuBLAS GEMM.
+
+---
+
+### Task 5b: W4A8 on the INT8 tensor cores
+
+`Must` for per-token scales, why k = 32 fits, "issue-bound" and the study vs ablation lesson. `Understand` for the min-term algebra, the int-to-float trick and the gate method. `Skip` the v2 fp16 min-term experiment.
+
+> **Plain version.** After Task 5 the GEMMs were at 92% of cuBLAS in bf16, so a better bf16 kernel couldn't win much. The INT8 tensor cores run at ~4× our bf16-with-fp32-accumulate rate (est., Entry 1 §1.2). The weights are already small integers (Q4_K codes 0..15), so only the activations had to shrink. Each token's activations are rounded to 8-bit integers with that token's own "ruler" (scale), and the multiply runs on INT8. We got **1.40 → 1.15 s**, with **75%** of the math on INT8. The other 25% stays bf16 because the picture needed it, and *which* 25% was the surprise.
+
+**Per-token activation scales** (`Must`). For each token (row) t: s_t = max|x_t| / 127, xq = round(x_t / s_t) in −127..127, plus xsum (the sum of xq over each 32 values, for the min term). A loud token gets a coarse ruler, **but only for itself**. `test_w4a8_outlier_token` multiplies one token by 1000 and checks that **every other token's output is bit-identical**: the outlier is contained. One scale per tensor would let the loudest token set the step for everyone. The cost is rounding: FLUX tokens have a few big values (max |x| a median 25–50× the median |x|, and ~700–1400× in the worst text-MLP layers), so most values use only a handful of the 255 levels.
+
+**INT8 `mma.m16n8k32`: k = 32 is one Q4_K sub-block** (`Must`). The INT8 instruction multiplies along k = 32, exactly one Q4_K sub-block. So one instruction's whole integer sum shares one (d·sc_j, dmin·m_j) pair. The codes go in **as they are** (0..15 fits a signed byte), with no decode: mask `& 0x0F0F0F0F` for low nibbles and `>> 4` for high ones.
+
+**The min-term algebra** (`Understand`). With x_i = s·xq_i and w_i = (d·sc_j)·q_i − dmin·m_j, one sub-block's share of an output is:
+
+```
+ Σ x_i w_i  =  s · [ (d·sc_j) · Σ xq_i q_i   −   (dmin·m_j) · Σ xq_i ]
+                               \_ int32, one mma _/          \_ xsum_j: from quantize_act, once per token _/
+```
+
+The xsum doesn't depend on the output column, so it is computed once and reused by every output. The kernel accumulates `(d·sc_j)·int_sum − (dmin·m_j)·xsum_j` in fp32 per sub-block, multiplies by s once in the epilogue, adds the bias and rounds to bf16. The integer part is exact, so the kernel matches "fake-quantized x × exact weight" to ~1e-6. **All the loss is in x's rounding, none in the kernel.**
+
+**The integer-exact int-to-float trick** (`Understand`). The `mma`'s accumulator input C is set to the integer 0x4B400000, which is the bit pattern of the float 2²³ + 2²². The `mma` adds the integer dot product to that pattern, so the sum lands in the mantissa. One fp32 subtract of 12,582,912 then gives the exact sum as a float. It is exact as long as the sum stays within ±2²² (4,194,304). The largest possible is 32 × 127 × 15 = **60,960**, far below. The hardware int-to-float conversion runs at 1/8 of the FMA rate and would have dominated.
+
+**Why 1.5×, not 4×: issue-bound** (`Must`). Around each INT8 `mma` (~16 cycles per SM sub-partition, est.), a lane spends **~12 issue slots** on the rescale alone: subtract, FMA, FMA for its 4 outputs, plus unpacking the sub-block scales. The tensor cores wait on the instruction stream, not the reverse. Timing-only ablations (wrong results) show where it goes:
+
+| Variant | GEMM speed vs bf16 `mma` |
+|---|---|
+| chosen kernel | **1.64×** |
+| no scale unpacking | 1.87× |
+| no min-term FMA | 1.92× |
+| neither, nor the xsum loads | 2.10× |
+
+Measured per FLUX shape, including the quantize pass: **1.45–1.72×** the bf16 kernel, 135–156% of cuBLAS bf16, ~25 bf16-equivalent TFLOP/s.
+
+**The lesson: per-layer error did NOT predict the failure** (`Must`).
+
+1. **The study.** Before writing the kernel, a fake-quant study measured each linear's error *on its own* (its output with per-token INT8 x vs exact x). The errors were fairly flat, 1–4% relative L2, worst in the text MLP (up to 7.2%) and the value projections. Attention-out ranked *least* hurt (1.1–1.2%).
+2. **All-INT8 failed the walk gate** (spot 1 seam 1.25 > 1.1). Keeping the study's 5 worst families (A2) still failed, and so did adding the study's next-worst 23 layers.
+3. **The ablation** over 8 keep-lists found what passes: A2 plus **every linear by which a double block writes into the residual stream**, the image MLP-out (`ff.net.2`) and both attention-outs (`to_out.0`, `to_add_out`). Drop either kind and spot 1 fails (1.22, 1.24). Keeping the first and last blocks whole added nothing.
+
+```
+ residual stream:  x ──(+)───────(+)───────(+)── ... ──> 57 blocks later
+                       ^          ^          ^
+                    attn-out    MLP-out    next block's writes   ← an error here is carried to the end
+            inside attention / MLP: errors partly washed out by the next norm and nonlinearity
+```
+
+A plausible reading: an error written into the residual stream persists through every later block, while an error inside one attention or MLP is partly washed out. The isolated per-layer metric measured the second kind well and the first poorly. **Judge lossy changes on the real output, not layer by layer.**
+
+**Gate methodology** (`Understand`).
+- **A deterministic walk:** a fixed 6-spot `sharp` walk (haunted forest, seed 7, fixed headings). The same code gives bit-identical images, so a score moves only when the arithmetic changes.
+- **A seam limit:** `walk_sheet.py --check` scores each spot's strongest full-height seam and fails above SEAM_LIMIT 1.1. The lossless paths set the noise floor (Task 5 `mma` 1.080, diffusers 1.082).
+- **Evidence on committed code:** two fresh walks at commit a2bdb67 (clean tree, AC, no overrides), each recording kernel, keep-list and git sha. Both passed and were bit-identical: max seam **1.058**, below the lossless paths' own 1.08.
+- **Caveat:** that is one scene. Tasks 6 and 8 re-gate it. Task 5c later moved the default sample (25.78 dB vs 5b) and the walk was not re-walked, so the 1.058 margin should be re-checked before relying on it.
+
+**The PSNR trap.** The 512 test image under W4A8 is 25.22 dB from `mma`'s: the same path, ferns and light shafts, with some trunks in other places. Four denoising steps turn tiny rounding into a *different sample of the same prompt*, not a noisy copy. That is why a lossy stage is judged by the walk gate and the eye, not by PSNR against the reference.
+
+**Results.** Step **1.15 s**, **15.37** bf16-equivalent TFLOP/s (80.4%), **75.0%** of token-facing FLOPs on INT8, max seam **1.058**, walk step 57.4 → **48.9 s**.
+
+**In an interview.** "I moved FLUX's GEMMs to W4A8: per-token INT8 activations on the INT8 tensor cores, where k = 32 of `m16n8k32` is exactly one Q4_K sub-block, and the offset term uses precomputed activation sums. The GEMM got ~1.5× rather than 4× because the per-sub-block rescale makes it issue-bound. The real lesson was quality: a per-layer error study didn't predict which layers broke the image. An ablation on a deterministic end-to-end gate showed the residual-stream writes had to stay bf16."
+
+<details><summary>Check yourself (Task 5b)</summary>
+
+**Q1.** Why can the int-to-float trick use a float base and one subtract, and what limits it?
+
+**A1.** A float of magnitude 2²³–2²⁴ has a mantissa step of exactly 1, so adding a small integer to its bit pattern gives that float plus the integer, exactly. Starting at 2²³ + 2²² leaves room for negative sums. It holds while |sum| < 2²²; ours is at most 60,960.
+
+**Q2.** The study ranked attention-out as the least hurt layer. Why did keeping it bf16 still matter?
+
+**A2.** The study measured each layer's error in isolation. Attention-out writes into the residual stream, which carries its error through every later block, so a small isolated error became a large end-to-end one. Only an end-to-end test (the walk gate) sees that.
+
+</details>
+
+> **Remember this:** lower precision buys speed only if the kernel isn't issue-bound, and buys quality loss where errors accumulate (the residual stream), so check it on the real output, not layer by layer.
+
+---
+
+### Task 5c: the modulation GEMV
+
+`Must` for the plain version, why 4-bit helps at M = 1, and re-measuring before optimizing. `Understand` for the kernel design. `Skip` the register counts and the two-rows-per-warp tuning.
+
+> **Plain version.** Modulation (Entry 1 §1.6) is 27% of the weights (1.815 GB of Q4_K), but each linear multiplies **one row** per image. That makes it a **GEMV** (matrix × vector), with about one multiply-add per weight fetched. So it is **memory-bound**: time = bytes ÷ bandwidth. Here, unlike the big GEMMs, **4-bit weights do make it faster**: 3.6× fewer bytes than bf16 is 3.6× less time. The old path (the naive kernel) read those bytes in scattered pieces at 52 GB/s. The new kernel reads them in big coalesced chunks at **165 GB/s**, and modulation went **35.1 → 11.0 ms** per pass. The floor the bytes allow is 9.7 ms.
+
+**Why M = 1 is different** (`Must`). Using the roofline from Entry 1, with VRAM now measured at **187 GB/s** (a 512 MB `torch.sum`; 192 on the spec sheet), the ridge is 19.1 T ÷ 187 G ≈ 102 FLOP/B:
+
+```
+ weight format   bytes/weight   AI at M = 1   AI at M = 1280
+ bf16            2              1.0           1280      (compute-bound: 4-bit saves memory, not time)
+ Q4_K            0.5625         3.6           4551
+                                ^ far left of the ridge: every byte saved is time saved
+
+ 76 modulation linears per pass:  bf16 6.45 GB / 187 GB/s = 34.5 ms   Q4_K 1.815 GB / 187 = 9.7 ms (floor)
+   before (naive, scattered):  35.1 ms   (51.7 GB/s: the 4-bit advantage lost to bad access patterns)
+   after  (q4k_gemv):          10.97 ms  (165 GB/s = 86% of the spec, 88% of the measured 187)
+```
+
+Tensor cores can't help: an `mma` tile is at least 16 rows, so M = 1 is 15/16 padding and saves no bytes. Forced at M = 1, `mma` took 49.5 ms per pass and `w4a8` 31.8 ms.
+
+**How the kernel works** (`Understand`).
+
+```
+ one warp = one weight row (one output); K in chunks of 1024 = 4 super-blocks = 576 contiguous bytes
+   lanes 0-7  -> super-block 0, lanes 8-15 -> sb 1, ...      each lane: one 128-bit load of codes (32 weights)
+                                                              + one 128-bit header load (8 lanes share it)
+   decode in registers (exact gguf fp32), FMA with x from shared memory (XOR-swizzled), fp32
+   the next chunk's bytes are requested before this chunk's math (loads in flight)
+
+ end of row: 32 partial sums -> warp-shuffle reduction
+   lane i += lane (i xor 16) -> xor 8 -> xor 4 -> xor 2 -> xor 1      5 steps, no shared memory
+   -> every lane holds the total; one lane writes y[n] + bias
+```
+
+- **Coalesced 128-bit loads:** a warp's 32 loads cover 512 contiguous bytes, so every Q4_K byte crosses the bus once, in full transactions. Naive gave each thread its own 1,728-byte row, so neighbouring threads read addresses 1,728 bytes apart.
+- **Enough bytes in flight:** 3 blocks (24 warps) per SM at M = 1, each with its next chunk already requested. That is what keeps the memory busy.
+- **Swizzled x** removed 4-way bank conflicts: M = 1 went 154 → 173 GB/s on one linear.
+- From M = 2 each warp takes two weight rows, so each x value read feeds both. At M = 4 (a walk pass) it reaches 114 GB/s: there it runs short of instruction slots, not memory.
+- It stays **lossless**: bf16 x and an fp32 sum, so modulation never runs on INT8, even under the w4a8 default.
+
+**The lesson: re-measure before optimizing** (`Must`). The plan expected "0.29 s → ~0". That number was modulation's share of the diffusers **dequant**, which Tasks 3–5 had already removed. By Task 5b modulation really cost 35 ms, so the whole task saved ~24 ms: **1.15 → 1.12 s, about 0.03 s**. The kernel is good (86% of bandwidth); the premise was stale. Entry 1 §1.6 made the same mistake by calling it a "cheap 0.29 s target". A five-minute measurement before planning would have sized it correctly.
+
+**In an interview.** "At M = 1 a linear is a GEMV: one multiply-add per weight byte, far left of the roofline ridge, so time is just bytes over bandwidth. That is the one place where 4-bit weights buy speed, 3.6× over bf16. My GEMV used a warp per weight row with coalesced 128-bit loads and a warp-shuffle reduction, and reached 86% of DRAM bandwidth. I also learned to re-measure first: the plan's 0.29 s target had already been removed by an earlier kernel, and the real gain was 30 ms."
+
+<details><summary>Check yourself (Task 5c)</summary>
+
+**Q1.** Why is 4-bit storage a speedup for the GEMV but not for the big M = 1280 GEMMs?
+
+**A1.** The GEMV has AI ~3.6 FLOP/B, far below the ridge (~102), so its time is bytes ÷ bandwidth, and 3.6× fewer bytes is 3.6× less time. The GEMMs sit far above the ridge, so their time is set by the math rate, and fewer weight bytes don't change it.
+
+**Q2.** The naive kernel read the same 1.815 GB but took 35 ms. Why?
+
+**A2.** Its access pattern: each thread walked its own weight row, so a warp's 32 simultaneous loads hit 32 addresses 1,728 bytes apart. Each became its own memory transaction, and the bus moved far more than the useful bytes per request. Coalescing gives the same bytes in full, contiguous transactions.
+
+</details>
+
+> **Remember this:** at M = 1, bandwidth is the only number that matters, and fewer bytes means less time. But measure the cost first: this one was 35 ms, not 0.29 s.
+
+---
+
+### Patterns so far
+
+`Must`
+
+> 1. **Find which limit you're hitting** (roofline). The big GEMMs are compute-bound, so a faster number format helps (W4A8). The GEMV is memory-bound, so fewer bytes help (Q4_K at M = 1). Glue is memory-bound, so fusion helps (Task 6).
+> 2. **Keep data in registers.** Decode Q4_K into the fragment the next instruction needs, convert int to float with a bit trick, and reduce with warp shuffles. Never write an intermediate to VRAM.
+> 3. **Overlap loads with math.** `cp.async` double buffering, two blocks per SM, and the next chunk requested before this one's math.
+> 4. **Check lossy changes against the real output, not layer by layer.** A per-layer error study missed the residual-stream layers; a deterministic end-to-end gate found them.
+> 5. **Measure before trusting an estimate.** Task 5 beat its estimate (92% of cuBLAS, not 65–85%), Task 5b fell short (1.5×, not 2–4×), and Task 5c's 0.29 s premise was stale. Re-measure the thing you're about to optimize, and keep the ablation builds.
 
 ---
 
