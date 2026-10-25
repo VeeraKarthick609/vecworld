@@ -71,3 +71,32 @@ def test_load_transformer_resolves_the_kernel_as_the_painter_does(monkeypatch):
             monkeypatch.setenv("VECWORLD_KERNEL", value)
         assert bench.load_transformer()[0] == "transformer"
         assert swapped == want, value
+
+
+def test_modulation_linears_are_the_adaln_ones():
+    """blocks times the modulation linears (Task 5c): the Q4KLinear under each block's AdaLN norm (double blocks'
+    norm1 and norm1_context, single blocks' norm, the output norm), one row per image. Token-facing Q4_K linears and
+    linears left on diffusers are not modulation."""
+    import numpy as np
+    from gguf import GGMLQuantizationType
+
+    from vecworld.engine.q4k import GGUFTensor, Q4KLinear
+
+    def q4k(out=64, inp=256):
+        return Q4KLinear(GGUFTensor("w", GGMLQuantizationType.Q4_K, (out, inp), np.zeros((out, inp // 256 * 144),
+                                                                                           np.uint8)), None, "w4a8")
+
+    tr = torch.nn.Module()
+    tr.transformer_blocks = torch.nn.ModuleList([torch.nn.Module()])
+    blk = tr.transformer_blocks[0]
+    blk.norm1, blk.norm1_context, blk.ff = torch.nn.Module(), torch.nn.Module(), torch.nn.Module()
+    blk.norm1.linear, blk.norm1_context.linear, blk.ff.proj = q4k(), q4k(), q4k()
+    tr.single_transformer_blocks = torch.nn.ModuleList([torch.nn.Module()])
+    tr.single_transformer_blocks[0].norm = torch.nn.Module()
+    tr.single_transformer_blocks[0].norm.linear = q4k()
+    tr.single_transformer_blocks[0].proj_out = q4k()
+    tr.norm_out = torch.nn.Module()
+    tr.norm_out.linear = torch.nn.Linear(256, 64)                     # not Q4_K in the file: diffusers' own
+    names = [n for n, _ in bench.modulation_linears(tr)]
+    assert names == ["transformer_blocks.0.norm1.linear", "transformer_blocks.0.norm1_context.linear",
+                     "single_transformer_blocks.0.norm.linear"]

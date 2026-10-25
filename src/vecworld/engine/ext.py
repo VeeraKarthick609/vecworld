@@ -10,8 +10,8 @@ CSRC = Path(__file__).parent / "csrc"
 
 @functools.cache
 def load_ext():
-    """The compiled module (q4k_dequant, q4k_gemm_naive / tiled / mma / w4a8, q4k_quantize_act). The first call in a process builds it, or
-    loads the build cached under ~/.cache/torch_extensions when the sources haven't changed."""
+    """The compiled module (q4k_dequant, q4k_gemm_naive / tiled / mma / w4a8, q4k_quantize_act, q4k_gemv). The first
+    call in a process builds it, or loads the build cached under ~/.cache/torch_extensions when the sources haven't changed."""
     os.environ["CUDA_HOME"] = CUDA_HOME
     os.environ["TORCH_CUDA_ARCH_LIST"] = ARCH
     import torch.utils.cpp_extension as cpp

@@ -102,6 +102,7 @@ are no bank conflicts.
 
 ### Small M goes to naive
 
+(Since Task 5c every kernel hands M <= 8 to a GEMV instead and `MMA_MIN_M` is gone: `05-modulation-gemv.md`.)
 `Q4KLinear("mma")` hands calls with M < `MMA_MIN_M` = 7 to the naive kernel. A 128-row tensor-core tile at M = 1
 does 128x the useful work. On FLUX's modulation linear (3072 -> 18432, M = windows per pass), measured:
 

@@ -109,47 +109,105 @@ def test_q4k_gemm_odd_n(gg, m, kernel):
     assert rel_err(out, ref) < 2e-2
 
 
-def test_q4k_tiled_small_m_runs_naive(gg, monkeypatch):
-    """Q4KLinear on "tiled" sends M < TILED_MIN_M (the M = 1 modulation linears) to the naive kernel, and M >= it to
-    the tiled one. (The raw tiled kernel is checked at small M in test_q4k_gemm_matches_naive.)"""
+class _Spy:
+    """Stands in for load_ext() and records which extension functions Q4KLinear calls."""
+    def __init__(self, real):
+        self.real, self.calls = real, []
+
+    def __getattr__(self, name):
+        self.calls.append(name)
+        return getattr(self.real, name)
+
+
+def _spy(monkeypatch) -> _Spy:
     import vecworld.engine.ext as ext_mod
-    from vecworld.engine.q4k import TILED_MIN_M, Q4KLinear
 
-    real, calls = ext_mod.load_ext(), []
+    spy = _Spy(ext_mod.load_ext())
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: spy)
+    return spy
 
-    class Spy:
-        def __getattr__(self, name):
-            calls.append(name)
-            return getattr(real, name)
 
-    monkeypatch.setattr(ext_mod, "load_ext", lambda: Spy())
+def test_q4k_tiled_small_m_runs_naive(gg, monkeypatch):
+    """Q4KLinear on "tiled" sends M <= GEMV_MAX_M to the GEMV, GEMV_MAX_M < M < TILED_MIN_M to the naive kernel (a
+    128-row tile would be mostly padding), and M >= TILED_MIN_M to the tiled one. (The raw tiled kernel is checked
+    at small M in test_q4k_gemm_matches_naive.)"""
+    from vecworld.engine.q4k import GEMV_MAX_M, TILED_MIN_M, Q4KLinear
+
+    spy = _spy(monkeypatch)
     lin = Q4KLinear(rows(gg[REAL[0]], 64), None, "tiled").cuda()
     for m in (1, TILED_MIN_M - 1, TILED_MIN_M, 1280):
         lin(torch.randn(m, 3072, device="cuda", dtype=torch.bfloat16))
-    assert TILED_MIN_M == 32
-    assert calls == ["q4k_gemm_naive", "q4k_gemm_naive", "q4k_gemm_tiled", "q4k_gemm_tiled"]
+    assert TILED_MIN_M == 32 and GEMV_MAX_M == 8
+    assert spy.calls == ["q4k_gemv", "q4k_gemm_naive", "q4k_gemm_tiled", "q4k_gemm_tiled"]
 
 
-def test_q4k_mma_small_m_runs_naive(gg, monkeypatch):
-    """Q4KLinear on "mma" sends M < MMA_MIN_M to the naive kernel (a 128-row tensor-core tile at M = 1 does 128x the
-    work: the M = 1 modulation linears are faster on naive, measured in docs/engine/03-q4k-mma.md), and M >= it to
-    the mma kernel. (The raw mma kernel is checked at small M in test_q4k_gemm_matches_naive.)"""
-    import vecworld.engine.ext as ext_mod
-    from vecworld.engine.q4k import MMA_MIN_M, Q4KLinear
+def test_gemv_dispatch(gg, monkeypatch):
+    """Q4KLinear sends M <= GEMV_MAX_M = 8 flattened rows (the modulation linears: one row per image, a pass holds at
+    most 8 windows) to q4k_gemv whatever its kernel, and M = 9 to the configured GEMM kernel ("tiled" keeps its own
+    naive fallback below TILED_MIN_M, test_q4k_tiled_small_m_runs_naive)."""
+    from vecworld.engine.q4k import GEMV_MAX_M, Q4KLinear
 
-    real, calls = ext_mod.load_ext(), []
+    assert GEMV_MAX_M == 8
+    gemm = {"naive": ["q4k_gemm_naive"], "tiled": ["q4k_gemm_naive"], "mma": ["q4k_gemm_mma"],
+            "w4a8": ["q4k_gemm_w4a8", "q4k_quantize_act"]}
+    for kernel, nine in gemm.items():
+        spy = _spy(monkeypatch)
+        lin = Q4KLinear(rows(gg[REAL[0]], 64), None, kernel).cuda()
+        for shape in ((1, 3072), (2, 4, 3072), (8, 3072)):          # leading dims flatten: 2 x 4 = 8 rows
+            lin(torch.randn(*shape, device="cuda", dtype=torch.bfloat16))
+        assert spy.calls == ["q4k_gemv"] * 3, kernel
+        spy.calls.clear()
+        lin(torch.randn(9, 3072, device="cuda", dtype=torch.bfloat16))
+        assert spy.calls == nine, kernel
 
-    class Spy:
-        def __getattr__(self, name):
-            calls.append(name)
-            return getattr(real, name)
 
-    monkeypatch.setattr(ext_mod, "load_ext", lambda: Spy())
-    lin = Q4KLinear(rows(gg[REAL[0]], 64), None, "mma").cuda()
-    for m in (1, MMA_MIN_M - 1, MMA_MIN_M, 1280):
-        lin(torch.randn(m, 3072, device="cuda", dtype=torch.bfloat16))
-    assert MMA_MIN_M == 7
-    assert calls == ["q4k_gemm_naive", "q4k_gemm_naive", "q4k_gemm_mma", "q4k_gemm_mma"]
+def _gemv_cases(gg):
+    """Every in_features the file holds (3072, 12288, 15360), an odd out_features (1001), and in_features 1280 (5
+    super-blocks, not a multiple of the GEMV's 1024-wide K chunk): the first 5 super-blocks of each row."""
+    from vecworld.engine.q4k import GGUFTensor
+
+    t = gg[REAL[0]]
+    short = GGUFTensor(f"{t.name}[:1001, :1280]", t.type, (1001, 1280), np.ascontiguousarray(t.data[:1001, :5 * 144]))
+    return [gg[n] for n in REAL] + [rows(t, 1001), short]
+
+
+@pytest.mark.parametrize("m", [1, 2, 4, 8], ids=lambda m: f"M={m}")
+def test_q4k_gemv_matches_reference(gg, m):
+    """The GEMV (Q4KLinear at M <= 8, any kernel) against gguf dequant + torch.matmul, the Task 3 bar (max-rel <
+    2e-2), with a bias and leading dims; and the raw q4k_gemv against the naive kernel, which decodes the same
+    exact fp32 weights and sums in fp32: only the summation order differs (NAIVE_BAR)."""
+    from vecworld.engine.ext import load_ext
+    from vecworld.engine.q4k import Q4KLinear
+
+    for t in _gemv_cases(gg):
+        g = torch.Generator().manual_seed(m)
+        x = torch.randn(m, t.shape[1], generator=g).to("cuda", torch.bfloat16)
+        bias = (torch.randn(t.shape[0], generator=g) * 0.1).to("cuda", torch.bfloat16)
+        ref = x.float() @ deq(t).cuda().T + bias.float()
+        out = Q4KLinear(t, bias, "w4a8").cuda()(x.view(1, m, -1))
+        assert out.dtype == torch.bfloat16 and out.shape == (1, m, t.shape[0])
+        err = rel_err(out[0], ref)
+        packed = torch.from_numpy(np.ascontiguousarray(t.data)).cuda()
+        raw = load_ext().q4k_gemv(x, packed, bias)
+        naive = rel_err(raw, load_ext().q4k_gemm_naive(x, packed, bias).float())
+        print(f"\ngemv {t.name} M={m}: max-rel {err:.2e} vs reference, {naive:.2e} vs naive")
+        assert torch.equal(raw, out[0])
+        assert err < 2e-2
+        assert naive < NAIVE_BAR
+    t = rows(gg[REAL[0]], 1000)
+    packed = torch.from_numpy(np.ascontiguousarray(t.data)).cuda()
+    x = torch.randn(m, 3072, device="cuda", dtype=torch.bfloat16)
+    assert rel_err(load_ext().q4k_gemv(x, packed), x.float() @ deq(t).cuda().T) < 2e-2      # no bias
+
+
+def test_q4k_gemv_rejects():
+    """q4k_gemv takes at most GEMV_MAX_M rows; M = 0 gives an empty output."""
+    from vecworld.engine.ext import load_ext
+
+    w = torch.zeros(16, 144, device="cuda", dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="at most 8"):
+        load_ext().q4k_gemv(torch.zeros(9, 256, device="cuda", dtype=torch.bfloat16), w)
+    assert load_ext().q4k_gemv(torch.zeros(0, 256, device="cuda", dtype=torch.bfloat16), w).shape == (0, 16)
 
 
 # Every later stage against the naive reference directly, on the same real weights. Both decode each weight
@@ -276,6 +334,12 @@ def test_q4k_gemm_misaligned(gg, kernel):
     lin.qweight.data = wm
     with pytest.raises(RuntimeError, match=re.escape(t.name) + ".*aligned"):   # an error, never copied
         lin(x)
+    with pytest.raises(RuntimeError, match=re.escape(t.name) + ".*aligned"):   # M = 1: the GEMV path too
+        lin(x[:1])
+    with pytest.raises(RuntimeError, match="aligned"):
+        load_ext().q4k_gemv(xm[:1], packed)
+    with pytest.raises(RuntimeError, match="aligned"):
+        load_ext().q4k_gemv(x[:1], wm)
 
 
 def test_swap_skips_non_q4k(gg):

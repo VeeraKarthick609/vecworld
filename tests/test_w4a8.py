@@ -102,7 +102,7 @@ def test_w4a8_gemm_ragged(gg, m, n, tile):
     """Review Focus 2: ragged M (tokens x windows), N no tile multiple, even (the bf16 pair store) and odd (the bias
     tail), with a bias, both tile shapes forced and the launcher's pick; and Q4KLinear's bf16 output, leading dims
     kept, is the kernel's fp32 output rounded."""
-    from vecworld.engine.q4k import SMALL_M, Q4KLinear
+    from vecworld.engine.q4k import GEMV_MAX_M, Q4KLinear
 
     t = rows(gg[REAL[0]], n)
     out, ref, b = _w4a8(t, m, m, tile=tile)
@@ -114,7 +114,7 @@ def test_w4a8_gemm_ragged(gg, m, n, tile):
         x = _x(m, t.shape[1], m)
         y = Q4KLinear(t, b.cpu(), "w4a8").cuda()(x.view(1, m, -1))
         assert y.shape == (1, m, n) and y.dtype == torch.bfloat16 and torch.isfinite(y).all()
-        if m >= SMALL_M["w4a8"]:                    # below it the linear runs naive (M = 1 modulation linears)
+        if m > GEMV_MAX_M:                          # up to it the linear runs the GEMV (bf16, exact)
             assert torch.equal(y[0], out.to(torch.bfloat16))
 
 

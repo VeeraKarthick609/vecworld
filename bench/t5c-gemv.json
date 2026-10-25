@@ -1,0 +1,30 @@
+{
+ "power": "ac",
+ "git": "66dcb2f-dirty",
+ "results": {
+  "what": "tile512",
+  "painter": "engine",
+  "kernel": "w4a8",
+  "gpu_power": "80.00 1 8",
+  "load_s": 9.5,
+  "rss_after_setup_gb": 7.62,
+  "t5_encode_cold_s": 6.59,
+  "mon_t5": {
+   "rss_gb": 8.16,
+   "smi_mib": 1296
+  },
+  "tile512": {
+   "s": 4.5,
+   "passes": 4,
+   "s_per_pass_median": 1.12,
+   "peak_alloc_gb": 1.02,
+   "rss_gb": 8.28,
+   "smi_mib": 1220,
+   "flop_per_step": 17672448245760,
+   "achieved_tflops": 15.78,
+   "pct_bf16_peak": 82.6
+  },
+  "wall_s": 22.4,
+  "gpu_power_end": "90.00 4 8"
+ }
+}

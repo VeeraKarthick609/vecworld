@@ -7,16 +7,14 @@ from gguf import GGMLQuantizationType
 
 QK_K, Q4K_BYTES = 256, 144          # weights and bytes per Q4_K super-block
 KERNELS = ("naive", "tiled", "mma", "w4a8")
-# Below this many rows (tokens x windows) "tiled" runs the naive kernel: a 128-row tile would be mostly padding. FLUX's
-# modulation linears run at M = 1 per window (4.0 ms tiled vs 0.7 ms naive for 3072 -> 18432); the crossover measured
-# at M = 24..32 (docs/engine/02-q4k-tiled.md).
+# Up to this many rows (tokens x windows) every kernel hands the call to q4k_gemv, a memory-bound GEMV that streams
+# the Q4_K bytes once with bf16 activations (exact, as naive). Only the modulation linears are this small: one row per
+# image, and a pass holds at most 8 windows (docs/engine/05-modulation-gemv.md).
+GEMV_MAX_M = 8
+# Below this many rows "tiled" runs the naive kernel: a 128-row tile would be mostly padding (crossover measured at
+# M = 24..32, docs/engine/02-q4k-tiled.md). (mma and w4a8 crossed naive at M = 6..8, now under GEMV_MAX_M.)
 TILED_MIN_M = 32
-# The same for "mma": its 128-row tensor-core tile at M = 1 costs 0.84 ms on 3072 -> 18432 against naive's 0.65; they
-# cross at M = 6..8 (docs/engine/03-q4k-mma.md). In FLUX only the modulation linears (M = windows per pass) are this
-# small.
-MMA_MIN_M = 7
-# "w4a8" shares mma's tile and so its crossover; below it the M = 1 modulation linears stay exact (W4A16 naive).
-SMALL_M = {"tiled": TILED_MIN_M, "mma": MMA_MIN_M, "w4a8": MMA_MIN_M}     # below this M a kernel hands the call to naive
+SMALL_M = {"tiled": TILED_MIN_M}     # GEMV_MAX_M < M < this: the kernel hands the call to naive
 
 
 @dataclass(frozen=True)
@@ -68,7 +66,8 @@ def _aligned_activation(x: torch.Tensor) -> torch.Tensor:
 
 class Q4KLinear(torch.nn.Module):
     """A linear layer computed straight from its packed Q4_K super-blocks: forward(x bf16 [..., in]) ->
-    bf16 [..., out]. kernel picks the stage (KERNELS).
+    bf16 [..., out]. kernel picks the stage (KERNELS) for M > GEMV_MAX_M flattened rows; up to it every kernel runs
+    the GEMV (q4k_gemv).
 
     The packed bytes (qweight, uint8 [out, in / 256 * 144]) and the bias are frozen Parameters, not buffers:
     diffusers' streamed group offload (0.41, use_stream=True) copies a block's buffers to the GPU on onload but
@@ -95,13 +94,16 @@ class Q4KLinear(torch.nn.Module):
         lead = x.shape[:-1]
         x2 = _aligned_activation(x.reshape(-1, self.in_features).to(torch.bfloat16).contiguous())
         b = None if self.bias is None else self.bias.to(torch.bfloat16).contiguous()
-        kernel = "naive" if x2.shape[0] < SMALL_M.get(self.kernel, 0) else self.kernel
         if self.qweight.data_ptr() % 16:
             # Loud on purpose: a misaligned weight means whatever laid it out (e.g. a slot buffer carving views) is
             # wrong. Copying it here would hide that behind a weight-sized copy on every call.
             raise RuntimeError(f"Q4KLinear {self.weight_name}: the packed weight must be 16-byte aligned (vector "
                                f"loads); its address is {self.qweight.data_ptr() % 16} bytes off")
-        if kernel == "w4a8":
+        m = x2.shape[0]
+        kernel = "gemv" if m <= GEMV_MAX_M else "naive" if m < SMALL_M.get(self.kernel, 0) else self.kernel
+        if kernel == "gemv":
+            y = load_ext().q4k_gemv(x2, self.qweight, b)
+        elif kernel == "w4a8":
             y = load_ext().q4k_gemm_w4a8(*quantize_act(x2), self.qweight, b)
         else:
             y = getattr(load_ext(), f"q4k_gemm_{kernel}")(x2, self.qweight, b)

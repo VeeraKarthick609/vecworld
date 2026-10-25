@@ -1,6 +1,7 @@
 // Q4_K kernels. Stage 1 (Task 3): the naive correctness reference. Stage 2 (Task 4): tiled through shared memory.
 // Stage 3 (Task 5): tensor cores (bf16 mma.sync), decoding Q4_K into the B fragments in registers.
 // Stage 4 (Task 5b): W4A8, per-token INT8 activations x the Q4_K codes on the INT8 tensor cores (mma.sync s8).
+// Task 5c: a GEMV for M <= 8 rows (the modulation linears), streaming the Q4_K bytes once at memory bandwidth.
 //
 // A Q4_K super-block holds 256 weights of one row in 144 bytes:
 //   d (fp16) | dmin (fp16) | scales[12]: 8 x 6-bit sc, 8 x 6-bit m | qs[128]: 256 x 4-bit codes
@@ -795,6 +796,137 @@ __global__ void __launch_bounds__(QT) quantize_kernel(const __nv_bfloat16* __res
 
 }  // namespace w4a8
 
+// GEMV (Task 5c): y = x W^T (+ bias) for M <= MAX_M = 8 rows of x: the modulation linears, which see one row per
+// image (a pass holds at most 8 windows). At M = 1 a linear does 2 FLOPs per weight, about 3.6 FLOPs per byte of
+// Q4_K, far below the ridge of the roofline: the time is the time to read the weight once, so the kernel's only job
+// is to stream the packed bytes at full bandwidth, each byte read once, and to keep the rest out of the way
+// (docs/engine/05-modulation-gemv.md). The tensor cores don't help: a 16-row mma tile would be 15/16 padding.
+//
+//   a warp per weight row (= output column n), ROWS rows per warp; K walks in chunks of KC = 1024 = 4 super-blocks:
+//
+//     lane l = 8 * grp + part:  super-block grp (0..3) of the chunk, 16-byte piece `part` (0..7) of its codes
+//                               (run g = part / 2, half h = part % 2), plus the super-block's 16-byte header
+//     global --128-bit loads, one chunk ahead--> registers --decode (exact gguf fp32)--> FMA with x from shared
+//
+//   x (bf16, M rows x 1024 of the chunk) is staged in shared memory by the whole block, once per chunk, and read by
+//   all its warps. Piece `part` holds weights k = 64 g + 16 h + i (low nibbles, sub-block 2g) and k + 32 (high
+//   nibbles, 2g + 1), i = 0..15: two runs of 16 x values per row of x.
+//   The 8 lanes of a quarter-warp (one 128-bit shared load phase) read 8 different (g, h); unswizzled their x pieces
+//   would sit on only 2 of the 8 16-byte bank groups (4-way conflicts), so pieces are XOR-swizzled (swz;
+//   measured on 18432 x 3072: M = 1 154 -> 173 GB/s, M = 8 63 -> 79 GB/s).
+//   Each lane sums its 32 weights x M rows in fp32; a warp-shuffle reduction adds the 32 lanes; lane m writes row m.
+// The super-blocks of a row are contiguous, so a warp's 32 code loads cover 4 x 128 bytes of one row; the headers
+// are read by 8 lanes each (one request). Rows past N and super-blocks past K are skipped.
+namespace gemv {
+
+constexpr int MAX_M = 8;
+constexpr int WARPS = 8;
+constexpr int THREADS = WARPS * 32;
+constexpr int KC = 4 * QK_K;                 // weights per chunk: 4 super-blocks, 8 lanes each
+constexpr int PIECES = KC / 8;               // 16-byte pieces of x per row per chunk
+
+// Piece c = 32 grp + 8 g + 4 f + 2 h + e (f: high-nibble run +32 weights, e: second 8 of 16) -> its slot. Within a
+// quarter-warp grp, e and f are fixed and (g, h) take all 8 values; c ^ (g << 1) ^ h maps them to 8 different
+// 16-byte bank groups (bit 0 = e ^ h, bit 1 = h ^ g0, bit 2 = f ^ g1), and it is a bijection on each 8 pieces.
+__device__ __forceinline__ int swz(int c) { return c ^ (((c >> 3) & 3) << 1) ^ ((c >> 1) & 1); }
+
+__device__ __forceinline__ void bf16x8(uint4 v, float* f) {
+    const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __nv_bfloat162 p = *reinterpret_cast<const __nv_bfloat162*>(&u[i]);
+        f[2 * i] = __low2float(p);
+        f[2 * i + 1] = __high2float(p);
+    }
+}
+
+template <int M, int ROWS>
+__global__ void __launch_bounds__(THREADS)
+    gemv_kernel(const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w,
+                const __nv_bfloat16* __restrict__ bias, __nv_bfloat16* __restrict__ y, int N, int K) {
+    __shared__ uint4 xs[M * PIECES];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int grp = lane >> 3, part = lane & 7, g = part >> 1, h = part & 1;
+    const int nb = K / QK_K, chunks = (nb + 3) / 4;
+    const int n0 = (blockIdx.x * WARPS + warp) * ROWS;
+    const int64_t row_bytes = int64_t(nb) * BLOCK_BYTES;
+
+    uint4 hd[ROWS], qs[ROWS];
+    auto load_w = [&](int c) {                // this lane's header and code piece of chunk c, for each row
+        const int sb = c * 4 + grp;
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            hd[r] = qs[r] = make_uint4(0, 0, 0, 0);
+            if (n0 + r < N && sb < nb) {
+                const uint8_t* blk = w + (n0 + r) * row_bytes + int64_t(sb) * BLOCK_BYTES;
+                hd[r] = __ldg(reinterpret_cast<const uint4*>(blk));
+                qs[r] = __ldg(reinterpret_cast<const uint4*>(blk + 16 + part * 16));
+            }
+        }
+    };
+
+    float acc[ROWS][M] = {};
+    load_w(0);
+    for (int c = 0; c < chunks; ++c) {
+        if (c) __syncthreads();               // every warp is done with the previous chunk's x
+        for (int i = threadIdx.x; i < M * PIECES; i += THREADS) {
+            const int m = i / PIECES, p = i % PIECES, k = c * KC + p * 8;
+            xs[m * PIECES + swz(p)] =
+                k < K ? *reinterpret_cast<const uint4*>(x + int64_t(m) * K + k) : make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+        uint4 hc[ROWS], qc[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) hc[r] = hd[r], qc[r] = qs[r];
+        if (c + 1 < chunks) load_w(c + 1);    // the next chunk's bytes are in flight while this one computes
+        if (n0 >= N || c * 4 + grp >= nb) continue;
+        const int base = grp * 32 + g * 8 + h * 2;
+#pragma unroll
+        for (int f = 0; f < 2; ++f) {         // f = 0: low nibbles, sub-block 2g; f = 1: high, 2g + 1
+            float wv[ROWS][16];
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const SubScale s = sub_scale_regs(hc[r], 2 * g + f);
+                const uint32_t v[4] = {qc[r].x, qc[r].y, qc[r].z, qc[r].w};
+#pragma unroll
+                for (int i = 0; i < 16; ++i) wv[r][i] = decode(s, (v[i >> 2] >> (8 * (i & 3) + 4 * f)) & 0x0F);
+            }
+#pragma unroll
+            for (int m = 0; m < M; ++m)
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    float xv[8];
+                    bf16x8(xs[m * PIECES + swz(base + 4 * f + e)], xv);
+#pragma unroll
+                    for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) acc[r][m] = fmaf(wv[r][e * 8 + i], xv[i], acc[r][m]);
+                }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+        for (int m = 0; m < M; ++m)
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) acc[r][m] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][m], o);
+    if (lane >= M) return;
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        const int n = n0 + r;
+        if (n >= N) break;
+        float o = 0.f;
+#pragma unroll
+        for (int m = 0; m < M; ++m)
+            if (lane == m) o = acc[r][m];     // a static index: acc stays in registers
+        if (bias != nullptr) o += __bfloat162float(bias[n]);
+        y[int64_t(lane) * N + n] = __float2bfloat16(o);
+    }
+}
+
+}  // namespace gemv
+
 
 void check_packed(const torch::Tensor& w, int64_t in) {
     TORCH_CHECK(w.is_cuda() && w.scalar_type() == torch::kUInt8 && w.dim() == 2 && w.is_contiguous(),
@@ -1000,5 +1132,45 @@ torch::Tensor q4k_gemm_w4a8(torch::Tensor xq, torch::Tensor s, torch::Tensor xsu
         dispatch_w4a8<float>(tile_n, xq, s, xsum, w, b, y);
     else
         dispatch_w4a8<__nv_bfloat16>(tile_n, xq, s, xsum, w, b, y);
+    return y;
+}
+
+// GEMV (Task 5c): bf16 x [M <= 8, in] @ Q4_K W[out, in]^T (+ bias) -> bf16 [M, out], memory-bound, bf16 activations
+// (exact, as naive). One instantiation per M, so the per-row accumulators are registers.
+namespace {
+
+template <int M>
+void launch_gemv(const torch::Tensor& x, const torch::Tensor& w, const __nv_bfloat16* b, torch::Tensor& y) {
+    // Two weight rows per warp from M = 2: each x value read from shared memory feeds both (3050 Ti, 18432 x 3072:
+    // M = 4 98 -> 118 GB/s, M = 8 62 -> 79; four rows measured no better). M = 1 is at the memory roof with one.
+    constexpr int ROWS = M >= 2 ? 2 : 1;
+    const int64_t K = x.size(1), N = w.size(0);
+    const int64_t rows_per_block = int64_t(gemv::WARPS) * ROWS;
+    gemv::gemv_kernel<M, ROWS><<<unsigned((N + rows_per_block - 1) / rows_per_block), gemv::THREADS, 0,
+                                 at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), w.data_ptr<uint8_t>(), b,
+        reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), int(N), int(K));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace
+
+torch::Tensor q4k_gemv(torch::Tensor x, torch::Tensor w, c10::optional<torch::Tensor> bias) {
+    const __nv_bfloat16* b = check_gemm(x, w, bias);
+    const int64_t M = x.size(0), N = w.size(0);
+    TORCH_CHECK(M <= gemv::MAX_M, "q4k_gemv takes at most 8 rows of x (GEMV_MAX_M), got ", M);
+    const c10::cuda::CUDAGuard guard(x.device());
+    auto y = torch::empty({M, N}, x.options());
+    if (M == 0 || N == 0) return y;
+    switch (M) {
+        case 1: launch_gemv<1>(x, w, b, y); break;
+        case 2: launch_gemv<2>(x, w, b, y); break;
+        case 3: launch_gemv<3>(x, w, b, y); break;
+        case 4: launch_gemv<4>(x, w, b, y); break;
+        case 5: launch_gemv<5>(x, w, b, y); break;
+        case 6: launch_gemv<6>(x, w, b, y); break;
+        case 7: launch_gemv<7>(x, w, b, y); break;
+        default: launch_gemv<8>(x, w, b, y); break;
+    }
     return y;
 }

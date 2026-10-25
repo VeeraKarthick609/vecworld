@@ -1,0 +1,67 @@
+{
+ "power": "ac",
+ "git": "66dcb2f-dirty",
+ "results": {
+  "what": "blocks",
+  "painter": "engine",
+  "kernel": "w4a8",
+  "gpu_power": "90.00 4 8",
+  "bf16_matmul_tflops": 19.17,
+  "512x512": {
+   "double_block_ms": 20.4,
+   "single_block_ms": 16.4,
+   "double_dequant_ms": 0.0,
+   "single_dequant_ms": 0.0,
+   "sdpa_ms_per_block": 1.19,
+   "resident_step_s": 1.01,
+   "dequant_s": 0.0,
+   "dequant_share": 0.0,
+   "attention_s": 0.07,
+   "attention_share": 0.067,
+   "gemm_glue_s": 0.94,
+   "gemm_glue_share": 0.933,
+   "gemm_flops_floor_s": 1.59,
+   "flop_per_step": 17672448245760,
+   "achieved_tflops": 17.5,
+   "pct_bf16_peak": 91.6
+  },
+  "1024x512": {
+   "double_block_ms": 37.6,
+   "single_block_ms": 31.6,
+   "double_dequant_ms": 0.0,
+   "single_dequant_ms": 0.0,
+   "sdpa_ms_per_block": 3.87,
+   "resident_step_s": 1.91,
+   "dequant_s": 0.0,
+   "dequant_share": 0.0,
+   "attention_s": 0.22,
+   "attention_share": 0.115,
+   "gemm_glue_s": 1.69,
+   "gemm_glue_share": 0.885,
+   "gemm_flops_floor_s": 2.86,
+   "flop_per_step": 33462895509504,
+   "achieved_tflops": 17.52,
+   "pct_bf16_peak": 91.7
+  },
+  "modulation": {
+   "n_linears": 76,
+   "q4k_gb": 1.815,
+   "vram_read_gbps_measured": 187.2,
+   "vram_gbps_spec": 192,
+   "m1": {
+    "ms_per_pass": 10.97,
+    "gbps": 165.4,
+    "pct_of_spec": 86.2,
+    "pct_of_measured_read": 88.4
+   },
+   "m4": {
+    "ms_per_pass": 15.94,
+    "gbps": 113.9,
+    "pct_of_spec": 59.3,
+    "pct_of_measured_read": 60.8
+   }
+  },
+  "wall_s": 19.5,
+  "gpu_power_end": "90.00 4 8"
+ }
+}

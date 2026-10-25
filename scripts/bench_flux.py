@@ -7,7 +7,8 @@ also carry the step's FLOP count, achieved TFLOP/s and % of the measured bf16 pe
   VECWORLD_KERNEL=naive uv run python scripts/bench_flux.py --painter engine --what tile512 --out bench/t3-naive.json
 
 tile512, pano and step run the real painter (its T5 and CLIP included; T5 is encoded once, before timing, and
-its cold encode is recorded). blocks and bw measure the bare transformer and the machine. gemm times
+its cold encode is recorded). blocks and bw measure the bare transformer and the machine; blocks also times the
+modulation linears per pass (do_modulation). gemm times
 VECWORLD_KERNEL's GEMM alone on the FLUX linear shapes against torch.matmul on the same weight pre-dequantized to
 bf16 (the reference's cuBLAS GEMM, without its dequant). Speed numbers are only valid on AC power; on battery
 this exits without touching the GPU.
@@ -195,6 +196,51 @@ def do_step(R, mon):
     (ROOT / "bench").mkdir(exist_ok=True); img.save(ROOT / "bench/last_step.png")
 
 
+def modulation_linears(tr):
+    """(name, module) of the modulation linears: the Q4KLinear under each AdaLN norm (a double block's norm1 and
+    norm1_context, a single block's norm, the output norm's when it is Q4_K). They turn the per-image conditioning
+    into shift / scale / gate, so they see one row per image (Task 5c, docs/engine/05-modulation-gemv.md)."""
+    from vecworld.engine.q4k import Q4KLinear
+    return [(n, m) for n, m in tr.named_modules()
+            if isinstance(m, Q4KLinear) and n.rpartition(".")[2] == "linear" and n.split(".")[-2].startswith("norm")]
+
+
+# The RTX 3050 Ti Laptop's VRAM bandwidth on paper (GDDR6, 128-bit, 12 Gbps): the brief's "~192 GB/s est.".
+VRAM_GBPS_SPEC = 192
+
+
+def do_modulation(tr, ms=(1, 4)):
+    """The modulation linears' cost per transformer pass: each moved to the GPU and timed alone through Q4KLinear's
+    own dispatch at M rows (1: a tile512 pass; 4: FLUX_BATCH windows), the better of two 20-call medians, summed.
+    GB/s is their packed bytes over that time (each byte is read once a pass), against the 192 GB/s spec and the
+    read bandwidth measured here (a 512 MB torch sum)."""
+    import torch
+    mods = modulation_linears(tr)
+    if not mods:
+        return None
+    buf = torch.ones(512 * 2 ** 20 // 8, dtype=torch.int64, device="cuda")
+    read_gbps = 512 * 2 ** 20 / min(bench(lambda: buf.sum(), 20), bench(lambda: buf.sum(), 20)) / 1e6
+    del buf
+    nbytes = sum(m.qweight.numel() for _, m in mods)
+    out = dict(n_linears=len(mods), q4k_gb=round(nbytes / 1e9, 3), vram_read_gbps_measured=round(read_gbps, 1),
+               vram_gbps_spec=VRAM_GBPS_SPEC)
+    tot = dict.fromkeys(ms, 0.0)
+    for _, m in mods:
+        m.cuda()
+        with torch.inference_mode():
+            for M in ms:
+                x = torch.randn(M, m.in_features, device="cuda", dtype=torch.bfloat16)
+                tot[M] += min(bench(lambda: m(x), 20), bench(lambda: m(x), 20))
+        m.cpu()
+    for M in ms:
+        gbps = nbytes / tot[M] / 1e6
+        out[f"m{M}"] = dict(ms_per_pass=round(tot[M], 2), gbps=round(gbps, 1),
+                            pct_of_spec=round(100 * gbps / VRAM_GBPS_SPEC, 1),
+                            pct_of_measured_read=round(100 * gbps / read_gbps, 1))
+    torch.cuda.empty_cache()
+    return out
+
+
 def do_blocks(R, mon):
     import torch
     import torch.nn.functional as F
@@ -240,6 +286,9 @@ def do_blocks(R, mon):
             gemm_glue_s=round(step_s - dq_s - att_s, 2), gemm_glue_share=round(1 - (dq_s + att_s) / step_s, 3),
             gemm_flops_floor_s=round(gemm_s, 2))  # FLOPs / peak matmul TFLOPS: a lower bound, not a measurement
         d.to("cpu"); s.to("cpu"); torch.cuda.empty_cache()
+    mod = do_modulation(tr)
+    if mod is not None:
+        R["modulation"] = mod
 
 
 def do_bw(R, mon):
