@@ -9,7 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
-| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task | 2b, 3, 4, 5, 5b, 5c |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06 | 2b, 3, 4, 5, 5b, 5c, 6 |
 
 ---
 
@@ -45,6 +45,12 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 - Entry 2, Task 5c:
   - M = 1 is memory-bound, so 4-bit weights do speed it up (3.6× fewer bytes): 35 → 11 ms at 86% of bandwidth.
   - Re-measure before optimizing (0.29 s was stale; the real gain was 0.03 s).
+- Entry 2, Task 6:
+  - Fusion saves memory round trips, not FLOPs; the kernels run at 89–96% of the memory roof.
+  - Amdahl: glue was 31% of GPU time after the GEMMs got fast.
+  - Profile first: the planned 0.4 s of glue was 68 ms; RoPE in fp32 was the hidden 147 ms.
+  - Bit-identical lossless changes, so the gate shows Δ = 0 (two-pass LayerNorm's ~3e-6 bit flips failed under W4A8).
+  - "99% of bf16 peak" is bf16-equivalent: 75% of the math runs on INT8.
 - Entry 2, Patterns so far: roofline first; data in registers; overlap loads with math; gate on the real output; measure before trusting estimates.
 
 **Understand.** The exact Q4_K bytes, `mma` tile shapes, the min-term algebra, CUDA graphs, block caching and glue fusion.
@@ -759,11 +765,12 @@ One 512 px window, one transformer pass (1024 image + 256 text tokens, 17.67 TFL
 | Task 4: tiled, shared memory, CUDA cores | 3.77 | 4.69 | 24.5% | 156.3 |
 | **Task 5: tensor cores, bf16 `mma` (W4A16)** | **1.40** | 12.62 | 66.1% | 57.4 |
 | **Task 5b: W4A8 on INT8 tensor cores (default)** | **1.15** | 15.37 (bf16-equivalent) | 80.4% | 48.9 |
-| **Task 5c: modulation on a Q4_K GEMV** | **1.12** | 15.78 (bf16-equivalent) | 82.6% | 47.6 |
+| **Task 5c: modulation on a Q4_K GEMV** | **1.12** | 15.78 (bf16-equivalent) | 82.6% | 47.6 (47.0 when re-run in Task 6's session) |
+| **Task 6: glue fusion (bit-identical)** | **0.93** | 19.00 (bf16-equivalent) | 99.4% (see Task 6 for why this isn't "at the limit") | **39.5** (against 47.0 in the same session) |
 
 From Task 5b on, "TFLOP/s" counts the same 17.67 TFLOP even though 75% of it runs as INT8, so it is **bf16-equivalent**: how fast a bf16 engine would need to be to match. It can pass the bf16 roof without breaking physics.
 
-The step is 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step only 1.29× (61.4 → 47.6 s). Why the walk gains less is the first lesson of Task 5.
+Through Task 5c the step was 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step only 1.29× (61.4 → 47.6 s). After Task 6: step 2.95× (0.93 s), walk step 1.55× (39.5 s). Why the walk gains less is the first lesson of Task 5.
 
 **How the Entry 1 estimates did.**
 
@@ -1005,7 +1012,7 @@ A plausible reading: an error written into the residual stream persists through 
 - **A deterministic walk:** a fixed 6-spot `sharp` walk (haunted forest, seed 7, fixed headings). The same code gives bit-identical images, so a score moves only when the arithmetic changes.
 - **A seam limit:** `walk_sheet.py --check` scores each spot's strongest full-height seam and fails above SEAM_LIMIT 1.1. The lossless paths set the noise floor (Task 5 `mma` 1.080, diffusers 1.082).
 - **Evidence on committed code:** two fresh walks at commit a2bdb67 (clean tree, AC, no overrides), each recording kernel, keep-list and git sha. Both passed and were bit-identical: max seam **1.058**, below the lossless paths' own 1.08.
-- **Caveat:** that is one scene. Tasks 6 and 8 re-gate it. Task 5c later moved the default sample (25.78 dB vs 5b) and the walk was not re-walked, so the 1.058 margin should be re-checked before relying on it.
+- **Caveat:** that is one scene. Tasks 6 and 8 re-gate it. Task 5c later moved the default sample (25.78 dB vs 5b) and the walk was not re-walked, so the 1.058 margin should be re-checked before relying on it. *(Re-checked in Task 6: the Task 5c default scores 1.15 at spot 1, above the fixed 1.1. So from Task 6 on, the gate is relative: no spot more than 0.03 above the previous task's walk. Ruling 2026-11-06.)*
 
 **The PSNR trap.** The 512 test image under W4A8 is 25.22 dB from `mma`'s: the same path, ferns and light shafts, with some trunks in other places. Four denoising steps turn tiny rounding into a *different sample of the same prompt*, not a noisy copy. That is why a lossy stage is judged by the walk gate and the eye, not by PSNR against the reference.
 
@@ -1128,6 +1135,104 @@ Tensor cores can't help: an `mma` tile is at least 16 rows, so M = 1 is 15/16 pa
 
 ---
 
+### Task 6: glue fusion
+
+`Must` for the plain version, why fusion saves bytes not FLOPs, Amdahl, profile first, bit-exactness as a gate and the bf16-equivalent caveat. `Understand` for Welford, reduction order and the layout search. `Skip` the launch-configuration numbers and the cat details.
+
+> **Plain version.** Between the big multiplies, every block does small jobs: add the attention output back, normalize each token (LayerNorm), scale and shift it (modulate), normalize and rotate q and k (RMSNorm + RoPE). Each is a few adds per number, but PyTorch runs each as its own kernel, which **reads the whole tensor from VRAM and writes it back**. Task 6 does each chain in **one pass**: read once, keep the values in registers, write once. The maths is unchanged, and the output is **bit-identical** to diffusers. Step **1.12 → 0.93 s**, walk step **47.0 → 39.5 s**. The surprise: the real cost wasn't the norms the plan pointed at (68 ms). It was diffusers' RoPE in fp32 (147 ms).
+
+**Memory-bound elementwise ops: fusion saves round trips, not FLOPs** (`Must`). One [1280 × 3072] bf16 activation is 7.9 MB. An op that does one multiply per value has AI ≈ 0.1–0.5 FLOP/B, far left of the ~102 FLOP/B ridge, so its time is bytes ÷ bandwidth:
+
+```
+ diffusers (each box reads the whole tensor from VRAM and writes it back)
+   res, y, gate ─[ gate*y ]─[ res + . ]─[ LayerNorm ]─[ *(1+scale) ]─[ +shift ]─> x_mod
+                    r/w        r/w          r/w           r/w          r/w        = 5 round trips
+
+ fused residual_norm_modulate (one block of 128 threads per token row)
+   res, y, gate, scale, shift ─[ v = res + gate*y ; LN stats ; LN(v)*(1+scale)+shift ; (w4a8: quantize) ]─> res_out, x_mod
+                                   read once            values stay in registers            write once
+```
+
+Same arithmetic, ~5× fewer bytes. The three kernels run at **167–179 GB/s, 89–96% of the 187 GB/s read roof**: their time is now the bytes they *must* move. `qk_norm_rope` is **14.5×** faster than diffusers' chain (97 µs against 1,403 µs per call).
+
+**Profile first: the second stale premise** (`Must`). The plan said "~0.4 s of glue" (Entry 1's estimate, from before Tasks 3–5c). A profile of one pass, attributing every GPU kernel to the op that launched it, said otherwise:
+
+| Non-GEMM work, one pass (Task 5c code) | Before | After |
+|---|---|---|
+| **RoPE** (diffusers' `apply_rotary_emb`, fp32: ~6 passes per projection at twice the bytes, 114 times a pass) | **147 ms (13%)** | in `qk_norm_rope` |
+| QK RMSNorm | 19 ms | in `qk_norm_rope` |
+| Residual + LayerNorm + modulate + gates + cats (the plan's "glue"; a third of it `torch.cat`) | **68 ms** | all fused passes together: **35 ms** |
+| Attention (flash SDPA) | 68 ms | 70 ms (not touched) |
+| GELU | 21 ms | 22 ms (not fused) |
+| **All non-GEMM GPU time** | **325 ms** | **128 ms** |
+
+Same lesson as Task 5c: the plan's number was right once and stale by the time we got there. Fusing only what the plan named would have saved ~35 ms; profiling found the 147 ms.
+
+**Amdahl: why glue matters more now** (`Must`). If a part takes fraction p of the time and you make it k× faster, the whole gets 1 / ((1 − p) + p/k) faster. The flip side: every task that sped up the GEMMs made the untouched glue a **bigger** share.
+
+```
+                  GPU time per pass    linears (GEMM-ish)    everything else
+ Task 5c          1042 ms              717 ms  69%           325 ms  31%   ████████░░░ <- RoPE alone 13%
+ Task 6            843 ms              715 ms  85%           128 ms  15%   ██████████░
+```
+
+Fusing ops that were never expensive in FLOPs bought 0.19 s, a 17% faster step, because by Task 5c they were almost a third of the time. Taking the remaining 128 ms to zero would give at most 843 / 715 = **1.18×** more. From here the GEMMs are the lever again.
+
+**Welford, and why reduction order decides the last bits** (`Understand`). LayerNorm needs each row's mean and variance. **Welford's online algorithm** gets both in one pass, with good numerical stability:
+
+```
+ for each value x:   n += 1;  d = x - mean;  mean += d / n;  M2 += d * (x - mean)      variance = M2 / n
+ combine two partial results a, b (how threads, then warps, merge their partials):
+   n = na + nb;  d = mean_b - mean_a;  mean = mean_a + d*nb/n;  M2 = M2a + M2b + d*d*na*nb/n
+```
+
+**Floating-point addition isn't associative:** (a + b) + c can differ from a + (b + c) in the last bit, because each add rounds. In fp32, (10⁸ + 1) − 10⁸ = 0, but (10⁸ − 10⁸) + 1 = 1. So the *order* of the merges (which values each thread holds, the shuffle pattern, the tree over warps) decides the last bit of mean and rstd. Occasionally that flips a bf16 rounding of the output. To be bit-identical to torch, the kernel must merge in **torch's order**.
+
+**The layout search** (`Understand`). torch's order isn't documented, so a probe ran Welford with every combination of load width (2, 4 or 8 values) and warps per row (1–16) against `torch.nn.functional.layer_norm` on 12.6 M outputs. **Only one of the 15 layouts matched: 4-value loads × 4 warps (128 threads), 0 mismatches.** The others mismatched on 104–214 outputs. That fixed the kernel's launch shape.
+
+**Bit-exactness as a gate strategy** (`Must`). A lossless change should change *nothing*, so test it that way: `torch.equal` on x_mod, on q/k, on whole blocks and on the 512 picture. Then the walk gate reads **Δ = 0 on all six spots** (byte-identical PNGs), with no argument about noise. This matters most on the lossy W4A8 default. INT8 rounding amplifies one flipped bf16 bit into a different sample (as Task 5c's one-ulp modulation change did: 25.78 dB), and a different sample moves seam scores by more than the gate's ±0.03. "Almost identical" isn't good enough upstream of a lossy stage; "identical" is.
+
+**The fused quantize (kept)** (`Understand`). Under W4A8, the norm's output feeds INT8 linears, each of which used to re-read x_mod to quantize it. The norm already holds x_mod in registers, so it emits the same s / xq / xsum (bit-identical to `quantize_act`) alongside it. Net **−10 ms** per pass; `quantize_act` fell 25.6 → 13.2 ms (228 → 38 launches).
+
+**"99.4% of bf16 peak" isn't a contradiction** (`Must`). 19.00 TFLOP/s is the nominal 17.67 TFLOP ÷ 0.93 s, quoted against the bf16 roof. But 75% of the token FLOPs run on the INT8 tensor cores (Task 5b), which are faster than bf16, so this **bf16-equivalent** rate can pass 100%. It doesn't mean the GPU is at its limit: the pass still has ~80 ms where the GPU waits (0.925 s wall against ~845 ms of kernels), which is Task 7's target (CUDA graphs).
+
+**Peak memory barely moved** (−1 to −2%): the peak is the streamed weights plus the largest GEMM's activations (the 12,288-wide MLP), not the norm intermediates. So fusion doesn't buy batch headroom, contrary to Entry 1's Technique 6 hope.
+
+**In an interview.** "I fused FLUX's elementwise glue into three memory-bound kernels at 89–96% of DRAM bandwidth. Fusion can't cut FLOPs, only round trips. Profiling first showed the real cost was an fp32 RoPE chain at 13% of the step, not the norms the plan named. I made the kernels bit-identical to PyTorch, including matching its Welford reduction order, because downstream INT8 quantization turns a single last-bit difference into a visibly different image. That made the quality gate trivial: byte-identical output."
+
+**Tried and not chosen** (`Understand`):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **Two-pass LayerNorm** (mean, then variance around it, fp32 in registers: the textbook way; the first version) | Same speed (94.6 against 96.4 µs). 2.8e-6 (~3e-6) of x_mod values off by one last bit; blocks max-rel 9.0e-3; picture 30.36 dB under mma but **25.17 dB under w4a8** (a different sample); walk spots 2, 4, 5 rose +0.04 / +0.08 / +0.21: **3 spots failed** the +0.03 gate | Not less accurate, just *different* from torch's bits, and W4A8 amplified the difference | Any pipeline without a lossy stage downstream, or where you own the reference (no need to match torch) |
+| The other 14 Welford layouts (2/4/8-value loads × 1–16 warps, except 4 × 4) | 104–214 mismatching outputs of 12.6 M | Don't reproduce torch's reduction order | Same as two-pass: if matching torch didn't matter |
+| Launch configs: rnm 64 or 256 threads, qk 4 or 16 warps (against 128 / 8 kept) | Within noise, e.g. 97.5 / **94.6** / 94.1 µs (M = 1024 + quantize); qk 96.7 / **96.6** / 96.0 | All at 89–96% of the memory roof, so the shape barely matters; 128 threads is also what torch's order needs | — |
+| (a) GELU into the GEMM epilogue | GELU costs 22 ms (2.4% of the fused step) | Needs epilogues in both Q4_K GEMMs (mma and w4a8): GEMM work, not glue work | A later GEMM task; it also unlocks (b) |
+| (b) Quantize `proj_out`'s input in its producers | 13.2 ms (1.4%) | Its row is [attention ‖ GELU(mlp)] from two producers; a per-token scale needs the whole row's max first | After (a) |
+| (c) A block's last residual fused into the next block's first norm | `gated_residual` ~7.5 ms per pass; at most ~3–4 ms saved | Crosses diffusers' block loop and the group-offload hooks | When we own the whole block loop (no diffusers loop) |
+| (d) Attention output written straight into `proj_out`'s buffer | 3.6 ms of copies | Flash SDPA allocates its own output; needs a custom attention call | With our own attention kernel |
+| (e) The last cats (double-block text+image v, first single-block join) | 1.8 ms | Too small to justify | — |
+| (f) RoPE folded into the q/k GEMM epilogue | `qk_norm_rope` already 97 µs per call (~11 ms per pass) at 176 GB/s | RMSNorm needs a whole head's sum of squares before RoPE; little left to save | A GEMM whose N-tile spans a whole head (128) |
+| Attention, modulation GEMV, SiLU, embedders | 70 / 11.6 / 0.2 / 1.6 ms | Not glue (attention is already flash) or already at memory speed (Task 5c) | — |
+
+One cost seen, not chased: with glue fused, the GEMMs ran ~1% slower (~10 ms of the 190 ms won). The likely cause is the denser schedule on a power- and heat-limited laptop GPU.
+
+<details><summary>Check yourself (Task 6)</summary>
+
+**Q1.** Fusing five elementwise ops doesn't remove a single FLOP. Why does it make them ~2.6× faster (14.5× for RoPE)?
+
+**A1.** They are memory-bound (~1 FLOP per value, far left of the ~102 FLOP/B ridge), so their time is bytes ÷ bandwidth. Unfused, each op reads and writes the whole tensor; fused, the chain reads its inputs once and writes its outputs once. RoPE gained most because diffusers ran it as ~6 passes in fp32, twice the bytes per value.
+
+**Q2.** The two-pass LayerNorm flipped only ~3e-6 of values by one last bit and was no less accurate. Why did it fail the gate under w4a8 but not under mma?
+
+**A2.** Under mma the flip stays a last-bit difference (30.36 dB, a near-identical picture). Under w4a8 the next linears quantize x per token to INT8, and a last-bit change can flip an INT8 rounding. Four denoising steps grow that into a different sample (25.17 dB), and a different sample moves seam scores past the ±0.03 gate. Upstream of a lossy stage, only bit-identical is safe.
+
+</details>
+
+> **Remember this:** glue is memory-bound, so fuse to cut bytes, not FLOPs. Profile before you fuse (the cost was RoPE, not the norms), and make lossless changes bit-identical so the gate can prove Δ = 0.
+
+---
+
 ### Patterns so far
 
 `Must`
@@ -1136,7 +1241,9 @@ Tensor cores can't help: an `mma` tile is at least 16 rows, so M = 1 is 15/16 pa
 > 2. **Keep data in registers.** Decode Q4_K into the fragment the next instruction needs, convert int to float with a bit trick, and reduce with warp shuffles. Never write an intermediate to VRAM.
 > 3. **Overlap loads with math.** `cp.async` double buffering, two blocks per SM, and the next chunk requested before this one's math.
 > 4. **Check lossy changes against the real output, not layer by layer.** A per-layer error study missed the residual-stream layers; a deterministic end-to-end gate found them.
-> 5. **Measure before trusting an estimate.** Task 5 beat its estimate (92% of cuBLAS, not 65–85%), Task 5b fell short (1.5×, not 2–4×), and Task 5c's 0.29 s premise was stale. Re-measure the thing you're about to optimize, and keep the ablation builds.
+> 5. **Measure before trusting an estimate.** Task 5 beat its estimate (92% of cuBLAS, not 65–85%), Task 5b fell short (1.5×, not 2–4×), and Task 5c's 0.29 s premise was stale. Task 6's "0.4 s of glue" was 68 ms, and the real cost (RoPE, 147 ms) wasn't in the plan at all. Re-measure the thing you're about to optimize, and keep the ablation builds.
+> 6. **Make lossless changes bit-identical** (Task 6). Then the gate proves Δ = 0 instead of arguing about noise, which matters most upstream of a lossy stage like W4A8.
+> 7. **Amdahl moves the target.** Each speedup makes the untouched parts a bigger share: glue went from small to 31% of GPU time by Task 5c, and after Task 6 the GEMMs are 85% again.
 
 ---
 
