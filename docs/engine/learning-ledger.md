@@ -9,7 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
-| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv) | 5, 5b, 5c |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task | 2b, 3, 4, 5, 5b, 5c |
 
 ---
 
@@ -776,6 +776,80 @@ The step is 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step
 
 ---
 
+### Tried and not chosen: how to read these tables
+
+`Must` (the habit, not every row)
+
+Every task below ends with a **"Tried and not chosen"** table: one row for each alternative we actually built or measured, what it measured, why we didn't pick it, and **when it might win instead**. That last column is the interview material. "Why didn't you do X?" is a common question, and "we measured X at N, and it loses here because of Y, but it would win if Z" is the strongest possible answer. Where a number was never recorded, the row says so rather than guessing.
+
+---
+
+### Task 2b: the walk-step recipe
+
+`Understand`
+
+> **Plain version.** A walk step moves the camera, then repaints the view. The question is *how much* of the old picture to keep in each part of the panorama: the band ahead (new ground), the sides and the band behind. Keep too little and the scene stops being continuous; keep too much, or keep it unevenly, and you get seams where a freshly painted band meets an old one. We tried six recipes and several variants of the winner. **`sharp`** won: paint ahead from scratch (focus 1.0), release the sides at 0.75 and the back at 0.9, all "graded" (each column released once at its own strength, then denoised with its neighbours), and feather the focus edge over 0.25 of a turn. Its worst seam on the gate walk is 1.08, against a limit of 1.1. You confirmed the pick on 2026-10-24.
+
+**Tried and not chosen.** Seam score: the strongest full-height edge in a spot (`walk_sheet.py`; above 1.1 fails).
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| `t1` (Task 1's step): linear release. The band ahead is painted from scratch; the rest is held to the original until sigma 0.15; the feather is a crossfade | Walk-step seams 1.13–1.79. Visible double exposures at the feather, chevrons behind, scene jumps | The two regions never denoise together, so the feather is a blend of two different pictures, a seam by construction | When the camera barely moves and both sides already agree (small local edits, inpainting a small object) |
+| `t1` with side strength 0.5 | "did not fix" the seams (no per-spot score archived) | Same mechanism: a softer hold doesn't make the regions denoise together | Not likely here; the fix had to change the release, not the strength |
+| `repaint`: graded, side 0.5, back 0.5, focus 1.0, feather 0.15 (SD-Turbo's approach) | Per-recipe seam scores not archived. Root cause measured: `dolly()`'s mirror padding is 38% of rows at z 2.5, and the 0.5 back band keeps it, so chevrons | Back 0.5 keeps the mirror artefacts behind the camera | With a model or camera move that creates no mirror padding (small dolly), or SD-Turbo, where it worked |
+| `carry`: focus 0.75, back 0.75 | Scores not archived. A related test, focus 0.95 on sharp, brought back the parent's blurred close-ups | Focus below 1.0 carries the dolly-magnified blur ahead into the new picture | Small forward moves, where the content ahead is already sharp and not magnified |
+| `renew`: focus 0.9, back 0.9 | Scores not archived; same focus < 1.0 issue as carry | Same as carry | Same as carry |
+| `fresh`: a new panorama each step; only the prompt blend carries the walk on | No seams by design. Continuity score 0.08 (the baseline that sharp's bar 0.12 sits just above); exempt from the continuity gate | No visual continuity: each step is a new place, so walking feels like teleporting | Deliberate scene changes (the journey drifting to a new place), or a "teleport" move |
+| `sharp` as first proposed: side 0.5, feather 0.15 | Seams 1.36 / 1.38 / 1.13 at spots 2, 4, 5 (fail) | Columns released at 0.6–0.85 between a fresh band and an old view became haze ending in a hard full-height edge | — (it was fixed, not replaced) |
+| Binary (stepped) releases instead of graded | Seam 1.79 on the same step | Harder edges: a step in strength makes a step in the picture | Never, for blending; graded release is strictly better here |
+| Feather 0.25 alone | That step's edge 1.41 → 0.64, but the next walk had haze bands at the focus edge: 1.33 / 1.31 | Moved the problem rather than fixing it | Together with wider sides, which is what was chosen (0.82 / 0.80) |
+| Side 0.75 alone | That step's edge 1.41 → 0.67 (single-step test, not walked alone) | Not tested on a whole walk alone; the combination was | — |
+
+---
+
+### Task 3: the naive Q4_K kernel
+
+`Understand`
+
+> **Plain version.** The simplest correct kernel: one thread per output number, each decoding its own whole weight row. Its job was to pin down *what* the right answer is, not to be fast. It removed the 1.08 s dequant but made the step **22.98 s** (8.2× slower), as expected. It stays as the reference every faster kernel is tested against.
+
+**Tried and not chosen** (isolated FLUX linears, TFLOP/s):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| First version: 32×8 thread blocks, scalar loads | 0.45 TFLOP/s | Slowest; each load fetched one value | Never as a fast path; it is the clearest version to read |
+| 32×8 blocks with vector loads | 0.55 | The 16×16 shape measured better | — |
+| Threads laid along m (tokens) instead of n (outputs) | 0.30 | Measured worst of all | Not measured beyond this; the cause wasn't profiled |
+| **Chosen:** 16×16 blocks + vector loads (4 code bytes, 4 + 4 bf16 x per load) | 0.85 | — | — |
+| Naive as the engine's kernel | 22.98 s/step against 2.74 s | No reuse: every weight decoded 1,280 times per pass, on CUDA cores | It did win at M = 1 (0.65 ms against `mma`'s 0.84 ms on one modulation linear), so it ran modulation until Task 5c's GEMV |
+
+---
+
+### Task 4: the tiled kernel (shared memory, CUDA cores)
+
+`Understand`
+
+> **Plain version.** Same maths as naive, but each block of threads works on a 128×128 tile of outputs. It decodes each weight **once per tile** into shared memory, so 128 rows of x reuse it. That made it **6.1× faster than naive** (3.77 s), with the dequant gone. It is still **1.38× slower than the reference** (2.74 s), because it multiplies on CUDA cores, which top out around **5.3 TFLOP/s** here (cuBLAS's own fp32 SGEMM, measured), while the reference used tensor cores. So it stays a teaching stage.
+
+**Tried and not chosen** (isolated linears at M = 1280, range over 5 FLUX shapes, TFLOP/s; clocks move ±5%):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **Tiled as the default kernel** | 3.77 s/step against the reference's 2.74 s | CUDA cores cap it at about cuBLAS SGEMM's 5.3 TFLOP/s; the reference's tensor cores do 19.1 | A GPU or data type without tensor-core support, or where fp32 math is required |
+| 128×128 tiles, plain row order, no register cap | 3.2–3.5 | Only 1 block per SM, and no L2 sharing between neighbouring blocks | — |
+| 128×64 tiles | 3.7–5.0 | Less reuse per weight than 128×128 once 2 blocks per SM fit | Smaller M, where a 128×128 grid would leave SMs idle |
+| 64×128 tiles | 2.0–4.8 | Lower reuse of x | — |
+| 64×64 tiles | 2.9–3.9 | Lower reuse both ways | Small matrices with too few 128-tiles to fill 20 SMs |
+| 32×128 / 16×128 tiles | 2.1–2.7 / 1.1–2.3 | Little reuse of each decoded weight | Very small M (few tokens) |
+| Double-buffered shared memory (128×64, 64×128, 64×64) | 1.9–4.3 | Twice the shared memory, fewer resident blocks: **occupancy** fell more than the overlap gained | When the copy doesn't go through registers (`cp.async`, Task 5), where double buffering *did* win |
+| 128×64 with 4 blocks per SM forced (register cap 128) | 3.2–3.9 | The register cap cost more than the extra blocks gained | — |
+| Coalesced x loads (4 lanes per row, a warp reads 512 contiguous bytes) | Same as 128×64 (±1%) | No gain for extra complexity; L1 already caught the other half of each sector | If x loads ever became the bottleneck |
+| Grouped order GROUP_M = 4 / 10 | 4.4–5.1 / 3.0–5.0 (128×64), against 4.7–5.2 for 2 | Larger groups shared L2 less well here | Other shapes or bigger L2 |
+| 128×128, 2 blocks per SM, GROUP_M = 4 | 4.6–5.7 | About the same as the chosen GROUP_M = 2 (5.2–5.6), less consistent | — |
+| Tiled at M = 1 (modulation) | 4.0 ms against naive's 0.7 ms on 3072 → 18432 | A 128-row tile at M = 1 is 127/128 padding; crossover measured at M = 24–32 | M ≥ 32 |
+
+---
+
 ### Task 5: the Q4_K kernel on tensor cores (W4A16)
 
 `Must` for the plain version, warps, fragments, `mma` and double buffering. `Understand` for the decode trick, `ldmatrix` and swizzle. `Skip` the exact nibble-to-lane map.
@@ -857,6 +931,25 @@ At M = 256 that keeps the kernel at 92–105% of cuBLAS. **The tuning lesson fro
 
 </details>
 
+**Tried and not chosen** (`Understand`). % of `torch.matmul` (cuBLAS) on the same weights pre-dequantized, M = 1024/1280 shapes, same harness:
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| 128×128, warps 2×4 (64×32 each), **3 stages**, 1 block per SM | 77–82% | Three stages' shared memory fits only 1 block per SM, so nothing hides one block's latency | A GPU with more shared memory per SM, where 3 stages and 2 blocks both fit |
+| The same, 4 stages | 77–89% | Same one-block limit | Same |
+| 128×128, warps 4×2 (32×64), 3 stages | 69–81% | Worse warp shape and one block per SM | — |
+| 128×256 tile, 64×64 warps, 3 stages | 80–89% | Big tile, one block per SM | Very large GEMMs on bigger GPUs |
+| 64×128, 32×32 warps, 3 stages, 2 per SM | 74–87% | Smaller tile: each weight decoded more often, less reuse | — |
+| 64×64, 32×32 warps, 3 stages, 3 per SM | 67–79% | Even less reuse | Small matrices |
+| 128×128, warps 2×4, 2 stages, 2 per SM | 86–101% | Each weight decoded **twice** per block (2 warps along M): about 5% slower than the chosen 1×8 layout | — |
+| **Chosen:** 128×128, warps 1×8 (128×16 each, each weight decoded once), 2 stages, 2 per SM | **90–99%** | — | — |
+| 128×64 tile with 3 stages | 71–77% | 3 × 57 KB shared memory: 1 block per SM | — |
+| 128×64 tile (2 stages, 2 per SM) | 86–95% (M = 256: 91–105%) | Not chosen for big grids; **chosen** under 160 tiles (fills the last wave better) | The M = 256 text linears, where it is used |
+| Grouped tile order GROUP 2 / 8 / 16 instead of 4 | Within 1% | No difference with 2 blocks per SM | — |
+| FMA decode (one rounding instead of mul + sub) | Within 1% | No speed gain, and it would lose gguf's bit-exact rounding | If the decode ever became ALU-bound |
+| Offline repacking of the weights (Marlin-style; Entry 1 suggested it) | Not built. Upper bound: the whole decode, layout included, costs 5–8% (the no-decode ablation) | GGUF's layout already gives conflict-free 16-bit loads, and one layout keeps the bit-exact test and the naive fallback simple | Memory-bound small-M GEMMs, where one wide load per fragment matters more |
+| `mma` at M = 1..6 | 0.84 ms at every M ≤ 64, against naive's 0.65 ms at M = 1 (3072 → 18432) | The 128-row tile is mostly padding; M < 7 went to naive (Task 5c later routed it to a GEMV) | M ≥ 7 |
+
 > **Remember this:** keep the data in registers. Decode exactly what the next tensor-core instruction needs, overlap the next load with this math, and the "4-bit tax" shrinks to ~8% of a cuBLAS GEMM.
 
 ---
@@ -932,6 +1025,31 @@ A plausible reading: an error written into the residual stream persists through 
 
 </details>
 
+**Tried and not chosen: the kernel** (`Understand`). GEMM speed against the bf16 `mma` kernel, from the same timing-only harness:
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **Chosen (v1):** 2 stages, scales unpacked per lane, min term as fp32 FMAs | **1.64×** (per-shape bench incl. quantize: 1.45–1.72×) | — | — |
+| 3 pipeline stages | 1.52× | More shared memory, fewer resident blocks; the kernel is issue-bound, so deeper prefetch doesn't help | If the kernel became latency-bound instead of issue-bound |
+| v2: min term as one fp16 `mma.m16n8k8` per super-block (correct results) | 1.44× | 18 more registers per thread **spilled** the 128×128 tile | A smaller tile, or a GPU with more registers per thread, where it wouldn't spill |
+| Hardware int → float conversion (instead of the 0x4B400000 trick) | Not timed alone; it runs at 1/8 of the FMA rate here | It would have dominated the rescale | GPUs where conversion runs at full rate |
+| No rescale work (timing-only, **wrong results**): no scale unpack / no min-term FMA / neither, nor xsum loads | 1.87× / 1.92× / 2.10× | Not a real option: it measures the prize | Shows what cooperative scale unpacking could win (follow-up; ceiling ~+15%) |
+
+**Tried and not chosen: which layers stay bf16** (`Must`: the method). Each list was walked on the deterministic 6-spot gate; max seam over spots 0–5 must be ≤ 1.1. Lossless baselines: Task 5 `mma` 1.080, diffusers 1.082. "INT8 share" is the share of token-facing FLOPs on INT8.
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| All-INT8 (keep nothing) | 100% INT8; seam **1.25** at spot 1 (fail) | Failed the gate | A scene without borderline fog edges, or a looser gate; or with smarter activation scaling (SmoothQuant) |
+| A2 = the study's 5 worst families | 86.7%; **1.16** (spot 1), 1.14 (spot 3): fail | Failed | — |
+| A2 + the study's next-worst 23 single layers (S26) | 77.5%; **1.19** / 1.11: fail | Failed: **picking layers by per-layer error doesn't work** | — |
+| A2 + whole blocks (double 0, 18; single 0, 37) (BL) | 80.8%; **1.16**: fail | The first and last blocks aren't the sensitive part | — |
+| A2 + attention-outs, no MLP-out (A2+AO) | 83.9%; **1.22**: fail | Missing the MLP-out residual write | — |
+| A2 + MLP-out + whole blocks, no attention-outs (A3-AO) | 72.8%; **1.24**: fail | Missing the attention-out residual writes | — |
+| Attempt 3: A2 + MLP-out + attention-outs + whole blocks (Entry 1's guess) | 70.3%; **1.098: pass** (margin 0.002); step 1.17 s, walk 49.4 s, 24.91 dB vs mma | Passed, but FA (chosen) passes with a bigger margin (1.058) and more on INT8 (75.0%, step 1.15 s, walk 48.9 s): the whole blocks added nothing | If a later scene shows the FA list failing; it's the safer fallback |
+| **Chosen: FA** = A2 + MLP-out + attention-outs | **75.0%; 1.058: pass**, twice, bit-identical, at committed a2bdb67 | — | Not proven minimal: the A2 patterns were never dropped one at a time |
+| Choosing the keep-list from the per-layer fake-quant study alone | The study ranked attention-outs *least* hurt (1.1–1.2%); its lists all failed | Isolated per-layer error doesn't see errors accumulating through the residual stream | A cheap first filter (it did give A2, which every passing list needed) |
+| Modulation linears on INT8 | Highest per-layer error in the study, 4–7% rel L2; 0.04% of the math | Big error for no speed: they're memory-bound GEMVs, where INT8 math buys nothing | Never on this model |
+
 > **Remember this:** lower precision buys speed only if the kernel isn't issue-bound, and buys quality loss where errors accumulate (the residual stream), so check it on the real output, not layer by layer.
 
 ---
@@ -993,6 +1111,19 @@ Tensor cores can't help: an `mma` tile is at least 16 rows, so M = 1 is 15/16 pa
 
 </details>
 
+**Tried and not chosen** (`Understand`). The 76 modulation linears per pass at M = 1, 1.815 GB of Q4_K; the floor at the measured 187 GB/s is 9.7 ms:
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| The plan's premise: "M = 1 runs padded tensor-core tiles, ~0.29 s" | Wrong premise. M < 7 already ran naive, and the 0.29 s was dequant that Task 3 removed; the real cost was 35.1 ms | — (a planning error, kept here as a lesson) | — |
+| Naive kernel (the previous routing) | 35.1 ms, 51.7 GB/s (M = 4: 38.8 ms) | Scattered reads: neighbouring threads 1,728 bytes apart | — |
+| `mma` forced at M = 1 (padded 128-row tiles) | 49.5 ms | 15/16 of each `mma` tile is padding, and it saves no bytes | M ≥ 7 |
+| `w4a8` forced at M = 1 | 31.8 ms (with its quantize) | Same padding; INT8 math doesn't help a memory-bound op, and it would be lossy | Never for modulation |
+| **Chosen:** `q4k_gemv` | **10.97 ms, 165 GB/s** (M = 4: 15.9 ms) | — | M ≤ 8 (`GEMV_MAX_M`) |
+| GEMV without the x swizzle | 154 GB/s at M = 1 (173 with it), 63 GB/s at M = 8 (79 with it), one linear | 4-way shared-memory bank conflicts on x | — |
+| One weight row per warp at M ≥ 2 | 98 GB/s at M = 4, 62 at M = 8 (two rows per warp: 118, 79) | Each x value read from shared memory fed only one row; instruction slots ran out | M = 1, where it is used |
+| Four weight rows per warp | "no better" than two (no figure recorded) | No gain for more registers | — |
+
 > **Remember this:** at M = 1, bandwidth is the only number that matters, and fewer bytes means less time. But measure the cost first: this one was 35 ms, not 0.29 s.
 
 ---
@@ -1016,3 +1147,4 @@ Recorded at the 2026-10-24 walkthrough. They apply to every future entry and wal
 - Plain language first, numbers second. Open each idea with a one-line version before the detail.
 - One concept per walkthrough.
 - When the learner says "skip", reduce that part to a one-line takeaway, and keep the detail only under an "Understand later" label.
+- Standing rule (2026-11-06): record **every** technique tested, including those not chosen, in a "Tried and not chosen" table with what we measured, why we didn't pick it and when it might win. Use measured numbers, and say so plainly when a number was never recorded.
