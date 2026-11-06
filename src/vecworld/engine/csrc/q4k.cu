@@ -14,6 +14,8 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 
+#include "w4a8_quant.cuh"
+
 namespace {
 
 constexpr int QK_K = 256;
@@ -719,36 +721,8 @@ __global__ void __launch_bounds__((BM / WM) * (BN / WN) * 32, MIN_BLOCKS)
 // as on the bf16 paths, rather than as quietly clamped numbers.
 constexpr int QT = 256, QREG = 8;
 
-__device__ __forceinline__ uint32_t amax8(uint4 v, uint32_t amax) {
-    const uint32_t u[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-    for (int e = 0; e < 4; ++e) amax = max(amax, max(u[e] & 0x7FFFu, (u[e] >> 16) & 0x7FFFu));
-    return amax;
-}
-
-// Quantize chunk c (8 values, v) and write it; every lane of the warp calls this together (the xsum shuffles).
-__device__ __forceinline__ void quantize8(int c, bool ok, uint4 v, float s, int8_t* qr, int* sr) {
-    int sum = 0;
-    if (ok) {
-        const uint32_t u[4] = {v.x, v.y, v.z, v.w};
-        uint32_t packed[2] = {0, 0};
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u[e]));
-            int q0 = 0, q1 = 0;
-            if (s > 0.f) {
-                q0 = int(fminf(fmaxf(rintf(__fdiv_rn(f.x, s)), -127.f), 127.f));
-                q1 = int(fminf(fmaxf(rintf(__fdiv_rn(f.y, s)), -127.f), 127.f));
-            }
-            sum += q0 + q1;
-            packed[e >> 1] |= ((uint32_t(q0) & 0xFF) | ((uint32_t(q1) & 0xFF) << 8)) << (16 * (e & 1));
-        }
-        *reinterpret_cast<uint2*>(qr + c * 8) = make_uint2(packed[0], packed[1]);
-    }
-    sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 1);
-    sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 2);
-    if (ok && (c & 3) == 0) sr[c >> 2] = sum;
-}
+using vw_w4a8::amax8;
+using vw_w4a8::quantize8;
 
 __global__ void __launch_bounds__(QT) quantize_kernel(const __nv_bfloat16* __restrict__ x, int8_t* __restrict__ xq,
                                                       float* __restrict__ s_out, int* __restrict__ xsum, int K) {

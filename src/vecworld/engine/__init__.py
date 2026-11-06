@@ -6,6 +6,7 @@ packed Q4_K super-blocks; swap.swap_linears puts it in place of a model's Q4_K l
 import os
 
 KERNEL_OFF = ("off", "reference")    # VECWORLD_KERNEL values that keep the diffusers path
+FUSE_ON, FUSE_OFF = ("1", "on", "true", "yes"), ("0", "off", "false", "no")   # VECWORLD_FUSE values
 
 
 def engine_kernel() -> str | None:
@@ -22,6 +23,21 @@ def engine_kernel() -> str | None:
     if name not in KERNELS:
         raise ValueError(f"VECWORLD_KERNEL={name!r}; built kernels: {', '.join(KERNELS)} (or off)")
     return name
+
+
+def engine_fuse(kernel: str | None) -> bool:
+    """Whether the FLUX blocks run their glue fused (vecworld.engine.blocks, docs/engine/06-glue-fusion.md), the one
+    rule for the painter and the bench. VECWORLD_FUSE unset or empty: yes under every engine kernel, no under "off"
+    (kernel None: the diffusers reference stays diffusers all the way); "0" / "off": no, under any kernel; "1" / "on":
+    yes, under any kernel, "off" included (the fused blocks on diffusers' own linears, to test them apart)."""
+    v = (os.environ.get("VECWORLD_FUSE") or "").strip().lower()
+    if not v:
+        return kernel is not None
+    if v in FUSE_ON:
+        return True
+    if v in FUSE_OFF:
+        return False
+    raise ValueError(f"VECWORLD_FUSE={v!r}; use 1 / on or 0 / off (unset: on with an engine kernel)")
 
 
 def keep_for(kernel: str | None) -> tuple[str, ...]:

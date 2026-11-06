@@ -104,7 +104,8 @@ def bench(fn, n=5):
 
 def load_transformer():
     """The bare transformer, its Q4_K linears on the kernel VECWORLD_KERNEL resolves to (vecworld.engine.engine_kernel,
-    the painter's own rule: unset is config.FLUX_KERNEL, "off" leaves diffusers)."""
+    the painter's own rule: unset is config.FLUX_KERNEL, "off" leaves diffusers), its blocks fused as the painter's
+    (vecworld.engine.engine_fuse)."""
     import torch
     from diffusers import FluxTransformer2DModel, GGUFQuantizationConfig
     from vecworld.config import FLUX_BASE, FLUX_GGUF
@@ -117,6 +118,10 @@ def load_transformer():
         from vecworld.engine import keep_for
         from vecworld.engine.swap import gguf_linears, swap_linears
         swap_linears(tr, gguf_linears(tr), kernel, keep_a16=keep_for(kernel))
+    from vecworld.engine import engine_fuse
+    if engine_fuse(kernel):                       # the painter's rule (VECWORLD_FUSE): fused glue in the blocks
+        from vecworld.engine.blocks import patch_blocks
+        patch_blocks(tr)
     return tr, str(FLUX_GGUF)
 
 
@@ -437,12 +442,14 @@ def main():
         sys.exit("--what gemm times an engine kernel: use --painter engine")
     if a.painter == "reference":
         os.environ["VECWORLD_KERNEL"] = "off"         # the reference is diffusers all the way (the painter defaults to an engine kernel)
+        os.environ["VECWORLD_FUSE"] = "off"
     pw = power()
     if pw != "ac":
         sys.exit("on battery: speed numbers are invalid; plug in and rerun")
     import torch
     mon = Mon()
-    R = {"what": a.what, "painter": a.painter, "kernel": engine_kernel(), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
+    from vecworld.engine import engine_fuse
+    R = {"what": a.what, "painter": a.painter, "kernel": engine_kernel(), "fused": engine_fuse(engine_kernel()), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
     t0 = time.time()
     WHATS[a.what](R, mon)
     R["wall_s"] = round(time.time() - t0, 1)

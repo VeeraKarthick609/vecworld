@@ -1,0 +1,219 @@
+{
+ "what": "GPU kernel ms per op group, one tile512 pass (torch profiler, kernels attributed to their launching op), w4a8, AC",
+ "before_unfused": {
+  "kernel": "w4a8",
+  "fused": false,
+  "wall_s_median": 1.12,
+  "walls": [
+   1.119,
+   1.12,
+   1.12,
+   1.121,
+   1.122
+  ],
+  "compute_stream_ms": 1042.0,
+  "groups_ms": {
+   "linear": 717.1,
+   "rope": 147.0,
+   "sdpa": 68.4,
+   "glue": 68.0,
+   "gelu": 21.2,
+   "qk_rmsnorm": 18.8,
+   "outside_blocks": 1.5
+  },
+  "glue_ops_ms": {
+   "aten::cat": [
+    25.92,
+    133
+   ],
+   "aten::add": [
+    18.04,
+    342
+   ],
+   "aten::mul": [
+    14.68,
+    228
+   ],
+   "aten::native_layer_norm": [
+    9.21,
+    114
+   ],
+   "aten::silu": [
+    0.18,
+    76
+   ]
+  },
+  "linear_kernels_ms": {
+   "gemm_w4a8": [
+    428.71,
+    228
+   ],
+   "gemm_mma": [
+    251.2,
+    190
+   ],
+   "quantize_kernel": [
+    25.58,
+    228
+   ],
+   "gemv": [
+    11.58,
+    76
+   ]
+  },
+  "gpu_clocks": "1695 MHz, 20.16 W, 67",
+  "memcpy_ms": {
+   "Memcpy DtoD (Device -> Device)": 0.0,
+   "Memcpy HtoD (Pageable -> Device)": 10.4,
+   "Memcpy HtoD (Pinned -> Device)": 499.9,
+   "Memcpy DtoH (Device -> Pageable)": 38.6
+  }
+ },
+ "after_fused": {
+  "kernel": "w4a8",
+  "fused": true,
+  "wall_s_median": 0.926,
+  "walls": [
+   0.924,
+   0.925,
+   0.926,
+   0.927,
+   0.927
+  ],
+  "compute_stream_ms": 845.3,
+  "groups_ms": {
+   "linear": 716.6,
+   "sdpa": 70.1,
+   "glue": 35.1,
+   "gelu": 22.0,
+   "outside_blocks": 1.6
+  },
+  "glue_ops_ms": {
+   "?": [
+    29.52,
+    342
+   ],
+   "aten::copy_": [
+    3.57,
+    38
+   ],
+   "aten::cat": [
+    1.84,
+    20
+   ],
+   "aten::silu": [
+    0.18,
+    76
+   ]
+  },
+  "linear_kernels_ms": {
+   "gemm_w4a8": [
+    436.34,
+    228
+   ],
+   "gemm_mma": [
+    255.46,
+    190
+   ],
+   "quantize_kernel": [
+    13.18,
+    38
+   ],
+   "gemv": [
+    11.63,
+    76
+   ]
+  },
+  "gpu_clocks": "1935 MHz, 37.12 W, 69",
+  "memcpy_ms": {
+   "Memcpy DtoD (Device -> Device)": 0.0,
+   "Memcpy HtoD (Pageable -> Device)": 11.0,
+   "Memcpy HtoD (Pinned -> Device)": 499.4,
+   "Memcpy DtoH (Device -> Pageable)": 38.2
+  }
+ },
+ "intermediate_rnm_only_twopass_with_fused_quantize": {
+  "kernel": "w4a8",
+  "fused": true,
+  "wall_s_median": 1.084,
+  "walls": [
+   1.082,
+   1.083,
+   1.084,
+   1.086,
+   1.087
+  ],
+  "compute_stream_ms": 1007.4,
+  "groups_ms": {
+   "linear": 705.7,
+   "rope": 146.9,
+   "sdpa": 68.6,
+   "glue": 44.4,
+   "gelu": 21.4,
+   "qk_rmsnorm": 18.9,
+   "outside_blocks": 1.5
+  },
+  "glue_ops_ms": {
+   "aten::cat": [
+    25.89,
+    133
+   ],
+   "?": [
+    18.32,
+    190
+   ],
+   "aten::silu": [
+    0.18,
+    76
+   ]
+  },
+  "memcpy_ms": {
+   "Memcpy DtoD (Device -> Device)": 0.0,
+   "Memcpy HtoD (Pageable -> Device)": 10.9,
+   "Memcpy HtoD (Pinned -> Device)": 499.8,
+   "Memcpy DtoH (Device -> Pageable)": 38.7
+  }
+ },
+ "intermediate_rnm_only_twopass_no_fused_quantize": {
+  "kernel": "w4a8",
+  "fused": true,
+  "wall_s_median": 1.097,
+  "walls": [
+   1.094,
+   1.097,
+   1.097,
+   1.098,
+   1.098
+  ],
+  "compute_stream_ms": 1017.6,
+  "groups_ms": {
+   "linear": 718.3,
+   "rope": 146.9,
+   "sdpa": 68.5,
+   "glue": 42.2,
+   "gelu": 21.4,
+   "qk_rmsnorm": 18.9,
+   "outside_blocks": 1.5
+  },
+  "glue_ops_ms": {
+   "aten::cat": [
+    25.88,
+    133
+   ],
+   "?": [
+    16.15,
+    190
+   ],
+   "aten::silu": [
+    0.18,
+    76
+   ]
+  },
+  "memcpy_ms": {
+   "Memcpy DtoD (Device -> Device)": 0.0,
+   "Memcpy HtoD (Pageable -> Device)": 10.8,
+   "Memcpy HtoD (Pinned -> Device)": 499.8,
+   "Memcpy DtoH (Device -> Pageable)": 37.5
+  }
+ }
+}

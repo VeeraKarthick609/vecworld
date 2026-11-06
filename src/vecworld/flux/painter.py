@@ -14,8 +14,9 @@ crossfade. The differences:
   A Prompt's texts blend as a weighted sum of both.
 - The transformer is the 4-bit GGUF through diffusers, streamed block by block with diffusers' group offload.
   Its Q4_K linears run on the engine's hand-written kernel (vecworld.engine; VECWORLD_KERNEL, default FLUX_KERNEL =
-  "mma") instead of diffusers' dequantize-then-matmul; every other layer stays on the diffusers path.
-  VECWORLD_KERNEL=off keeps diffusers for those too.
+  "w4a8") instead of diffusers' dequantize-then-matmul, and its blocks run their norm / modulate / residual and
+  q / k norm + RoPE glue fused (VECWORLD_FUSE, default on with an engine kernel), bit-identical to diffusers'.
+  VECWORLD_KERNEL=off keeps diffusers for all of it.
 """
 import math
 import os
@@ -31,7 +32,7 @@ from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENG
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
-from vecworld.engine import engine_kernel, keep_for, load_engine_ext
+from vecworld.engine import engine_fuse, engine_kernel, keep_for, load_engine_ext
 
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
 
@@ -139,6 +140,8 @@ class FluxPainter(Painter):
     VECWORLD_KERNEL (read at construction, see vecworld.engine.engine_kernel(); unset: config.FLUX_KERNEL, "w4a8" with
     config.FLUX_A16_KEEP on "mma"; "off": diffusers) names the engine kernel the transformer's Q4_K linears run on;
     self.kernel records it (None: diffusers), self.keep_a16 the patterns kept on mma (vecworld.engine.keep_for).
+    VECWORLD_FUSE (vecworld.engine.engine_fuse; unset: on with an engine kernel, off under "off") patches the blocks to
+    run their glue fused (vecworld.engine.blocks, bit-identical to diffusers'); self.fused records it.
     """
 
     style = FLUX_STYLE
@@ -153,7 +156,8 @@ class FluxPainter(Painter):
         from vecworld.flux.text import T5Text
 
         self.kernel = engine_kernel()           # a typo or a broken extension build fails here, before the
-        if self.kernel is not None:             # minute-long model load, with a hint to set VECWORLD_KERNEL=off
+        self.fused = engine_fuse(self.kernel)   # minute-long model load, with a hint to set VECWORLD_KERNEL=off
+        if self.kernel is not None or self.fused:
             load_engine_ext()
         dev, bf16 = torch.device("cuda"), torch.bfloat16
         tr = FluxTransformer2DModel.from_single_file(
@@ -166,6 +170,11 @@ class FluxPainter(Painter):
 
             self.keep_a16 = keep_for(self.kernel)
             self.swapped = swap_linears(tr, gguf_linears(tr), self.kernel, keep_a16=self.keep_a16)
+        if self.fused:
+            # Before group offload: its hooks wrap each block's forward as it is when they are installed.
+            from vecworld.engine.blocks import patch_blocks
+
+            patch_blocks(tr)
         self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
         tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"), offload_type="block_level",
                                 num_blocks_per_group=1, use_stream=True)
@@ -188,6 +197,7 @@ class FluxPainter(Painter):
         self._pinned: list[int] = getattr(self, "_pinned", [])
         self.kernel: str | None = getattr(self, "kernel", None)
         self.keep_a16: tuple[str, ...] = getattr(self, "keep_a16", ())   # the linears kept on mma (keep_for)
+        self.fused: bool = getattr(self, "fused", False)                # blocks run fused glue (engine_fuse)
         self._closed = False
         self._dev, self._dtype = dev, dtype
         self._sf, self._shift = vae.config.scaling_factor, vae.config.shift_factor

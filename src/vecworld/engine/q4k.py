@@ -57,6 +57,23 @@ def quantize_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Ten
     return tuple(load_ext().q4k_quantize_act(x))
 
 
+_QUANTIZED = "_vecworld_w4a8_act"     # the tensor attribute attach_quantized sets
+
+
+def attach_quantized(x: torch.Tensor, q: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """Attach quantize_act(x)'s outputs (xq, s, xsum) to the tensor object x, for a w4a8 Q4KLinear that is handed x
+    itself: it then skips its own quantize. The fused glue (glue.residual_norm_modulate, quantize=True) computes them in
+    the pass that writes x. Linears on any other kernel (mma: the keep-list) ignore them and read x in bf16. Returns
+    x."""
+    setattr(x, _QUANTIZED, q)
+    return x
+
+
+def quantized_of(x: torch.Tensor):
+    """The quantization attach_quantized put on x, or None."""
+    return getattr(x, _QUANTIZED, None)
+
+
 def _aligned_activation(x: torch.Tensor) -> torch.Tensor:
     """x, or an aligned copy of it: the kernels read x with 16-byte vector loads. x is an activation, made fresh each
     call, and fresh CUDA allocations are always aligned; only an exotic view that starts mid-allocation gets copied,
@@ -104,7 +121,11 @@ class Q4KLinear(torch.nn.Module):
         if kernel == "gemv":
             y = load_ext().q4k_gemv(x2, self.qweight, b)
         elif kernel == "w4a8":
-            y = load_ext().q4k_gemm_w4a8(*quantize_act(x2), self.qweight, b)
+            gemm = load_ext().q4k_gemm_w4a8
+            q = quantized_of(x)                    # the fused glue's quantization of this very x, if it made one
+            if q is None or q[0].shape != x2.shape:
+                q = quantize_act(x2)
+            y = gemm(*q, self.qweight, b)
         else:
             y = getattr(load_ext(), f"q4k_gemm_{kernel}")(x2, self.qweight, b)
         return y.reshape(*lead, self.out_features)

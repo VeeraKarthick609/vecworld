@@ -1,0 +1,45 @@
+{
+ "what": "peak allocated and pass time at 1, 2, 4 windows per pass (painter _forward, one pass at sigma 1), w4a8",
+ "unfused": {
+  "kernel": "w4a8",
+  "fused": false,
+  "git": "ee44876-dirty",
+  "batch1": {
+   "peak_alloc_gb": 1.018,
+   "s_per_pass": 1.126,
+   "s_per_window": 1.126
+  },
+  "batch2": {
+   "peak_alloc_gb": 1.119,
+   "s_per_pass": 2.213,
+   "s_per_window": 1.106
+  },
+  "batch4": {
+   "peak_alloc_gb": 1.323,
+   "s_per_pass": 4.404,
+   "s_per_window": 1.101
+  },
+  "power": "ac"
+ },
+ "fused": {
+  "kernel": "w4a8",
+  "fused": true,
+  "git": "ee44876-dirty",
+  "batch1": {
+   "peak_alloc_gb": 1.011,
+   "s_per_pass": 0.93,
+   "s_per_window": 0.93
+  },
+  "batch2": {
+   "peak_alloc_gb": 1.106,
+   "s_per_pass": 1.819,
+   "s_per_window": 0.909
+  },
+  "batch4": {
+   "peak_alloc_gb": 1.296,
+   "s_per_pass": 3.667,
+   "s_per_window": 0.917
+  },
+  "power": "ac"
+ }
+}

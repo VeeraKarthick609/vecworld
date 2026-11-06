@@ -487,3 +487,57 @@ def test_a_broken_extension_build_fails_before_the_model_load(monkeypatch):
     with pytest.raises(RuntimeError, match=r"VECWORLD_KERNEL=off") as e:
         FluxPainter()
     assert "nvcc not found" in str(e.value) and isinstance(e.value.__cause__, OSError)
+
+
+def test_fuse_defaults_on_with_an_engine_kernel(monkeypatch):
+    """VECWORLD_FUSE (vecworld.engine.engine_fuse, one rule for the painter and the bench): unset or empty, the glue
+    is fused under every engine kernel and not under "off" (the diffusers reference stays diffusers all the way);
+    "0" / "off" turns it off under any kernel, "1" / "on" turns it on under any kernel, "off" included (to test the
+    fused blocks on diffusers' linears); anything else is refused."""
+    from vecworld.engine import engine_fuse
+
+    monkeypatch.delenv("VECWORLD_FUSE", raising=False)
+    for kernel in ("naive", "tiled", "mma", "w4a8"):
+        assert engine_fuse(kernel) is True
+    assert engine_fuse(None) is False
+    for value, want in (("", None), ("0", False), ("off", False), ("1", True), ("on", True)):
+        monkeypatch.setenv("VECWORLD_FUSE", value)
+        for kernel in ("w4a8", "mma", None):
+            assert engine_fuse(kernel) is (kernel is not None if want is None else want), (value, kernel)
+    monkeypatch.setenv("VECWORLD_FUSE", "maybe")
+    with pytest.raises(ValueError, match="maybe"):
+        engine_fuse("w4a8")
+
+
+def test_painter_patches_blocks_when_fused(monkeypatch):
+    """FluxPainter patches the transformer's blocks (vecworld.engine.blocks.patch_blocks) after the swap and before
+    group offload (whose hooks wrap each block's forward as it is then) when engine_fuse says so, and records it as
+    painter.fused."""
+    import diffusers
+
+    import vecworld.engine.blocks as blocks_mod
+    import vecworld.engine.ext as ext_mod
+    import vecworld.engine.swap as swap_mod
+    import vecworld.flux.painter as painter_mod
+
+    order = []
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: "transformer")
+    monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
+    monkeypatch.setattr(swap_mod, "swap_linears", lambda *a, **k: order.append("swap") or 1)
+    monkeypatch.setattr(blocks_mod, "patch_blocks", lambda tr: order.append("patch") or 57)
+
+    # the transformer is a string here, so the painter stops at the pinning that follows (AttributeError)
+    for kernel, fuse, want in ((None, None, ["swap", "patch"]), ("mma", "off", ["swap"]), ("off", None, []),
+                               ("off", "on", ["patch"])):
+        monkeypatch.delenv("VECWORLD_KERNEL", raising=False)
+        monkeypatch.delenv("VECWORLD_FUSE", raising=False)
+        if kernel:
+            monkeypatch.setenv("VECWORLD_KERNEL", kernel)
+        if fuse:
+            monkeypatch.setenv("VECWORLD_FUSE", fuse)
+        order.clear()
+        with pytest.raises(AttributeError):
+            FluxPainter()
+        assert order == want, (kernel, fuse)
