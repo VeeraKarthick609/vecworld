@@ -1,10 +1,11 @@
 # 07: CUDA graphs over the blocks, from fixed weight slots (Task 7)
 
 **What this is:** the transformer's 57 blocks no longer stream their weights through diffusers' group offload. They
-stream through three device buffers of fixed address ("slots", `engine/slots.py`), and each block is replayed as a
-CUDA graph, one per block and input shape (`engine/graphs.py`). The CPU still runs between blocks, to sequence the
-weight copies. `VECWORLD_GRAPHS=0` runs the same blocks eagerly on the same slots; `VECWORLD_KERNEL=off` keeps the
-diffusers reference with group offload.
+stream through three device buffers of fixed address ("slots", `engine/slots.py`). Each block can also be replayed
+as a CUDA graph, one per block and input shape (`engine/graphs.py`); the CPU still runs between blocks, to sequence
+the weight copies. **The default is eager on the slots**; `VECWORLD_GRAPHS=1` turns the graphs on (ruling after the
+Task 7 review: they tie with eager on speed and cost first-use captures and memory, see "What graphs cost" below).
+`VECWORLD_KERNEL=off` keeps the diffusers reference with group offload.
 
 **The result is bit-identical** (graph replay = eager on slots = group offload, `torch.equal` on whole transformer
 passes; the gate walk is byte-identical to Task 6's). The step drops **0.92 → 0.85 s** (same session; 19.0 →
@@ -102,9 +103,14 @@ the weights of all of them in slots at once and buys nothing (the GPU is already
   block i + 1's static input: the next block sees the same tensor objects it was captured with and nothing is
   copied. The fused forwards (Task 6) write their last pass straight into the buffer (`gated_residual(..., out=)`);
   any other forward is captured with one copy at its end (measured +5 ms a pass, so `out=` is used).
-- **Inputs.** Block 0's inputs, the timestep embedding and the rotary tables are copied into per-key static buffers,
-  skipped when the very same tensor (same object, unchanged) was copied already, as `temb` and the rotary tables
-  are for blocks 1..56.
+- **Inputs.** Block 0's inputs, the timestep embedding and the rotary tables are copied into per-key static buffers.
+  Block 0 always copies; blocks 1..56 of the same pass skip the copy while the very same tensor comes again (`temb`,
+  the rotary tables). The skip is scoped to one pass because the painter's tensors are inference tensors, which have
+  no version counter: a caller that wrote the same tensor in place between passes would otherwise replay stale
+  values (found in review, `test_graph_input_written_in_place_is_copied_again`).
+- **Outputs are reused buffers.** With graphs, a block returns the key's ping-pong buffers, the same tensor objects
+  every call: overwritten by the next call of the same block and, within a pass, by block i + 2. The transformer
+  consumes each output before that; anything that keeps a block output (a residual cache, a debug hook) must clone it.
 - **One shared memory pool.** Nothing allocated inside a capture outlives it (outputs go to the ping-pong buffers,
   allocated outside), so every graph's intermediates can reuse the same pool memory in any replay order. Four keys
   captured: 2.10 GB reserved with one pool, 2.84 GB with a pool per key. When the last graph is dropped the pool goes
@@ -114,6 +120,11 @@ the weights of all of them in slots at once and buys nothing (the GPU is already
   captured again on its next use). A walk uses batches 1..4 (`FLUX_BATCH`).
 - **Outside inference mode.** The runner runs blocks under `no_grad` instead of `inference_mode`, so activations
   keep version counters (below).
+- **One thread.** The slots' bookkeeping and events and the runner's keys are unsynchronised, so the first thread to
+  run a block owns them and a block run from another thread raises (the game runs all GPU work on one queue thread).
+- **A block that raises** still releases its slot after the kernels it queued (an always-called forward hook), so a
+  later copy can't overwrite weights those kernels still read. Host tensors must be contiguous (else a raise: a
+  contiguous copy would be pageable and replace the page-locked original on close).
 
 ### Making the invisible visible (from the Task 6 review)
 
@@ -131,7 +142,7 @@ the weights of all of them in slots at once and buys nothing (the GPU is already
 
 ## Timelines, before and after (nsys, 3 tile512 passes back to back, per pass)
 
-| | Task 6 (group offload) | slots, eager (`VECWORLD_GRAPHS=0`), ring 2 | slots + graphs, ring 2 | **slots + graphs, ring 3 (default)** |
+| | Task 6 (group offload) | slots, eager, ring 2 | slots + graphs, ring 2 | **slots + graphs, ring 3** |
 |---|---|---|---|---|
 | GPU span per pass | 940 ms | 858 ms | 859 ms | **853 ms** |
 | idle per pass | 102 ms (10.9%) | 10.4 ms (1.2%) | 9.6 ms (1.1%) | **0.76 ms (0.09%)** |
@@ -152,11 +163,11 @@ measure the same within noise.
 
 tile512 (`bench_flux.py --what tile512`, 4 passes, each timed by CUDA events on the compute stream):
 
-| | Task 6 (`ee3baae`) | slots, eager | **slots + graphs (default)** |
+| | Task 6 (`ee3baae`) | **slots, eager (default)** | slots + graphs (`VECWORLD_GRAPHS=1`) |
 |---|---|---|---|
 | pass min / median / max s | 0.918 / 0.922 / 0.924 | 0.844 / 0.850 / 0.852 | 0.848 / 0.854 / 0.857 |
-| **step s** (median, 2 d.p.) | 0.92 | 0.85 | **0.85** |
-| achieved TFLOP/s (bf16-equivalent) | 19.21 | 20.79 | **20.79** |
+| **step s** (median, 2 d.p.) | 0.92 | **0.85** | 0.85 |
+| achieved TFLOP/s (bf16-equivalent) | 19.21 | **20.79** | 20.79 |
 | % of the 19.1 bf16 peak | 100.5 | 108.8 | 108.8 |
 
 One pass at 1, 2 and 4 windows (`--what peak`: a first pass, which captures with graphs, then the median of 3; each
@@ -200,6 +211,25 @@ busy server could cause), a batch-1 pass took 19.6 / 28.9 / 64.9 s (min / median
 Graphs remove most of the Python per block but not all of it. The game's GPU work runs on one worker thread and its
 other threads mostly wait on I/O, so this is a stress case, not today's game, but it says where the next CPU cost is.
 
+## What graphs cost (why they are off by default)
+
+| | eager on slots (default) | slots + graphs | source |
+|---|---|---|---|
+| steady-state tile512 pass | 0.850 s | 0.854 s | same session |
+| steady-state batch-4 pass, 5 alternating pairs | 3.538 s (mean of medians) | 3.565 s (+0.8%, inside the run-order effect) | `alt.py` |
+| first pass of a new shape, batch 1 / 2 / 4 | 0.95 / 1.70 / 3.36 s | **1.98 / 3.70 / 7.60 s** (warm-up + capture + replay) | `bench/t7-graphs-peak.json` |
+| first panorama of a walk (spot 0, captures the walk's shapes) | 36.7 s (t7-r1) | **40.6 s (+3.9 s)** | gate walks |
+| peak allocated, one pass at batch 1 / 2 / 4 | 1.225 / 1.342 / 1.576 GB | 1.249 / 1.431 / 1.792 GB | `bench/t7-graphs-peak.json` |
+| peak allocated, walk step | 1.77 GB | 1.92 GB | `bench/t7-*-step.json` |
+| per-shape buffers kept | none | ~39 MB × batch per shape; 2.10 GB reserved with 4 shapes | `alt.py` |
+| GIL stress pass (2 spinning threads), min / median / max | 19.6 / 28.9 / **64.9** s | 7.5 / 23.0 / **74.5** s (capture pass 118.6 s) | `alt.py --hog 2` |
+| other | | a device sync + `empty_cache` per capture; an LRU eviction recaptures 57 graphs silently | |
+
+All of the measured speed-up is the slots; the graphs add first-use latency (the panorama the player waits for)
+and 0.2–0.6 GB that Task 9 (T5 on the engine) needs. **Revisit after Task 10**: once the CPU sequencing between
+blocks (hooks, ~20 tensor copies per block) is batched, the per-block Python that made both modes collapse under
+GIL contention shrinks, and a free CPU may be worth the captures.
+
 ## Correctness
 
 | Test (`tests/test_graphs.py`, gpu) | Bar | Result |
@@ -215,7 +245,11 @@ other threads mostly wait on I/O, so this is a stress case, not today's game, bu
 | `test_graph_stop_between_steps` | `Stopped` before pass 3 of a 4-step job, then a full job: = the eager job; allocated memory after a full job, the stopped job and the next job | `torch.equal`; 0.893 / 0.893 / 0.893 GB |
 | `test_graph_peak_memory_batch4` | peak allocated with graphs at batch 4, capture pass included, < 3.6 GB | 1.255 GB |
 | `test_slots_match_offload` | whole transformer pass, batch 2: slots eager and slots + graphs vs group offload (Task 6's path) | `torch.equal` |
-| CPU: `test_graphs_default_on_with_an_engine_kernel`, `test_painter_streams_blocks_from_slots_under_an_engine_kernel` | the `VECWORLD_GRAPHS` rule; slots instead of group offload under engine kernels, group offload under `off` | pass |
+| `test_slots_refuse_a_non_contiguous_host_tensor`, `test_slot_is_released_after_its_block_when_the_block_raises`, `test_slots_refuse_another_thread`, `test_runner_refuses_another_thread` | review fixes M4, M2, M7 | pass |
+| `test_graph_input_written_in_place_is_copied_again` | same inference tensors written in place: replay = eager on the new values (review I1) | `torch.equal` |
+| `test_glue.py`: `test_gated_residual_into_out`, `test_double_block_out_buffers_with_an_ip_adapter_output` | `out=` = no `out`; a wrong-shape `out` raises; the IP-adapter add lands in `out` | `torch.equal` |
+| CPU: `test_close_frees_slots_and_unpins_even_if_the_runner_fails` | `FluxPainter.close()` frees slots and unpins host memory when the runner's close raises | pass |
+| CPU: `test_graphs_default_off_opt_in`, `test_painter_streams_blocks_from_slots_under_an_engine_kernel` | the `VECWORLD_GRAPHS` rule; slots instead of group offload under engine kernels, group offload under `off` | pass |
 
 ## The gate
 
@@ -225,14 +259,15 @@ Relative walk gate (ruling 2026-11-06): no spot worse than the base walk by more
 | spot | 0 | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|---|
 | t7-base (ee3baae, w4a8 + fused, group offload) | 0.726 | 1.151 | 0.898 | 1.079 | 0.879 | 0.576 |
-| **t7 (931c3ad, w4a8 + fused, slots + graphs)** | **0.726** | **1.151** | **0.898** | **1.079** | **0.879** | **0.576** |
-| Δ | 0 | 0 | 0 | 0 | 0 | 0 |
+| t7 (931c3ad, w4a8 + fused, slots + graphs) | 0.726 | 1.151 | 0.898 | 1.079 | 0.879 | 0.576 |
+| **t7-r1 (76bc390, w4a8 + fused, eager on slots: the default)** | **0.726** | **1.151** | **0.898** | **1.079** | **0.879** | **0.576** |
+| Δ (both against the base) | 0 | 0 | 0 | 0 | 0 | 0 |
 
-All six spot images are **byte-identical** to the base (`cmp`), so the gate passes and `VECWORLD_GRAPHS` is on by
-default. Both walks record kernel w4a8, the same 8-pattern keep-list and their git sha (the t7 walk also
+All six spot images are **byte-identical** to the base (`cmp`), so the gate passes. Both walks record kernel w4a8, the same 8-pattern keep-list and their git sha (the t7 walk also
 `graphs: true`, on a clean tree). The fixed 1.1 limit is reported, not gated: spot 1 scores 1.151 in both, as at
-Task 6. Mean walk step (spots 1..5) 47.5 s base, 46.9 s t7; the t7 panorama (spot 0) is 4.7 s slower, its first
-passes capturing the graphs. Sheet: `~/walk-archive/t7-vs-base.png` (looked at: the same pictures).
+Task 6. Mean walk step (spots 1..5) 47.5 s base, 46.9 s t7 (graphs), 46.1 s t7-r1 (eager); spot 0, the panorama:
+36.7 s base, 40.6 s with graphs (its first passes capture the walk's shapes), 36.7 s eager. Archived:
+`~/walk-archive/t7-base`, `t7`, `t7-r1`. Sheet: `~/walk-archive/t7-vs-base.png` (looked at: the same pictures).
 
 ## Tried and not chosen
 
@@ -241,7 +276,8 @@ passes capturing the graphs. Sheet: `~/walk-archive/t7-vs-base.png` (looked at: 
 | **Ring of 2 slots** (the brief's default) | tile512 median 0.867 / 0.871 / 0.870 s vs ring 3 0.858 / 0.861 / 0.859 (3 alternating rounds × 8 passes); nsys: a 13.5 ms stall at every pass start, idle 9.6 vs 0.76 ms/pass; batch 4: 3.568 vs 3.553 s | 57 blocks is odd, so block 0 shares block 56's slot and its copy can't overlap. Ring 3 (+191 MB, peak 1.06 → 1.25 GB at batch 1) removes it. Ring 2 stays the class default. |
 | **Copy outputs into the next block's static input** (generic forward, no `out=`) | 0.863 / 0.866 / 0.866 s vs `out=` 0.855 / 0.860 / 0.861 (3 rounds) | +5 ms a pass: 57 extra 8 MB copies. The fused forwards write their last pass straight into the buffer; the copy stays as the fallback for unfused forwards. |
 | **A memory pool per key** | 4 keys captured: 2.84 GB reserved vs 2.10 GB shared (allocated 1.505 GB both) | +0.74 GB for nothing: nothing outlives a capture, so all graphs can share one pool. |
-| **Eager on slots** (`VECWORLD_GRAPHS=0`) as the default | tile512 0.850 vs graphs 0.854 s (one same-session run); batch 4, 5 alternating pairs: eager 3.538 s mean of medians, graphs 3.565 (+0.8%, inside the run-order effect); nsys idle per pass 1.2% vs 1.1% (ring 2), 1.4 vs 0.8 ms (batch 4) | Kept available, not the default: both gates pass and graphs free the CPU (one call per block), which keeps the GPU fed when the CPU is busy (GIL test: median 23.0 vs 28.9 s). Speed alone does not separate them. |
+| **Graphs on by default** (the first version of this task) | tile512 0.854 vs eager 0.850 s; batch 4, 5 alternating pairs: 3.565 vs 3.538 s; first panorama +4.7 s; batch-4 capture pass 7.6 vs 3.4 s; walk-step peak 1.92 vs 1.77 GB; GIL stress median 23.0 vs 28.9 s but max 74.5 vs 64.9 s | A speed tie that costs first-use latency and memory (table above). Opt-in via `VECWORLD_GRAPHS=1`; revisit after Task 10. |
+| **Skipping the static-input copy for the same tensor object across passes** (first version) | saves under 1 ms of 850 per pass (≤ 70 MB of rotary copies); reviewer reproduced a stale replay with an input written in place | Inference tensors carry no version, so identity can't prove "unchanged". Block 0 now always copies; the skip holds only within a pass. |
 | **Graphs alone, keeping group offload** | not buildable: group offload re-allocates weights per onload (new addresses) | The slots are a precondition, and turned out to be the win (10.9% → 0.09% idle). |
 | **A whole-pass graph / a graph per several blocks** | estimate: all weights 6.7 GB > 4 GB card; per-block idle is already 0.09% | Needs weights resident or many slots; no idle left to recover; Task 10 needs the CPU between blocks for SSD reads. |
 | **Capture on the second use** (first use eager, second captures) | first pass of a shape: eager 0.87–0.92 s, capture pass (warm-up + capture + replay) 1.92–1.96 s | Same total cost spread over two passes; capturing in the first pass makes every later pass a replay, which is what the bench and the game run. |
