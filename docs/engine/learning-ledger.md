@@ -9,7 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
-| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06 | 2b, 3, 4, 5, 5b, 5c, 6 |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08 | 2b, 3, 4, 5, 5b, 5c, 6, 7 |
 
 ---
 
@@ -51,6 +51,12 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
   - Profile first: the planned 0.4 s of glue was 68 ms; RoPE in fp32 was the hidden 147 ms.
   - Bit-identical lossless changes, so the gate shows Δ = 0 (two-pass LayerNorm's ~3e-6 bit flips failed under W4A8).
   - "99% of bf16 peak" is bf16-equivalent: 75% of the math runs on INT8.
+- Entry 2, Task 7:
+  - Profile first: launch overhead was 0.34% of a pass, while the real 10.9% idle was group-offload syncs.
+  - Fixed weight slots took the pass from 0.92 to 0.85 s; graphs tied with eager because the GPU was already saturated.
+  - Ring 3, not 2: with 57 (odd) blocks, ring 2 wraps block 0 onto block 56's slot.
+  - Graphs are opt-in: no speed gain, but capture latency and extra memory.
+  - Time async GPU work with CUDA events, not CPU clocks.
 - Entry 2, Patterns so far: roofline first; data in registers; overlap loads with math; gate on the real output; measure before trusting estimates.
 
 **Understand.** The exact Q4_K bytes, `mma` tile shapes, the min-term algebra, CUDA graphs, block caching and glue fusion.
@@ -767,10 +773,11 @@ One 512 px window, one transformer pass (1024 image + 256 text tokens, 17.67 TFL
 | **Task 5b: W4A8 on INT8 tensor cores (default)** | **1.15** | 15.37 (bf16-equivalent) | 80.4% | 48.9 |
 | **Task 5c: modulation on a Q4_K GEMV** | **1.12** | 15.78 (bf16-equivalent) | 82.6% | 47.6 (47.0 when re-run in Task 6's session) |
 | **Task 6: glue fusion (bit-identical)** | **0.93** | 19.00 (bf16-equivalent) | 99.4% (see Task 6 for why this isn't "at the limit") | **39.5** (against 47.0 in the same session) |
+| **Task 7: fixed weight slots, eager by default (graphs opt-in)** | **0.85** (Task 6 re-run in the same session: 0.92) | 20.79 (bf16-equivalent) | 108.8% (bf16-equivalent, see Task 6) | **38.3** (Task 6 same session: 39.0) |
 
 From Task 5b on, "TFLOP/s" counts the same 17.67 TFLOP even though 75% of it runs as INT8, so it is **bf16-equivalent**: how fast a bf16 engine would need to be to match. It can pass the bf16 roof without breaking physics.
 
-Through Task 5c the step was 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step only 1.29× (61.4 → 47.6 s). After Task 6: step 2.95× (0.93 s), walk step 1.55× (39.5 s). Why the walk gains less is the first lesson of Task 5.
+Through Task 5c the step was 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step only 1.29× (61.4 → 47.6 s). After Task 6: step 2.95× (0.93 s), walk step 1.55× (39.5 s). After Task 7: step 3.2× (0.85 s), walk step 1.6× (38.3 s). Why the walk gains less is the first lesson of Task 5.
 
 **How the Entry 1 estimates did.**
 
@@ -1233,6 +1240,105 @@ One cost seen, not chased: with glue fused, the GEMMs ran ~1% slower (~10 ms of 
 
 ---
 
+### Task 7: fixed weight slots and CUDA graphs
+
+`Must` for the plain version, profile first, why graphs tied, ring 3 vs 2, and why graphs are opt-in. `Understand` for graph capture constraints, the `_version` trap, output aliasing and the bench timing change. `Skip` the LRU and memory-pool details.
+
+> **Plain version.** The plan was to remove *kernel launch overhead* with CUDA graphs: record each block's ~20 kernels once, replay them with one call. Profiling first showed launches weren't the problem. Gaps that look like launch overhead were only **0.34%** of a pass. The GPU was really idle **10.9%** of the time, waiting on **group offload's syncs**: diffusers re-allocated each block's weights on every load and synchronised around it. Graphs need fixed weight addresses anyway, so Task 7 built **three fixed-address weight "slots"** that blocks stream through. That alone removed the waits: **0.92 → 0.85 s** per pass. Graphs on top measured the **same** as plain eager (0.854 against 0.850 s), and they cost first-use time and memory. So the default is **eager on the slots**, with graphs opt-in (`VECWORLD_GRAPHS=1`). Every path is bit-identical; the gate walk is byte-identical (Δ = 0).
+
+**Profile first: the third stale premise** (`Must`). Nsight Systems over three back-to-back passes (Task 6 build):
+
+| Per pass (Task 6, group offload) | ms | Share |
+|---|---|---|
+| GPU span of a pass | 940 | |
+| Kernels running | 838 | |
+| **Idle** | **102** | **10.9%** |
+| ...a ~0.87 ms sync after every one of the 57 blocks | ~50 | 5.3% |
+| ...pass end (blocking offload of the non-block layers) + pass start (onload, nothing to overlap) | ~39 + ~28 | 7.1% (overlaps the row above) |
+| ...gaps under 100 µs, **what launch overhead looks like** | **3.2** | **0.34%** |
+
+1,220 kernels a pass, median gap 0.64 µs: the CPU was already far ahead of the GPU. Graphs fix launch overhead, which was a third of a percent. The plan's target was real in Entry 1's eager world (≈12k launches, est.) but stale after Tasks 3–6 cut the kernel count.
+
+**What the slots changed** (`Must`):
+
+```
+ Task 6:  |##block##|..|##block##|..|##block##| ... |####|.....39 ms.....|...28 ms...|####
+                     ^ ~0.87 ms sync per block           pass end           next pass start
+ Task 7:  |##block##|##block##|##block##| ... |####|##block##|...       (no gap over 0.3 ms)
+
+ main stream   [x_emb][blk 0 ][blk 1 ][blk 2 ][blk 3 ] ... [blk 56][out]
+ side stream     [copy 2][copy 3 ][copy 4 ][copy 5 ] ... [copy 0][copy 1]   (next pass's first blocks)
+ events        copy i done ──> blk i may start;   blk i done ──> slot i % 3 may take block i + 3
+```
+
+Each block's weights land in slot i % 3, a buffer at a **fixed address** sized to the largest block (191 MB). The copy for block i + 3 starts as soon as block i frees its slot, on a side stream ordered by CUDA events, so copies overlap compute (13.4 GB/s pinned: 14 ms for a double block). Idle per pass: **102 ms → 0.76 ms (0.09%)**.
+
+**Why graphs then tied with eager** (`Must`). Once the syncs were gone, the CPU queued kernels a whole pass ahead of the GPU, so the queue never emptied and there was no idle time left for graphs to remove. A graph saves CPU time per launch; it only shows up as GPU time when the GPU is waiting for the CPU. Alternating A/B at batch 4 (5 pairs): graphs +0.8%, inside the order effect (whichever runs first in a pair is faster, from heat). nsys confirmed the same kernels, with the compute-bound ones ~1.6% slower in the later run: clocks, not launches.
+
+**Ring 3, not 2: an odd number of blocks** (`Must`). With 2 slots, block i uses slot i % 2. **57 is odd**, so the last block (56) and the next pass's first block (0) both use slot 0. Block 0's 14 ms copy can't start until block 56 finishes, so every pass started with a **13.5 ms stall** (seen in nsys). With 3 slots, 3 divides 57, so block 0's copy runs during blocks 55–56. Measured, alternating 3 × 8 passes: **0.869 → 0.859 s**, idle 9.6 → 0.76 ms per pass, for 191 MB more memory. Lesson: ring buffers wrap, so check the wrap boundary as well as the steady state.
+
+**How a graph works, and its constraints** (`Understand`). A CUDA graph records a sequence of launches (*capture*) and replays them with one call. Every kernel's grid and **every device address it touches are frozen at capture**. Hence:
+1. **Static shapes:** one graph per (block, batch, image tokens, text tokens), with an LRU of 4 keys.
+2. **Static weights:** group offload put each load at a new address, so a graph over it would read freed memory. The slots are a precondition.
+3. **Static inputs and outputs:** new inputs are *copied into* the buffers the graph reads, and outputs appear in buffers it wrote.
+4. **No CPU in the middle:** one graph per block, with the CPU between blocks queueing weight copies (Task 10 puts SSD reads there). A whole-pass graph would need all 6.7 GB resident on a 4 GB card.
+
+**The inference-tensor `_version` trap (review I1)** (`Understand`). To skip re-copying an input that hasn't changed, the first version checked "same tensor object, and same `_version`". `_version` is PyTorch's per-tensor counter that bumps on every in-place write. But the painter runs under `torch.inference_mode`, and **inference tensors have no version counter**: `_version` is unavailable, so the check fell back to "same object". The reviewer reproduced the bug: a caller that writes the same buffer in place between passes (a preallocated timestep or rotary buffer, the natural graph-friendly design) got a replay on the **old values**. It looked plausible, was wrong, and raised no error. Fix: block 0 always copies; the skip holds only within one pass (blocks 1–56 seeing the very same `temb`/rotary objects). The same guard protects Task 6's attached INT8 quantization: `quantized_of` refuses it if `x._version` moved, and never trusts it on an inference tensor. **Identity doesn't prove "unchanged"; only a version counter can, and inference mode removes it.**
+
+**Static output buffers alias** (`Understand`). With graphs, each key owns two "ping-pong" output buffers. Block i writes into buffer (i + 1) % 2, which is exactly block i + 1's static input, so nothing is copied between blocks. The flip side: a block **returns the same tensor objects every call**, overwritten by block i + 2 and by the next call of the same block. The transformer consumes each output in time, but anything that *keeps* a block output (a residual cache for block caching, a debug hook) must `clone()` it. Writing straight into the buffer (`gated_residual(..., out=)`) beat a generic copy at the end by 5 ms a pass.
+
+**Why graphs are opt-in: the cost table** (`Must`). Ruling M5, after review:
+
+| | Eager on slots (default) | Slots + graphs |
+|---|---|---|
+| Steady tile512 pass | 0.850 s | 0.854 s (tie) |
+| Batch-4 pass, 5 alternating pairs | 3.538 s | 3.565 s (+0.8%, noise) |
+| First pass of a new shape, batch 1 / 2 / 4 | 0.95 / 1.70 / 3.36 s | **1.98 / 3.70 / 7.60 s** (warm-up + capture + replay) |
+| First panorama of a walk (spot 0) | 36.7 s | **40.6 s (+3.9 s** on the gate walks; the ruling cited +4.7 s from an earlier run) |
+| Peak allocated, walk step | 1.77 GB | 1.92 GB (+0.2–0.6 GB across batch sizes, which Task 9's T5 needs) |
+| GIL stress (2 spinning Python threads), batch-1 pass min / median / max | 19.6 / 28.9 / 64.9 s | 7.5 / 23.0 / 74.5 s |
+| Other | — | a device sync + `empty_cache` per capture; an LRU eviction silently recaptures 57 graphs |
+
+The speed-first goal gets nothing for those costs. Graphs do help when the CPU is busy (the GIL stress median), but both modes collapse there because the per-block sequencing is still Python. **Revisit after Task 10** batches that CPU work.
+
+**The bench timing change** (`Understand`). The bench used to time a pass with a CPU clock at each `progress()` call. With no syncs, the CPU runs a pass ahead, so that clock measured *enqueueing*: the first graph pass read **0.01 s**. Each pass is now timed with **CUDA events on the compute stream** (recorded in the stream, so they measure GPU execution). A device sync per pass was rejected too: it also waits for the next pass's weight prefetch (~14 ms). **Asynchronous GPUs need GPU-side clocks.**
+
+**Results.** Step **0.85 s** (same-session Task 6: 0.92), **20.79** bf16-equivalent TFLOP/s; walk step **38.3 s** (Task 6: 39.0; at 4 windows a pass the old waits were small next to 3.6 s of compute). Peak allocated rose (walk 1.30 → 1.77 GB eager: three 191 MB slots against group offload's ~two blocks), well under 3.6 GB. Per-pass spread didn't narrow (6–9 ms): on this laptop it is set by heat and clocks, not launch jitter.
+
+**In an interview.** "I set out to add CUDA graphs, but an Nsight profile showed launch-sized gaps were 0.34% of the pass. The real 10.9% idle was the offload library's syncs. Replacing it with three fixed-address weight slots, event-ordered copies on a side stream and a ring of 3 because 57 blocks is odd, cut idle to 0.09% and the pass by 8%. With the GPU saturated, graphs tied with eager but cost capture latency and memory, so I shipped them opt-in. Review also caught a stale-replay bug: inference-mode tensors have no version counter, so object identity can't prove an input is unchanged."
+
+**Tried and not chosen** (`Understand`):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **Graphs on by default** (the first version of this task) | Tie: 0.854 vs 0.850 s (tile512), 3.565 vs 3.538 s (batch 4, +0.8%, noise); first panorama +3.9 s; batch-4 capture pass 7.6 vs 3.4 s; walk peak 1.92 vs 1.77 GB | No speed gain once the GPU is saturated; costs first-use latency and memory | A CPU-bound host (the GIL stress median 23.0 vs 28.9 s), small kernels, or after Task 10 batches the per-block Python |
+| **Graphs alone, keeping group offload** | Not buildable: group offload re-allocates weights at new addresses on every load | A graph over moving addresses reads freed memory | Never with that offloader; the slots were the precondition, and the win |
+| **Ring of 2 slots** (the brief's default) | 0.867–0.871 vs 0.858–0.861 s (3 alternating rounds × 8 passes); a 13.5 ms stall at every pass start; idle 9.6 vs 0.76 ms | 57 blocks is odd: block 0 shares block 56's slot, so its copy can't overlap | An even block count, or memory too tight for a third 191 MB slot (still the class default) |
+| **Copy outputs into the next block's input** (generic forward, no `out=`) | 0.863–0.866 vs 0.855–0.861 s | +5 ms a pass: 57 extra 8 MB copies | Unfused forwards, where it stays as the fallback |
+| **A memory pool per graph key** | 2.84 vs 2.10 GB reserved with 4 keys (same 1.505 GB allocated) | +0.74 GB for nothing: nothing outlives a capture, so all graphs can share one pool | — |
+| **Skip the static-input copy for the same object across passes** (first version) | Saves under 1 ms of 850 per pass; the reviewer reproduced a stale replay | Inference tensors have no `_version`, so identity can't prove "unchanged" | Outside inference mode, where `_version` works (still only a < 1 ms win) |
+| **A whole-pass graph, or one graph per several blocks** | Estimated: 6.7 GB of weights against a 4 GB card; per-block idle already 0.09% | Needs all weights resident or many slots; no idle left; Task 10 needs the CPU between blocks for SSD reads | A model whose weights fit in VRAM |
+| **Capture on the second use** instead of the first | First pass eager 0.87–0.92 s against a capture pass of 1.92–1.96 s: the same total, spread over two passes | Capturing on first use makes every later pass a replay | When the first pass's latency matters most and shapes rarely repeat |
+| **Timing passes with a CPU clock** (the old bench) | First graph pass read 0.01 s, then 0.835–0.866 s | Measured enqueueing: the CPU runs a pass ahead | Never for async GPU work; use CUDA events |
+| **Timing with a device sync per pass** | Reads ~10–14 ms high: it also waits for the next pass's prefetch | Measures more than the pass | When nothing else is in flight |
+| **Shared ping-pong buffers across keys** (considered, not built) | Estimated ~236 MB saved (of ~393 MB static buffers for batches 1–4) | Memory is within budget (1.9 GB peak); a larger key would force recapturing every key | If Task 9/10 runs short of VRAM |
+
+<details><summary>Check yourself (Task 7)</summary>
+
+**Q1.** CUDA graphs removed almost all CPU launch work but didn't make the pass faster. Why not, and when would they?
+
+**A1.** Launch cost only shows up as GPU time when the GPU waits for the CPU. After the slots removed the syncs, the CPU was a whole pass ahead and the GPU never waited (0.09% idle), so there was nothing to recover. Graphs help when the CPU is the bottleneck: tiny kernels, a busy or contended CPU (the GIL stress case), or host syncs in the loop.
+
+**Q2.** Why did a ring of 2 slots stall 13.5 ms at every pass start, and why does 3 fix it?
+
+**A2.** Block i uses slot i % ring. With 57 (odd) blocks and ring 2, block 56 and the next pass's block 0 both use slot 0, so block 0's 14 ms copy must wait for block 56 to finish. With ring 3 (which divides 57), block 0 uses the slot block 54 freed, so its copy overlaps blocks 55–56.
+
+</details>
+
+> **Remember this:** profile before you optimize: the "launch overhead" was 0.34%, and the real 10.9% was syncs. Fix the waits (fixed slots), and only add machinery (graphs) when it measurably pays.
+
+---
+
 ### Patterns so far
 
 `Must`
@@ -1241,7 +1347,7 @@ One cost seen, not chased: with glue fused, the GEMMs ran ~1% slower (~10 ms of 
 > 2. **Keep data in registers.** Decode Q4_K into the fragment the next instruction needs, convert int to float with a bit trick, and reduce with warp shuffles. Never write an intermediate to VRAM.
 > 3. **Overlap loads with math.** `cp.async` double buffering, two blocks per SM, and the next chunk requested before this one's math.
 > 4. **Check lossy changes against the real output, not layer by layer.** A per-layer error study missed the residual-stream layers; a deterministic end-to-end gate found them.
-> 5. **Measure before trusting an estimate.** Task 5 beat its estimate (92% of cuBLAS, not 65–85%), Task 5b fell short (1.5×, not 2–4×), and Task 5c's 0.29 s premise was stale. Task 6's "0.4 s of glue" was 68 ms, and the real cost (RoPE, 147 ms) wasn't in the plan at all. Re-measure the thing you're about to optimize, and keep the ablation builds.
+> 5. **Measure before trusting an estimate.** Task 5 beat its estimate (92% of cuBLAS, not 65–85%), Task 5b fell short (1.5×, not 2–4×), and Task 5c's 0.29 s premise was stale. Task 6's "0.4 s of glue" was 68 ms, and the real cost (RoPE, 147 ms) wasn't in the plan at all. Task 7's launch overhead was 0.34%; the real 10.9% was offload syncs. Re-measure the thing you're about to optimize, and keep the ablation builds.
 > 6. **Make lossless changes bit-identical** (Task 6). Then the gate proves Δ = 0 instead of arguing about noise, which matters most upstream of a lossy stage like W4A8.
 > 7. **Amdahl moves the target.** Each speedup makes the untouched parts a bigger share: glue went from small to 31% of GPU time by Task 5c, and after Task 6 the GEMMs are 85% again.
 
