@@ -116,7 +116,8 @@ FLUX_SLOT_RING = 3
 FLUX_GRAPH_MAX = 4
 # First-block cache (Task 8, docs/engine/08-block-cache.md): a pass skips blocks 1..56 while block 0's residual has
 # changed by less than this (summed relative L1 change over the window batch's steps); 0.0 is off.
-# VECWORLD_CACHE_THRESHOLD overrides it; under VECWORLD_KERNEL=off it is always off.
+# VECWORLD_CACHE_THRESHOLD overrides it; under VECWORLD_KERNEL=off it is always off. Off by the Task 8 sweep: 0.3 and
+# 0.25 (1.3-1.6x per pass) fail the multi-scene relative walk gate, 0.2 and below skip nothing on its walks.
 FLUX_CACHE_THRESHOLD = 0.0
 FLUX_BG_STRENGTH = 0.15    # a walk step releases its background at this sigma (0.25: SSIM 0.58 outside the focus, 0.15: 0.67)
 # Behind the camera (from a quarter turn off the walking direction, feathered over FLUX_BACK_FEATHER) the dolly

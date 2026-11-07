@@ -1,0 +1,47 @@
+{
+ "power": "ac",
+ "git": "6388713",
+ "results": {
+  "what": "tile512",
+  "painter": "engine",
+  "kernel": "w4a8",
+  "fused": true,
+  "graphs": false,
+  "cache_threshold": 0.0,
+  "gpu_power": "90.00 4 8",
+  "load_s": 11.9,
+  "rss_after_setup_gb": 7.52,
+  "t5_encode_cold_s": 5.16,
+  "mon_t5": {
+   "rss_gb": 8.1,
+   "smi_mib": 1938
+  },
+  "tile512": {
+   "s": 3.5,
+   "passes": 4,
+   "s_per_pass_median": 0.86,
+   "s_per_pass_mean": 0.861,
+   "s_per_pass_min": 0.857,
+   "s_per_pass_max": 0.863,
+   "s_per_pass": [
+    0.857,
+    0.862,
+    0.861,
+    0.863
+   ],
+   "peak_alloc_gb": 1.22,
+   "rss_gb": 8.2,
+   "smi_mib": 1360,
+   "cache": {
+    "passes": 4,
+    "skips": 0,
+    "rel": []
+   },
+   "flop_per_step": 17672448245760,
+   "achieved_tflops": 20.55,
+   "pct_bf16_peak": 107.5
+  },
+  "wall_s": 21.5,
+  "gpu_power_end": "90.00 4 8"
+ }
+}
