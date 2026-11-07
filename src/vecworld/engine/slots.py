@@ -149,6 +149,13 @@ class BlockSlots:
         if j is not None and self.loaded[j % self.ring] != j:
             self.load(j)
 
+    def unhold(self) -> None:
+        """End a hold: hold nothing, and forget the prefetches held back and never released (a pass that skipped
+        blocks 1..56, or raised, leaves block 0 in its slot, so its next user's copy is simply issued again by the next
+        pass's after())."""
+        self.hold = set()
+        self._held.clear()
+
     def close(self) -> None:
         """Remove the hooks and put each block's host tensors back as its parameters and buffers (safe twice). The
         slots are freed once nothing views into them."""

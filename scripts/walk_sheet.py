@@ -30,6 +30,12 @@ The multi-scene relative gate (Task 8; for every lossy engine change from then o
 compares every spot of CAND-<scene> with the same spot of BASE-<scene> (without --scenes: BASE and CAND are walk
 directories): the seam delta (CAND - BASE; above --max-delta, 0.03, fails, exit 1) and the PSNR of CAND's image
 against BASE's (inf: identical). timings.json also records the block cache threshold (FLUX_CACHE_THRESHOLD).
+
+The gate refuses (exit 1) a pair that did not walk the same scene and route (theme, seed, headings, recipe, walked,
+from both timings.json): their per-spot deltas would compare unrelated images. Its verdict is PASS, FAIL or VACUOUS
+(exit 2): a candidate that claims a lossy setting (a block cache threshold > 0, or --expect-change for any other
+lossy knob) but exercised nothing (no skipped pass, or every spot byte-identical to its base) proves nothing. A
+lossless candidate that comes out identical is a PASS.
 """
 import argparse
 import json
@@ -55,6 +61,7 @@ SEAM_LIMIT = 1.1        # a spot scoring above this has a seam (see the module d
 SEAM_W, SEAM_GAP, SEAM_ROWS = 32, 8, 16
 LABEL_H = 18
 MAX_DELTA = 0.03        # --relative: a spot may score at most this much above the same spot of its base walk
+ROUTE = ("theme", "seed", "headings", "recipe", "walked")   # --relative: what BASE and CAND must share
 # The gate's scenes (name: (theme, seed)): a dark forest, a bright desert and a sea-and-sky coast.
 SCENES = {"forest": ("haunted forest", 7), "desert": ("red desert", 11), "coast": ("stormy coast", 23)}
 
@@ -219,11 +226,30 @@ def _pairs(base: Path, cand: Path, scenes: list[str] | None) -> list[tuple[str, 
     return [(s, base.with_name(f"{base.name}-{s}"), cand.with_name(f"{cand.name}-{s}")) for s in scenes]
 
 
+def _info(d: Path) -> dict:
+    f = d / "timings.json"
+    if not f.exists():
+        raise SystemExit(f"{d}: no timings.json, so the gate can't check it walked the same scene and route as its pair")
+    return json.loads(f.read_text())
+
+
+def same_route(b: Path, c: Path) -> None:
+    """Exit (1) unless walks b and c share their scene and route (ROUTE, from their timings.json)."""
+    ib, ic = _info(b), _info(c)
+    diff = [k for k in ROUTE if ib.get(k) != ic.get(k)]
+    if diff:
+        raise SystemExit(f"{b.name} and {c.name} walked different scenes or routes ("
+                         + "; ".join(f"{k} {ib.get(k)!r} vs {ic.get(k)!r}" for k in diff)
+                         + "): their spots can't be compared")
+
+
 def relative(base: Path, cand: Path, scenes: list[str] | None, max_delta: float = MAX_DELTA):
     """The relative gate: (rows, failures). One row per scene and spot: seams of base and candidate, their delta and
-    the candidate's PSNR against the base image. A failure is a spot whose seam rose by more than max_delta."""
+    the candidate's PSNR against the base image. A failure is a spot whose seam rose by more than max_delta. Exits if a
+    pair did not walk the same scene and route (same_route)."""
     rows, bad = [], []
     for scene, b, c in _pairs(base, cand, scenes):
+        same_route(b, c)
         n = len(list(b.glob("spot*.png")))
         if n == 0 or len(list(c.glob("spot*.png"))) != n:
             raise SystemExit(f"{b} and {c} must hold the same number of spots")
@@ -237,12 +263,34 @@ def relative(base: Path, cand: Path, scenes: list[str] | None, max_delta: float 
     return rows, bad
 
 
+def _cache_counts(infos: list[dict]) -> tuple[int, int]:
+    """(passes, skipped passes) of the block cache over the walks' painter calls (timings.json "cache")."""
+    calls = [c for i in infos for c in i.get("cache") or [] if c]
+    return sum(c.get("passes", 0) for c in calls), sum(c.get("skips", 0) for c in calls)
+
+
+def verdict(cand: Path, scenes, rows, bad, expect_change: bool = False) -> tuple[str, str]:
+    """(PASS / FAIL / VACUOUS, why). VACUOUS: the candidate claims a lossy setting (its block cache threshold > 0, or
+    expect_change) but exercised nothing: no skipped pass, or every spot byte-identical to its base."""
+    infos = [_info(c) for _, _, c in _pairs(cand, cand, scenes)]
+    if bad:
+        return "FAIL", f"{len(bad)} spot(s) worse than the base by more than the allowed delta"
+    cached = any((i.get("cache_threshold") or 0) > 0 for i in infos)
+    _, skips = _cache_counts(infos)
+    if cached and skips == 0:
+        return "VACUOUS", "the block cache is on (threshold > 0) but skipped no pass"
+    if (cached or expect_change) and all(r["psnr"] == float("inf") for r in rows):
+        return "VACUOUS", "a lossy setting was under test but every spot is byte-identical to its base"
+    return "PASS", ""
+
+
 def _print_relative(base: Path, cand: Path, scenes, rows) -> None:
     for scene, b, c in _pairs(base, cand, scenes):
         ib, ic = (json.loads((d / "timings.json").read_text()) if (d / "timings.json").exists() else {} for d in (b, c))
-        print(f"{scene}: base {b.name} (git {ib.get('git')}, kernel {ib.get('kernel')}, cache "
-              f"{ib.get('cache_threshold')}) vs {c.name} (git {ic.get('git')}, kernel {ic.get('kernel')}, cache "
-              f"{ic.get('cache_threshold')})")
+        passes, skips = _cache_counts([ic])
+        print(f"{scene}: base {b.name} (git {ib.get('git')}, kernel {ib.get('kernel')}, batch {ib.get('batch')}, cache "
+              f"{ib.get('cache_threshold')}) vs {c.name} (git {ic.get('git')}, kernel {ic.get('kernel')}, batch "
+              f"{ic.get('batch')}, cache {ic.get('cache_threshold')}: passes {passes}, skips {skips})")
         if ib.get("kernel") != ic.get("kernel") or ib.get("keep_a16") != ic.get("keep_a16"):
             print("  warning: the walks ran different kernels or keep-lists")
         for r in (r for r in rows if r["scene"] == scene):
@@ -279,6 +327,8 @@ def main(argv=None):
     ap.add_argument("--relative", nargs=2, type=Path, metavar=("BASE", "CAND"),
                     help="gate CAND against BASE spot by spot (seam delta, PSNR); with --scenes, both are prefixes")
     ap.add_argument("--max-delta", type=float, default=MAX_DELTA, help="--relative: the largest seam rise allowed")
+    ap.add_argument("--expect-change", action="store_true",
+                    help="--relative: CAND runs a lossy setting, so byte-identical spots are VACUOUS, not PASS")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args(argv)
     scenes = [x.strip() for x in a.scenes.split(",") if x.strip()] if a.scenes else None
@@ -288,8 +338,14 @@ def main(argv=None):
     if a.relative:
         rows, bad = relative(*a.relative, scenes, a.max_delta)
         _print_relative(*a.relative, scenes, rows)
-        if bad:
+        v, why = verdict(a.relative[1], scenes, rows, bad, a.expect_change)
+        _, skips = _cache_counts([_info(c) for _, _, c in _pairs(*a.relative, scenes)])
+        print(f"verdict {v} (candidate skips {skips})" + (f": {why}" if why else ""))
+        if v == "FAIL":
             sys.exit("seams worse than the base by more than %.3f: %s" % (a.max_delta, "; ".join(bad)))
+        if v == "VACUOUS":
+            print(f"VACUOUS, not a pass: {why}", file=sys.stderr)
+            sys.exit(2)
         return
     if a.check:
         bad = check(a.check, a.max_seam)

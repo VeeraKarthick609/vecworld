@@ -120,12 +120,16 @@ def test_run_scenes_walks_each_scene_into_its_own_dir(tmp_path):
         walk_sheet.main(["--scenes", "nowhere", "--out", str(tmp_path / "x")])
 
 
-def _walk_dir(d, arrays):
+def _walk_dir(d, arrays, **over):
+    """A walk directory as run() writes it; its scene (theme, seed) from the directory's -<scene> suffix."""
     d.mkdir(parents=True)
     for i, a in enumerate(arrays):
         _img(a).save(d / f"spot{i}.png")
-    info = {"seam": [walk_sheet.seam(_img(a))[0] for a in arrays], "kernel": "w4a8", "keep_a16": [],
-            "git": "abc", "cache_threshold": 0.0}
+    scene = d.name.rsplit("-", 1)[-1]
+    theme, seed = walk_sheet.SCENES.get(scene, ("haunted forest", 7))
+    info = {"recipe": "sharp", "scene": scene, "theme": theme, "seed": seed, "headings": [0.0, 0.0, 60.0][:len(arrays)],
+            "walked": 9.0, "seam": [walk_sheet.seam(_img(a))[0] for a in arrays], "kernel": "w4a8", "keep_a16": [],
+            "git": "abc", "cache_threshold": 0.0, "cache": [None] * len(arrays), **over}
     (d / "timings.json").write_text(json.dumps(info))
 
 
@@ -154,5 +158,60 @@ def test_relative_gate_compares_each_spot_with_its_base(tmp_path):
         walk_sheet.main(["--relative", str(tmp_path / "base"), str(tmp_path / "bad"), "--scenes", "forest,desert"])
     walk_sheet.main(["--relative", str(tmp_path / "base"), str(tmp_path / "same"), "--scenes", "forest,desert"])
     # without --scenes the two paths are walk directories themselves
-    rows, bad = walk_sheet.relative(tmp_path / "base-forest", tmp_path / "bad-desert", None)
+    rows, bad = walk_sheet.relative(tmp_path / "base-desert", tmp_path / "bad-desert", None)
     assert len(bad) == 1
+
+
+def test_relative_refuses_walks_of_another_scene_or_route(tmp_path):
+    """Task 8 review M3: BASE and CAND must have walked the same scene and route (theme, seed, headings, recipe,
+    walked, by their timings.json); otherwise the per-spot deltas compare unrelated images, and the gate fails loudly
+    instead of scoring them."""
+    clean = [_texture(64, 256, s) for s in range(3)]
+    _walk_dir(tmp_path / "base-forest", clean)
+    _walk_dir(tmp_path / "base-desert", clean)
+    _walk_dir(tmp_path / "ok-forest", clean)
+    for name, over in (("seed", {"seed": 8}), ("headings", {"headings": [0.0, 0.0, 300.0]}),
+                       ("recipe", {"recipe": "t1"}), ("walked", {"walked": 6.0}), ("theme", {"theme": "red desert"})):
+        _walk_dir(tmp_path / f"{name}x-forest", clean, **over)
+        with pytest.raises(SystemExit, match=name):
+            walk_sheet.relative(tmp_path / f"{name}x", tmp_path / "base", ["forest"])
+    with pytest.raises(SystemExit, match="theme|seed"):                  # a typo'd prefix that happens to exist
+        walk_sheet.relative(tmp_path / "base-forest", tmp_path / "base-desert", None)
+    (tmp_path / "ok-forest" / "timings.json").unlink()
+    with pytest.raises(SystemExit, match="timings.json"):
+        walk_sheet.relative(tmp_path / "base", tmp_path / "ok", ["forest"])
+    with pytest.raises(SystemExit):
+        walk_sheet.main(["--relative", str(tmp_path / "base"), str(tmp_path / "seedx"), "--scenes", "forest"])
+
+
+def test_relative_gate_flags_a_vacuous_pass(tmp_path, capsys):
+    """Task 8 review M4: a candidate that claims a lossy setting (a cache threshold > 0, or --expect-change) but
+    exercised nothing (no skipped pass, or every spot byte-identical to its base) is VACUOUS, not PASS (exit 2). A
+    lossless candidate that comes out identical is a PASS."""
+    clean = [_texture(64, 256, s) for s in range(2)]
+    noisy = [np.clip(a + np.random.default_rng(1).normal(0, 2, a.shape), 0, 255) for a in clean]
+    lossy = {"cache_threshold": 0.2}
+    _walk_dir(tmp_path / "base-forest", clean)
+    _walk_dir(tmp_path / "same-forest", clean)                                     # lossless, identical: PASS
+    _walk_dir(tmp_path / "noskip-forest", noisy, **lossy, cache=[{"passes": 8, "skips": 0}] * 2)
+    _walk_dir(tmp_path / "ident-forest", clean, **lossy, cache=[{"passes": 8, "skips": 3}] * 2)
+    _walk_dir(tmp_path / "real-forest", noisy, **lossy, cache=[{"passes": 8, "skips": 3}] * 2)
+    s = ["forest"]
+
+    def verdict(cand, **k):
+        rows, bad = walk_sheet.relative(tmp_path / "base", tmp_path / cand, s)
+        return walk_sheet.verdict(tmp_path / cand, s, rows, bad, **k)[0]
+
+    assert verdict("same") == "PASS"
+    assert verdict("same", expect_change=True) == "VACUOUS"
+    assert verdict("noskip") == "VACUOUS"
+    assert verdict("ident") == "VACUOUS"
+    assert verdict("real") == "PASS"
+    with pytest.raises(SystemExit) as e:
+        walk_sheet.main(["--relative", str(tmp_path / "base"), str(tmp_path / "noskip"), "--scenes", "forest"])
+    assert e.value.code == 2
+    out = capsys.readouterr().out
+    assert "VACUOUS" in out and "skips 0" in out
+    walk_sheet.main(["--relative", str(tmp_path / "base"), str(tmp_path / "real"), "--scenes", "forest"])
+    out = capsys.readouterr().out
+    assert "PASS" in out and "skips 6" in out

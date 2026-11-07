@@ -35,7 +35,8 @@ class _Entry:
 
 class BlockCache:
     """Per-batch first-block cache. threshold 0 (config.FLUX_CACHE_THRESHOLD's default) is off: probe never skips and
-    never syncs. stats counts "probes", "skips" and the relative changes seen ("rel": their list, for the sweep)."""
+    never syncs. stats counts "probes" and "skips" over the cache's life; rel lists the relative changes the current
+    (or last) job's probes saw, for the sweep (begin_job starts it again, so a long-lived painter keeps one job's)."""
 
     def __init__(self, threshold: float):
         if threshold < 0:
@@ -56,6 +57,7 @@ class BlockCache:
     def begin_job(self, job_id) -> None:
         """A new job: drop every entry; only keys of this job are accepted until the next begin_job."""
         self.clear()
+        self.rel.clear()
         self.job = job_id
 
     def clear(self) -> None:
@@ -114,7 +116,7 @@ def cached_forward(tr, cache: BlockCache, key: tuple, step: int, hidden_states, 
     their CUDA graphs (a block's forward is whatever the runner installed). With the cache computing, it equals the
     diffusers forward bit for bit. slots (engine.slots.BlockSlots): while the cache is active, block 0's slot holds
     its prefetch of the slot's next user (block 3) until the probe has decided: a computed pass releases it, a skipped
-    pass copies nothing and block 0 is still in place for the next pass."""
+    pass copies nothing and block 0 is still in place for the next pass (and nothing stays held after the call)."""
     held = slots is not None and cache.active
     if held:
         slots.hold = {0}
@@ -123,7 +125,9 @@ def cached_forward(tr, cache: BlockCache, key: tuple, step: int, hidden_states, 
                                img_ids, txt_ids, guidance, slots if held else None, return_dict)
     finally:
         if held:
-            slots.hold = set()
+            # a skipped pass (or one that raised before the decision) leaves block 0's prefetch held: drop it, so a
+            # later release(0) can't issue it out of order; block 0 is still in its slot
+            slots.unhold()
 
 
 def _cached_forward(tr, cache, key, step, hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids,

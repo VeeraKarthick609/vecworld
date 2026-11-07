@@ -89,6 +89,21 @@ def test_cache_stop_clears():
         c.probe((1, (0,)), _r(0), 1)
 
 
+def test_cache_rel_is_per_job_and_bounded():
+    """Task 8 review M1: the probe's relative changes (rel) are the current job's only, so a long-lived painter with the
+    cache on doesn't grow the list forever; begin_job starts it again."""
+    c = BlockCache(10.0)
+    for job in range(50):
+        c.begin_job(job)
+        k = (job, (0,))
+        for step in range(4):
+            c.probe(k, _r(step), step)
+            c.store(k, _r(9))
+        assert len(c.rel) == 3                             # steps 1..3 of this job, none of the jobs before
+    c.clear()                                              # a job's end keeps its rel for the bench to read
+    assert len(c.rel) == 3
+
+
 def test_cache_accumulates_change():
     """Two small changes, each under the threshold, that sum above it force a recompute; then the sum starts again."""
     c = BlockCache(0.1)
@@ -189,6 +204,55 @@ def test_cached_forward_computing_equals_the_plain_loop():
     want = tr(**kw)[0]
     assert torch.equal(cached_forward(tr, c, (1, (0, 1)), 0, **kw)[0], want)
     assert torch.equal(cached_forward(tr, BlockCache(0.0), (1, (0, 1)), 0, **kw)[0], want)
+
+
+class _HoldSlots:
+    """BlockSlots' hold bookkeeping without a GPU: block 0's forward hook holds its slot's next user (block 3) while 0
+    is in hold, as BlockSlots.after does; release issues it."""
+
+    def __init__(self, tr):
+        self.hold, self._held, self.loads = set(), {}, []
+        tr.transformer_blocks[0].register_forward_hook(lambda m, a, o: self._after())
+
+    def _after(self):
+        if 0 in self.hold:
+            self._held[0] = 3
+        else:
+            self.loads.append(3)
+
+    def release(self, i):
+        j = self._held.pop(i, None)
+        if j is not None:
+            self.loads.append(j)
+
+    def unhold(self):
+        from vecworld.engine.slots import BlockSlots
+
+        BlockSlots.unhold(self)
+
+
+def test_cached_forward_leaves_nothing_held_after_a_skip_or_an_error():
+    """Task 8 review M2: after a skipped pass (block 0 only, its prefetch held back) and after a pass that raised, the
+    slots hold nothing: a later release(0) issues no stray copy into block 0's slot."""
+    tr = FakeFlux()
+    slots = _HoldSlots(tr)
+    c = BlockCache(100.0)
+    c.begin_job(1)
+    g = torch.Generator().manual_seed(2)
+    kw = dict(hidden_states=torch.randn(1, 16, 64, generator=g), encoder_hidden_states=torch.randn(1, 4, 8, generator=g),
+              pooled_projections=torch.randn(1, 8, generator=g), timestep=torch.full((1,), 0.75),
+              img_ids=torch.randn(16, 3, generator=g), txt_ids=torch.zeros(4, 3))
+    cached_forward(tr, c, (1, (0,)), 0, slots=slots, **kw)          # computed: block 0's prefetch released
+    assert slots.loads == [3] and slots._held == {} and slots.hold == set()
+    cached_forward(tr, c, (1, (0,)), 1, slots=slots, **kw)          # skipped: nothing copied, nothing left held
+    assert c.stats["skips"] == 1
+    assert slots.loads == [3] and slots._held == {} and slots.hold == set()
+    slots.release(0)
+    assert slots.loads == [3]
+    c.probe = lambda *a: (_ for _ in ()).throw(RuntimeError("probe failed"))
+    with pytest.raises(RuntimeError):
+        cached_forward(tr, c, (1, (0,)), 2, slots=slots, **kw)      # raised after block 0 held its prefetch
+    assert slots._held == {} and slots.hold == set()
 
 
 def test_painter_cache_threshold_zero_is_the_plain_transformer():
@@ -302,6 +366,13 @@ def test_slots_hold_defers_block0_prefetch_until_released():
     assert s.copies - c1 == len(blocks)                    # every block once: 3..6 now, 0..2 for the next pass
     blocks[0](x)
     assert torch.equal(full(), want)
+    blocks[0](x)                                           # a skipped pass leaves block 0's prefetch held ...
+    assert s._held == {0: 3}
+    s.unhold()                                             # ... until unhold drops it (and the hold set)
+    assert s._held == {} and s.hold == set()
+    c2 = s.copies
+    s.release(0)                                           # nothing held: no stray copy into block 0's slot
+    assert s.copies == c2 and s.loaded[0] == 0
     torch.cuda.synchronize()
     s.close()
 
