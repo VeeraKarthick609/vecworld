@@ -16,9 +16,12 @@ crossfade. The differences:
   (vecworld.engine; VECWORLD_KERNEL, default FLUX_KERNEL = "w4a8") instead of diffusers' dequantize-then-matmul, its
   blocks run their norm / modulate / residual and q / k norm + RoPE glue fused (VECWORLD_FUSE, default on with an
   engine kernel), bit-identical to diffusers', and they stream block by block through fixed-address weight slots,
-  optionally replayed as CUDA graphs (VECWORLD_GRAPHS=1; default off: eager on the same slots, as fast).
+  optionally replayed as CUDA graphs (VECWORLD_GRAPHS=1; default off: eager on the same slots, as fast). A
+  first-block cache (vecworld.engine.cache, FLUX_CACHE_THRESHOLD / VECWORLD_CACHE_THRESHOLD; 0 = off) may skip
+  blocks 1..56 of a pass when block 0's output barely changed since the window batch's previous step.
   VECWORLD_KERNEL=off keeps diffusers for all of it, streamed with diffusers' group offload.
 """
+import itertools
 import math
 import os
 from collections import OrderedDict
@@ -33,7 +36,9 @@ from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENG
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
-from vecworld.engine import engine_fuse, engine_graphs, engine_kernel, keep_for, load_engine_ext
+from vecworld.engine import (engine_cache_threshold, engine_fuse, engine_graphs, engine_kernel, keep_for,
+                             load_engine_ext)
+from vecworld.engine.cache import BlockCache, cached_forward
 
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
 
@@ -146,6 +151,10 @@ class FluxPainter(Painter):
     Under an engine kernel the blocks stream through FLUX_SLOT_RING fixed-address weight slots (vecworld.engine.slots)
     instead of diffusers' group offload, and VECWORLD_GRAPHS=1 (vecworld.engine.engine_graphs; unset: off) replays
     each as a CUDA graph per input shape (vecworld.engine.graphs, bit-identical to eager); self.graphs records it.
+    VECWORLD_CACHE_THRESHOLD (vecworld.engine.engine_cache_threshold; unset: config.FLUX_CACHE_THRESHOLD; 0 off,
+    always off under "off") is the first-block cache's threshold (vecworld.engine.cache; self.cache_threshold,
+    self.cache): each job (a panorama or a step) keys its window batches by (job, window ids), and after a job
+    self.last_cache holds its passes and skipped passes.
     """
 
     style = FLUX_STYLE
@@ -181,6 +190,7 @@ class FluxPainter(Painter):
             patch_blocks(tr)
         self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
         self.graphs = engine_graphs(self.kernel)
+        self.cache_threshold = engine_cache_threshold(self.kernel)
         if self.kernel is not None:
             # The engine streams the blocks through fixed-address slots and replays them as CUDA graphs (Task 7,
             # docs/engine/07-cuda-graphs.md); after the patch, which the runner wraps.
@@ -214,6 +224,10 @@ class FluxPainter(Painter):
         self.graphs: bool = getattr(self, "graphs", False)              # blocks replay as graphs (engine_graphs)
         self._slots = getattr(self, "_slots", None)                     # engine.slots.BlockSlots (engine kernels)
         self._runner = getattr(self, "_runner", None)                   # engine.graphs.GraphRunner
+        self.cache_threshold: float = getattr(self, "cache_threshold", 0.0)
+        self.cache: BlockCache | None = BlockCache(self.cache_threshold)  # first-block cache (engine.cache)
+        self.last_cache: dict | None = None                             # the last job's passes and skips
+        self._jobs = itertools.count(1)
         self._closed = False
         self._dev, self._dtype = dev, dtype
         self._sf, self._shift = vae.config.scaling_factor, vae.config.shift_factor
@@ -372,16 +386,20 @@ class FluxPainter(Painter):
 
     # --- MultiDiffusion --------------------------------------------------------------------------------
 
-    def _forward(self, tiles, embs, s: float):
+    def _forward(self, tiles, embs, s: float, key: tuple | None = None, step: int = 0):
         """The transformer's velocity for a batch of token-grid windows [n, 64, FLUX_WIN, FLUX_WIN] at sigma s;
-        embs: one (t5, pooled) per window."""
+        embs: one (t5, pooled) per window. key = (job, window ids), step: the job's step, for the block cache (when
+        it is active, the pass runs engine.cache.cached_forward, which may skip blocks 1..56)."""
         torch, n = self._torch, tiles.shape[0]
-        out = self.transformer(
-            hidden_states=tiles.flatten(2).transpose(1, 2).to(self._dtype),
-            encoder_hidden_states=torch.cat([e[0] for e in embs]),
-            pooled_projections=torch.cat([e[1] for e in embs]),
-            timestep=torch.full((n,), s, device=self._dev, dtype=self._dtype),
-            img_ids=self._img_ids, txt_ids=self._txt_ids, guidance=None, return_dict=False)[0]
+        kw = dict(hidden_states=tiles.flatten(2).transpose(1, 2).to(self._dtype),
+                  encoder_hidden_states=torch.cat([e[0] for e in embs]),
+                  pooled_projections=torch.cat([e[1] for e in embs]),
+                  timestep=torch.full((n,), s, device=self._dev, dtype=self._dtype),
+                  img_ids=self._img_ids, txt_ids=self._txt_ids, guidance=None)
+        if self.cache is not None and self.cache.active and key is not None:
+            out = cached_forward(self.transformer, self.cache, key, step, slots=self._slots, **kw)[0]
+        else:
+            out = self.transformer(**kw, return_dict=False)[0]
         return out.float().transpose(1, 2).reshape(n, -1, FLUX_WIN, FLUX_WIN)
 
     def _denoise(self, grid, sigmas, embs, keep=None):
@@ -396,6 +414,9 @@ class FluxPainter(Painter):
         is reset to orig noised to sigmas[k] (differential diffusion), so a column held up to its release step
         denoises only from there, like img2img; rw[-1] pastes orig back after the last step (strength 0). Windows
         whose columns are all fully reset at the next step are skipped (_active).
+
+        The denoising is one job for the block cache: its batches are keyed (job id, window ids), its entries are
+        dropped when it ends or stops, and self.last_cache gets its passes and skipped passes.
         """
         torch = self._torch
         h, w = grid.shape[-2:]
@@ -405,27 +426,37 @@ class FluxPainter(Painter):
         acts = [_active(wins, None if full is None or k + 1 >= n_steps else full[k + 1]) for k in range(n_steps)]
         total, done = sum(math.ceil(len(a) / FLUX_BATCH) for a in acts), 0
         wt = torch.from_numpy(ramp(FLUX_WIN, FLUX_WIN // 2)).to(grid.device)
-        for k, act in enumerate(acts):
-            s = sigmas[k]
-            if keep is not None:
-                orig, noise, rw = keep
-                grid = (1 - rw[k]) * grid + rw[k] * ((1 - s) * orig + s * noise)
-            vel, cnt = torch.zeros_like(grid), torch.zeros_like(grid[:, :1])
-            for b in range(0, len(act), FLUX_BATCH):
-                check_stop()
-                idx = act[b:b + FLUX_BATCH]
-                cols = [wrap_cols(wins[i][1], FLUX_WIN, w) for i in idx]
-                tiles = torch.cat([grid[..., y:y + FLUX_WIN, :][..., c] for (y, _), c in
-                                   zip((wins[i] for i in idx), cols)])
-                out = self._forward(tiles, [embs[i] for i in idx], s)
-                for i, ((y, _), c) in enumerate(zip((wins[j] for j in idx), cols)):
-                    vel[..., y:y + FLUX_WIN, c] += out[i:i + 1] * wt
-                    cnt[..., y:y + FLUX_WIN, c] += wt
-                done += 1
-                if self.progress is not None:
-                    self.progress(done, total)
-            # columns no window covered this step (skipped background) move by 0: they are reset next step
-            grid = grid + (sigmas[k + 1] - s) * vel / cnt.clamp(min=1e-6)
+        job, cache = next(self._jobs), self.cache
+        skips0 = cache.stats["skips"] if cache is not None else 0
+        if cache is not None:
+            cache.begin_job(job)
+        try:
+            for k, act in enumerate(acts):
+                s = sigmas[k]
+                if keep is not None:
+                    orig, noise, rw = keep
+                    grid = (1 - rw[k]) * grid + rw[k] * ((1 - s) * orig + s * noise)
+                vel, cnt = torch.zeros_like(grid), torch.zeros_like(grid[:, :1])
+                for b in range(0, len(act), FLUX_BATCH):
+                    check_stop()
+                    idx = act[b:b + FLUX_BATCH]
+                    cols = [wrap_cols(wins[i][1], FLUX_WIN, w) for i in idx]
+                    tiles = torch.cat([grid[..., y:y + FLUX_WIN, :][..., c] for (y, _), c in
+                                       zip((wins[i] for i in idx), cols)])
+                    out = self._forward(tiles, [embs[i] for i in idx], s, key=(job, tuple(idx)), step=k)
+                    for i, ((y, _), c) in enumerate(zip((wins[j] for j in idx), cols)):
+                        vel[..., y:y + FLUX_WIN, c] += out[i:i + 1] * wt
+                        cnt[..., y:y + FLUX_WIN, c] += wt
+                    done += 1
+                    if self.progress is not None:
+                        self.progress(done, total)
+                # columns no window covered this step (skipped background) move by 0: they are reset next step
+                grid = grid + (sigmas[k + 1] - s) * vel / cnt.clamp(min=1e-6)
+        finally:
+            # a finished or stopped job's entries are never used again (and their residuals hold GPU memory)
+            self.last_cache = {"passes": done, "skips": cache.stats["skips"] - skips0 if cache is not None else 0}
+            if cache is not None:
+                cache.clear()
         if keep is not None and keep[2][-1].any():      # strength 0: a background never released is kept as is
             grid = (1 - keep[2][-1]) * grid + keep[2][-1] * keep[0]
         return grid

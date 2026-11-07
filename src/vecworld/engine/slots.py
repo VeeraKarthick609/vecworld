@@ -11,7 +11,9 @@ stream; CUDA events order the copy after the slot's previous user (block i - rin
     side stream        [copy i+1  ]  [copy i+2  ]  [copy i+3  ]       (slot (i+1) % 2 is free once block i-1 ends)
 
 So block i + 1's copy overlaps block i's compute. A block that runs out of order (or first) has its copy issued on
-demand. Task 10 grows this into BlockStreamer (reads from the SSD instead of host memory).
+demand. A block in `hold` keeps its slot's next copy back until release(i): the first-block cache (engine.cache)
+holds block 0's, so a pass that skips blocks 1..56 copies nothing and block 0 stays in place for the next pass.
+Task 10 grows this into BlockStreamer (reads from the SSD instead of host memory).
 """
 import threading
 from collections.abc import Callable
@@ -86,6 +88,10 @@ class BlockSlots:
         self._freed = [torch.cuda.Event() for _ in range(ring)]    # slot s's last user ended (recorded on main)
         self._used = [False] * ring
         self.copies = 0
+        # Blocks whose after() holds back the prefetch of their slot's next user until release(i) (engine.cache: block
+        # 0's, until the cache decides whether blocks 1..56 run at all), and the prefetches held back.
+        self.hold: set[int] = set()
+        self._held: dict[int, int] = {}
         self._owner: int | None = None                      # the thread that ran the first block (see before())
         # always_call: the slot is released after a block whose forward raised too, ordered after whatever kernels
         # it queued, so a later copy into the slot can't overwrite weights they still read
@@ -130,7 +136,17 @@ class BlockSlots:
         self._freed[s].record(torch.cuda.current_stream(self.device))   # (a wait already queued keeps its state)
         self._used[s] = True
         j = self.next_user(i)
-        if j != i:
+        if j == i:
+            return
+        if i in self.hold:
+            self._held[i] = j
+        else:
+            self.load(j)
+
+    def release(self, i: int) -> None:
+        """Issue the prefetch block i's after() held back (see hold), unless its block is already in the slot."""
+        j = self._held.pop(i, None)
+        if j is not None and self.loaded[j % self.ring] != j:
             self.load(j)
 
     def close(self) -> None:

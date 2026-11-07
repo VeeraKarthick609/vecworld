@@ -18,6 +18,18 @@ def test_tile512_runs_one_window_per_step():
     out = bench.run_tile512(p, p._embed([("a forest", 1.0)]), FLUX_STEPS)
     assert out.shape == (1, 64, FLUX_WIN, FLUX_WIN) and torch.isfinite(out).all()
     assert [c.shape[0] for c in tr.calls] == [1] * FLUX_STEPS           # one 512x512 window, once per step
+    assert p.last_cache == {"passes": FLUX_STEPS, "skips": 0}
+
+
+def test_tile512_is_one_cache_job():
+    """With the block cache on, tile512 runs as one cache job (keyed per step) and records its skips; every step but
+    the first may skip, and the job's entries are dropped after it."""
+    from test_cache import FakeFlux, _painter
+
+    p = _painter(100.0, FakeFlux())
+    p._embed = lambda prompt: (torch.zeros(1, 4, 8), torch.zeros(1, 8))
+    bench.run_tile512(p, p._embed(None), FLUX_STEPS)
+    assert p.last_cache == {"passes": FLUX_STEPS, "skips": FLUX_STEPS - 1} and len(p.cache) == 0
 
 
 def test_flop_per_step_matches_ledger():

@@ -52,6 +52,23 @@ def engine_graphs(kernel: str | None) -> bool:
     return kernel is not None and v in FUSE_ON
 
 
+def engine_cache_threshold(kernel: str | None) -> float:
+    """The first-block cache's threshold (vecworld.engine.cache, docs/engine/08-block-cache.md), the one rule for the
+    painter, the walk and the bench: VECWORLD_CACHE_THRESHOLD (a number >= 0) or, unset or empty,
+    config.FLUX_CACHE_THRESHOLD; 0 is off. Under "off" (kernel None: diffusers' group offload, whose prefetch order
+    assumes every block runs) always 0."""
+    from vecworld.config import FLUX_CACHE_THRESHOLD
+
+    v = (os.environ.get("VECWORLD_CACHE_THRESHOLD") or "").strip()
+    try:
+        t = float(v) if v else float(FLUX_CACHE_THRESHOLD)
+    except ValueError:
+        raise ValueError(f"VECWORLD_CACHE_THRESHOLD={v!r}; use a number >= 0 (0: off)") from None
+    if t < 0:
+        raise ValueError(f"VECWORLD_CACHE_THRESHOLD={v!r}; use a number >= 0 (0: off)")
+    return t if kernel is not None else 0.0
+
+
 def keep_for(kernel: str | None) -> tuple[str, ...]:
     """The linears (fnmatch patterns of module names, for swap_linears' keep_a16) that stay on "mma" under `kernel`:
     config.FLUX_A16_KEEP under "w4a8" (W4A8's per-layer policy, docs/engine/04-w4a8.md), nothing under any other

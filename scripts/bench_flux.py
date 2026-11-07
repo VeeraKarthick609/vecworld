@@ -7,7 +7,11 @@ also carry the step's FLOP count, achieved TFLOP/s and % of the measured bf16 pe
   VECWORLD_KERNEL=naive uv run python scripts/bench_flux.py --painter engine --what tile512 --out bench/t3-naive.json
 
 tile512, pano, step and peak run the real painter (its T5 and CLIP included; T5 is encoded once, before timing, and
-its cold encode is recorded). blocks and bw measure the bare transformer and the machine; blocks also times the
+its cold encode is recorded). With the first-block cache on (VECWORLD_CACHE_THRESHOLD or config.FLUX_CACHE_THRESHOLD
+> 0), tile512, pano and step each run as one cache job and record its passes and skipped passes ("cache"), and
+s_per_pass_mean (a job's passes averaged, skipped ones included) is the step metric: the median would hide the
+skips. Achieved TFLOP/s is then the nominal pass FLOPs over that mean, so it can exceed the hardware's rate.
+blocks and bw measure the bare transformer and the machine; blocks also times the
 modulation linears per pass (do_modulation). gemm times
 VECWORLD_KERNEL's GEMM alone on the FLUX linear shapes against torch.matmul on the same weight pre-dequantized to
 bf16 (the reference's cuBLAS GEMM, without its dequant). Speed numbers are only valid on AC power; on battery
@@ -157,6 +161,7 @@ def timed(fn, passes, mon):
     t = time.time(); t0 = _event(); out = fn(); torch.cuda.synchronize(); dt = time.time() - t
     gaps = [a.elapsed_time(b) / 1000 for a, b in zip([t0] + passes[:-1], passes)]
     return out, dict(s=round(dt, 1), passes=len(passes), s_per_pass_median=round(sorted(gaps)[len(gaps) // 2], 2),
+                     s_per_pass_mean=round(sum(gaps) / len(gaps), 3),
                      s_per_pass_min=round(min(gaps), 3), s_per_pass_max=round(max(gaps), 3),
                      s_per_pass=[round(g, 3) for g in gaps],
                      peak_alloc_gb=round(torch.cuda.max_memory_allocated() / 1e9, 2), **mon.report())
@@ -170,11 +175,23 @@ def run_tile512(p, e, steps, seed=0):
     g = torch.randn(1, 64, FLUX_WIN, FLUX_WIN, device=p._dev,
                     generator=torch.Generator(p._dev).manual_seed(seed))
     sig = p._sigmas(steps)
-    for k in range(steps):
-        g = g + (sig[k + 1] - sig[k]) * p._forward(g, [e], sig[k])
-        if p.progress is not None:
-            p.progress(k + 1, steps)
+    job, cache = next(p._jobs), p.cache                 # one block cache job, as the painter's _denoise runs one
+    s0 = cache.stats["skips"]
+    cache.begin_job(job)
+    try:
+        for k in range(steps):
+            g = g + (sig[k + 1] - sig[k]) * p._forward(g, [e], sig[k], key=(job, (0,)), step=k)
+            if p.progress is not None:
+                p.progress(k + 1, steps)
+    finally:
+        p.last_cache = {"passes": steps, "skips": cache.stats["skips"] - s0}
+        cache.clear()
     return g
+
+
+def _cache_record(p):
+    """The last job's block cache passes and skips, and the probe's relative changes it saw (engine.cache)."""
+    return {**(p.last_cache or {}), "rel": [round(x, 3) for x in p.cache.rel]}
 
 
 def do_tile512(R, mon):
@@ -185,7 +202,9 @@ def do_tile512(R, mon):
     with torch.inference_mode():
         e = p._embed(prompt)
         run_tile512(p, e, 1)                                                 # warm-up
+        p.cache.rel.clear()
         _, R["tile512"] = timed(lambda: run_tile512(p, e, FLUX_STEPS), passes, mon)
+        R["tile512"]["cache"] = _cache_record(p)
 
 
 def do_peak(R, mon):
@@ -211,7 +230,9 @@ def do_peak(R, mon):
 
 def do_pano(R, mon):
     p, prompt, passes = load_painter(R, mon)
+    p.cache.rel.clear()
     img, R["pano"] = timed(lambda: p.panorama(prompt, seed=21), passes, mon)
+    R["pano"]["cache"] = _cache_record(p)
     (ROOT / "bench").mkdir(exist_ok=True); img.save(ROOT / "bench/last_pano.png")
 
 
@@ -223,13 +244,15 @@ def do_step(R, mon):
     prev = dolly(p.panorama(prompt, seed=21), 1.6)
     wins, fwd = [0], p._forward
 
-    def counted(tiles, embs, s):                  # a pass carries up to FLUX_BATCH windows
+    def counted(tiles, embs, s, **kw):            # a pass carries up to FLUX_BATCH windows
         wins[0] += tiles.shape[0]
-        return fwd(tiles, embs, s)
+        return fwd(tiles, embs, s, **kw)
 
     p._forward = counted
+    p.cache.rel.clear()
     img, R["step"] = timed(lambda: p.step(prev, prompt, None, 0.5, seed=22, focus_half=focus_half(1.6)), passes, mon)
     R["step"]["window_passes"] = wins[0]
+    R["step"]["cache"] = _cache_record(p)
     R["step"]["s_per_window_pass"] = round(R["step"]["s"] / max(wins[0], 1), 2)   # wall time incl. VAE and text
     (ROOT / "bench").mkdir(exist_ok=True); img.save(ROOT / "bench/last_step.png")
 
@@ -452,6 +475,8 @@ def add_engine_fields(R):
     from vecworld.config import FLUX_TEXT_LEN, FLUX_WIN
     if "tile512" in R:
         R["tile512"] = engine_fields(R["tile512"], FLUX_WIN * FLUX_WIN, FLUX_TEXT_LEN)
+        if R.get("cache_threshold"):                 # skipped passes are short: the mean is the job's step
+            R["tile512"] = engine_fields(R["tile512"], FLUX_WIN * FLUX_WIN, FLUX_TEXT_LEN, key="s_per_pass_mean")
     if "step" in R:
         R["step"] = engine_fields(R["step"], FLUX_WIN * FLUX_WIN, FLUX_TEXT_LEN, key="s_per_window_pass")
     for k, (w, h) in (("512x512", (512, 512)), ("1024x512", (1024, 512))):
@@ -482,9 +507,9 @@ def main():
     import torch
     mon = Mon()
     from vecworld.engine import engine_fuse
-    from vecworld.engine import engine_graphs
+    from vecworld.engine import engine_cache_threshold, engine_graphs
     R = {"what": a.what, "painter": a.painter, "kernel": engine_kernel(), "fused": engine_fuse(engine_kernel()),
-         "graphs": engine_graphs(engine_kernel()), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
+         "graphs": engine_graphs(engine_kernel()), "cache_threshold": engine_cache_threshold(engine_kernel()), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
     t0 = time.time()
     WHATS[a.what](R, mon)
     R["wall_s"] = round(time.time() - t0, 1)

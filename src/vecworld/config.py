@@ -114,6 +114,10 @@ FLUX_BATCH = 4             # windows per transformer pass (peak 1.4 GB allocated
 # it: a walk uses up to FLUX_BATCH (1..4 windows a pass).
 FLUX_SLOT_RING = 3
 FLUX_GRAPH_MAX = 4
+# First-block cache (Task 8, docs/engine/08-block-cache.md): a pass skips blocks 1..56 while block 0's residual has
+# changed by less than this (summed relative L1 change over the window batch's steps); 0.0 is off.
+# VECWORLD_CACHE_THRESHOLD overrides it; under VECWORLD_KERNEL=off it is always off.
+FLUX_CACHE_THRESHOLD = 0.0
 FLUX_BG_STRENGTH = 0.15    # a walk step releases its background at this sigma (0.25: SSIM 0.58 outside the focus, 0.15: 0.67)
 # Behind the camera (from a quarter turn off the walking direction, feathered over FLUX_BACK_FEATHER) the dolly
 # shrank the view and mirrored rows in at the top and bottom edges; there the background is released at
