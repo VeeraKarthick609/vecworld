@@ -85,3 +85,74 @@ def test_a_walk_records_each_spots_seam_and_native_compare_sheets(tmp_path):
         native = Image.open(tmp_path / f"c_spot{i}.png")
         assert native.width == spot.width                            # native size, not scaled
         assert native.height == 2 * (spot.height + walk_sheet.LABEL_H)
+
+
+# --- the multi-scene relative gate (Task 8) -------------------------------------------------------------------------
+
+def test_a_walk_records_the_cache_threshold(tmp_path):
+    """timings.json records the block cache threshold the walk ran with (0.0 for a painter without one: no cache) and
+    the cache's passes and skips per painter call (painter.last_cache)."""
+    info = walk_sheet.run(FakePainter(), FakeDepth(), "t1", "forest", 1, [0, 0], 9.0, tmp_path / "a")
+    assert info["cache_threshold"] == 0.0 and info["cache"] == [None, None]
+    p = FakePainter()
+    p.cache_threshold, p.last_cache = 0.15, {"passes": 8, "skips": 3}
+    info = walk_sheet.run(p, FakeDepth(), "t1", "forest", 1, [0, 0], 9.0, tmp_path / "b")
+    assert info["cache_threshold"] == 0.15 and info["cache"] == [{"passes": 8, "skips": 3}] * 2
+
+
+def test_scenes_are_three_different_themes():
+    assert len(walk_sheet.SCENES) >= 3
+    themes = {theme for theme, _ in walk_sheet.SCENES.values()}
+    assert len(themes) == len(walk_sheet.SCENES)
+
+
+def test_run_scenes_walks_each_scene_into_its_own_dir(tmp_path):
+    painter = FakePainter()
+    dirs = walk_sheet.run_scenes(painter, FakeDepth(), None, ["forest", "desert"], [0, 0, 60], 9.0, tmp_path / "w")
+    assert [d.name for d in dirs] == ["w-forest", "w-desert"]
+    for d, name in zip(dirs, ("forest", "desert")):
+        info = json.loads((d / "timings.json").read_text())
+        assert (info["theme"], info["seed"]) == walk_sheet.SCENES[name]
+        assert info["scene"] == name
+    assert [c[1]["seed"] for c in painter.calls if c[0] == "panorama"] == [walk_sheet.SCENES[n][1]
+                                                                           for n in ("forest", "desert")]
+    with pytest.raises(SystemExit):
+        walk_sheet.main(["--scenes", "nowhere", "--out", str(tmp_path / "x")])
+
+
+def _walk_dir(d, arrays):
+    d.mkdir(parents=True)
+    for i, a in enumerate(arrays):
+        _img(a).save(d / f"spot{i}.png")
+    info = {"seam": [walk_sheet.seam(_img(a))[0] for a in arrays], "kernel": "w4a8", "keep_a16": [],
+            "git": "abc", "cache_threshold": 0.0}
+    (d / "timings.json").write_text(json.dumps(info))
+
+
+def test_relative_gate_compares_each_spot_with_its_base(tmp_path):
+    """--relative: per scene and spot, the seam delta against the base walk's same spot (fail above max_delta) and the
+    PSNR against the base image (identical: inf)."""
+    clean = [_texture(64, 256, s) for s in range(3)]
+    seamed = [a.copy() for a in clean]
+    seamed[2][:, 100:180] = 200                                      # spot 2 grows a hard seam
+    noisy = [np.clip(a + np.random.default_rng(1).normal(0, 2, a.shape), 0, 255) for a in clean]
+    for scene in ("forest", "desert"):
+        _walk_dir(tmp_path / f"base-{scene}", clean)
+        _walk_dir(tmp_path / f"same-{scene}", clean)
+        _walk_dir(tmp_path / f"noisy-{scene}", noisy)
+    _walk_dir(tmp_path / "bad-forest", clean)
+    _walk_dir(tmp_path / "bad-desert", seamed)
+    scenes = ["forest", "desert"]
+    rows, bad = walk_sheet.relative(tmp_path / "base", tmp_path / "same", scenes)
+    assert bad == [] and len(rows) == 6
+    assert all(r["delta"] == 0 and r["psnr"] == float("inf") for r in rows)
+    rows, bad = walk_sheet.relative(tmp_path / "base", tmp_path / "noisy", scenes)
+    assert all(30 < r["psnr"] < 60 for r in rows)
+    rows, bad = walk_sheet.relative(tmp_path / "base", tmp_path / "bad", scenes)
+    assert len(bad) == 1 and "desert" in bad[0] and "spot2" in bad[0]
+    with pytest.raises(SystemExit):
+        walk_sheet.main(["--relative", str(tmp_path / "base"), str(tmp_path / "bad"), "--scenes", "forest,desert"])
+    walk_sheet.main(["--relative", str(tmp_path / "base"), str(tmp_path / "same"), "--scenes", "forest,desert"])
+    # without --scenes the two paths are walk directories themselves
+    rows, bad = walk_sheet.relative(tmp_path / "base-forest", tmp_path / "bad-desert", None)
+    assert len(bad) == 1

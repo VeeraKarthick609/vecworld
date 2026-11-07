@@ -19,6 +19,17 @@ margin is thin: it catches hard full-height edges, not soft haze bands.
 
 --compare puts several walks side by side: OUT (one column per walk, half size, for an overview) and, at native
 size, OUT_spot{i}.png per spot (the walks' spot i stacked, full 2048 px width) to judge by eye.
+
+The multi-scene relative gate (Task 8; for every lossy engine change from then on):
+
+  uv run python scripts/walk_sheet.py --scenes forest,desert,coast --out ~/walk-archive/t8-base
+  uv run python scripts/walk_sheet.py --relative ~/walk-archive/t8-base ~/walk-archive/t8-c0.1 \
+      --scenes forest,desert,coast
+
+--scenes walks each named scene (SCENES: theme and seed) in one process, into OUT-<scene>. --relative BASE CAND
+compares every spot of CAND-<scene> with the same spot of BASE-<scene> (without --scenes: BASE and CAND are walk
+directories): the seam delta (CAND - BASE; above --max-delta, 0.03, fails, exit 1) and the PSNR of CAND's image
+against BASE's (inf: identical). timings.json also records the block cache threshold (FLUX_CACHE_THRESHOLD).
 """
 import argparse
 import json
@@ -43,13 +54,17 @@ SHEET_W = 1024          # each panorama is drawn this wide on the overview sheet
 SEAM_LIMIT = 1.1        # a spot scoring above this has a seam (see the module docstring)
 SEAM_W, SEAM_GAP, SEAM_ROWS = 32, 8, 16
 LABEL_H = 18
+MAX_DELTA = 0.03        # --relative: a spot may score at most this much above the same spot of its base walk
+# The gate's scenes (name: (theme, seed)): a dark forest, a bright desert and a sea-and-sky coast.
+SCENES = {"forest": ("haunted forest", 7), "desert": ("red desert", 11), "coast": ("stormy coast", 23)}
 
 
 class _Recorder:
-    """Wraps a painter: keeps each step's input view and times each painter call."""
+    """Wraps a painter: keeps each step's input view, times each painter call and keeps the painter's block cache
+    counts for it (painter.last_cache: passes, skips; None without a cache)."""
 
     def __init__(self, painter):
-        self.painter, self.prevs, self.paint_s = painter, [], []
+        self.painter, self.prevs, self.paint_s, self.cache = painter, [], [], []
 
     def __getattr__(self, name):
         return getattr(self.painter, name)
@@ -58,6 +73,7 @@ class _Recorder:
         t = time.perf_counter()
         img = self.painter.panorama(base, seed)
         self.paint_s.append(time.perf_counter() - t)
+        self.cache.append(getattr(self.painter, "last_cache", None))
         return img
 
     def step(self, prev, *a, **k):
@@ -65,6 +81,7 @@ class _Recorder:
         t = time.perf_counter()
         img = self.painter.step(prev, *a, **k)
         self.paint_s.append(time.perf_counter() - t)
+        self.cache.append(getattr(self.painter, "last_cache", None))
         return img
 
 
@@ -96,7 +113,8 @@ def walk(painter, depth, theme: str, seed: int, headings: list[float], walked: f
             ref = stats
         spots.append(spot)
         prompts.append(base)
-    return {"spots": spots, "prompts": prompts, "spot_s": times, "paint_s": rec.paint_s, "prevs": rec.prevs}
+    return {"spots": spots, "prompts": prompts, "spot_s": times, "paint_s": rec.paint_s, "prevs": rec.prevs,
+            "cache": rec.cache}
 
 
 def seam_profile(img: Image.Image) -> np.ndarray:
@@ -187,6 +205,64 @@ def check(dirs: list[Path], limit: float = SEAM_LIMIT) -> list[str]:
     return bad
 
 
+def psnr(a: Image.Image, b: Image.Image) -> float:
+    """PSNR of a against b in dB, over RGB 0..255 (inf: identical)."""
+    x = np.asarray(a.convert("RGB"), np.float64)
+    y = np.asarray(b.convert("RGB"), np.float64)
+    mse = float(((x - y) ** 2).mean())
+    return float("inf") if mse == 0 else round(10 * np.log10(255.0 ** 2 / mse), 2)
+
+
+def _pairs(base: Path, cand: Path, scenes: list[str] | None) -> list[tuple[str, Path, Path]]:
+    if not scenes:
+        return [(cand.name, base, cand)]
+    return [(s, base.with_name(f"{base.name}-{s}"), cand.with_name(f"{cand.name}-{s}")) for s in scenes]
+
+
+def relative(base: Path, cand: Path, scenes: list[str] | None, max_delta: float = MAX_DELTA):
+    """The relative gate: (rows, failures). One row per scene and spot: seams of base and candidate, their delta and
+    the candidate's PSNR against the base image. A failure is a spot whose seam rose by more than max_delta."""
+    rows, bad = [], []
+    for scene, b, c in _pairs(base, cand, scenes):
+        n = len(list(b.glob("spot*.png")))
+        if n == 0 or len(list(c.glob("spot*.png"))) != n:
+            raise SystemExit(f"{b} and {c} must hold the same number of spots")
+        for i in range(n):
+            ib, ic = Image.open(b / f"spot{i}.png"), Image.open(c / f"spot{i}.png")
+            sb, sc = seam(ib)[0], seam(ic)[0]
+            r = {"scene": scene, "spot": i, "base": sb, "seam": sc, "delta": round(sc - sb, 3), "psnr": psnr(ic, ib)}
+            rows.append(r)
+            if r["delta"] > max_delta:
+                bad.append(f"{scene}/spot{i}: seam {sc:.3f} vs base {sb:.3f} (+{r['delta']:.3f})")
+    return rows, bad
+
+
+def _print_relative(base: Path, cand: Path, scenes, rows) -> None:
+    for scene, b, c in _pairs(base, cand, scenes):
+        ib, ic = (json.loads((d / "timings.json").read_text()) if (d / "timings.json").exists() else {} for d in (b, c))
+        print(f"{scene}: base {b.name} (git {ib.get('git')}, kernel {ib.get('kernel')}, cache "
+              f"{ib.get('cache_threshold')}) vs {c.name} (git {ic.get('git')}, kernel {ic.get('kernel')}, cache "
+              f"{ic.get('cache_threshold')})")
+        if ib.get("kernel") != ic.get("kernel") or ib.get("keep_a16") != ic.get("keep_a16"):
+            print("  warning: the walks ran different kernels or keep-lists")
+        for r in (r for r in rows if r["scene"] == scene):
+            print(f"  spot{r['spot']}: seam {r['seam']:.3f} base {r['base']:.3f} delta {r['delta']:+.3f} "
+                  f"psnr {r['psnr']:.2f} dB")
+    worst = max(r["delta"] for r in rows)
+    print(f"worst delta {worst:+.3f}, min psnr {min(r['psnr'] for r in rows):.2f} dB")
+
+
+def run_scenes(painter, depth, recipe, scenes: list[str], headings, walked, out: Path) -> list[Path]:
+    """Walk each scene of SCENES (its theme and seed) into OUT-<scene>; returns the directories."""
+    dirs = []
+    for name in scenes:
+        theme, seed = SCENES[name]
+        d = out.with_name(f"{out.name}-{name}")
+        run(painter, depth, recipe, theme, seed, headings, walked, d, scene=name)
+        dirs.append(d)
+    return dirs
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--recipe", help="FLUX step recipe (config.FLUX_STEP_RECIPES); default: the configured one")
@@ -198,8 +274,23 @@ def main(argv=None):
     ap.add_argument("--compare", nargs="+", type=Path, help="walk directories to put side by side")
     ap.add_argument("--check", nargs="+", type=Path, help="re-score the seams of walks already written")
     ap.add_argument("--max-seam", type=float, default=SEAM_LIMIT, help="fail (exit 1) on a spot scoring above it")
+    ap.add_argument("--scenes", help=f"comma-separated scene names to walk (into OUT-<scene>) or gate; known: "
+                                     f"{', '.join(SCENES)}")
+    ap.add_argument("--relative", nargs=2, type=Path, metavar=("BASE", "CAND"),
+                    help="gate CAND against BASE spot by spot (seam delta, PSNR); with --scenes, both are prefixes")
+    ap.add_argument("--max-delta", type=float, default=MAX_DELTA, help="--relative: the largest seam rise allowed")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args(argv)
+    scenes = [x.strip() for x in a.scenes.split(",") if x.strip()] if a.scenes else None
+    unknown = [x for x in scenes or () if x not in SCENES]
+    if unknown:
+        ap.error(f"unknown scenes {unknown}; known: {', '.join(SCENES)}")
+    if a.relative:
+        rows, bad = relative(*a.relative, scenes, a.max_delta)
+        _print_relative(*a.relative, scenes, rows)
+        if bad:
+            sys.exit("seams worse than the base by more than %.3f: %s" % (a.max_delta, "; ".join(bad)))
+        return
     if a.check:
         bad = check(a.check, a.max_seam)
         if bad:
@@ -220,11 +311,15 @@ def main(argv=None):
 
     painter, depth = FluxPainter(), AnythingDepth()
     try:
-        info = run(painter, depth, a.recipe, a.theme, a.seed, headings, a.walked, a.out)
+        if scenes:
+            dirs = run_scenes(painter, depth, a.recipe, scenes, headings, a.walked, a.out)
+            infos = [json.loads((d / "timings.json").read_text()) for d in dirs]
+        else:
+            infos = [run(painter, depth, a.recipe, a.theme, a.seed, headings, a.walked, a.out)]
     finally:
         painter.close()
-    bad = [f"spot{i}: {sc:.2f} at column {at}" for i, (sc, at) in enumerate(zip(info["seam"], info["seam_at"]))
-           if sc > a.max_seam]
+    bad = [f"{info.get('scene') or ''} spot{i}: {sc:.2f} at column {at}" for info in infos
+           for i, (sc, at) in enumerate(zip(info["seam"], info["seam_at"])) if sc > a.max_seam]
     if bad:
         sys.exit("seams above %.2f: %s" % (a.max_seam, "; ".join(bad)))
 
@@ -242,7 +337,7 @@ def _git() -> str:
         return "unknown"
 
 
-def run(painter, depth, recipe, theme, seed, headings, walked, out: Path) -> dict:
+def run(painter, depth, recipe, theme, seed, headings, walked, out: Path, scene: str | None = None) -> dict:
     """One walk into `out` (spot/prev images, sheet.png, timings.json); returns the timings record."""
     if recipe is not None:
         painter.recipe = recipe
@@ -253,10 +348,10 @@ def run(painter, depth, recipe, theme, seed, headings, walked, out: Path) -> dic
         s.image.save(out / f"spot{i}.png")
     for i, p in enumerate(w["prevs"], 1):
         p.save(out / f"prev{i}.png")
-    info = {"recipe": recipe, "theme": theme, "seed": seed, "headings": headings, "walked": walked,
+    info = {"recipe": recipe, "scene": scene, "theme": theme, "seed": seed, "headings": headings, "walked": walked,
             "kernel": getattr(painter, "kernel", None), "keep_a16": list(getattr(painter, "keep_a16", ())),
             "fused": getattr(painter, "fused", None), "graphs": getattr(painter, "graphs", None),
-            "git": _git(),
+            "cache_threshold": getattr(painter, "cache_threshold", 0.0), "cache": w["cache"], "git": _git(),
             "spot_s": [round(x, 2) for x in w["spot_s"]], "paint_s": [round(x, 2) for x in w["paint_s"]],
             "distance": [round(s.distance, 3) for s in w["spots"]], "scale": [round(s.scale, 3) for s in w["spots"]],
             "prompts": [[[t, round(x, 3)] for t, x in p] for p in w["prompts"]]}
