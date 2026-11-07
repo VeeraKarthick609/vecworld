@@ -64,6 +64,31 @@ def test_flux_panorama_seamless(pano):
     assert peak < 3.6e9
 
 
+def psnr(a, b) -> float:
+    """PSNR of image a against b in dB over RGB 0..255 (inf: identical)."""
+    x, y = np.asarray(a.convert("RGB"), np.float64), np.asarray(b.convert("RGB"), np.float64)
+    mse = float(((x - y) ** 2).mean())
+    return float("inf") if mse == 0 else 10 * np.log10(255.0 ** 2 / mse)
+
+
+@pytest.mark.gpu
+def test_flux_pano_batched_matches(painter, pano):
+    """Task 9: the panorama painted with every window of a step in one pass (FLUX_BATCH) matches the one painted a
+    window per pass, same seed: PSNR >= 35 dB (the passes' GEMMs see a different M, so bf16 sums may round apart)."""
+    from vecworld.config import FLUX_BATCH
+
+    assert painter.batch == FLUX_BATCH
+    try:
+        painter.batch = 1
+        one = painter.panorama(BASE, seed=21)
+    finally:
+        painter.batch = FLUX_BATCH
+    one.save("/tmp/flux_pano_batch1.png")
+    db = psnr(pano[0], one)
+    print(f"\npanorama at batch {FLUX_BATCH} vs batch 1: PSNR {db:.2f} dB")
+    assert db >= 35
+
+
 Z = 1.6
 CONTINUOUS = [n for n, r in FLUX_STEP_RECIPES.items() if r["release"] != "fresh"]
 # Continuity bar per recipe: SSIM between the dollied view and the step over the columns it keeps most (released

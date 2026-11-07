@@ -19,6 +19,9 @@ crossfade. The differences:
   optionally replayed as CUDA graphs (VECWORLD_GRAPHS=1; default off: eager on the same slots, as fast). A
   first-block cache (vecworld.engine.cache, FLUX_CACHE_THRESHOLD / VECWORLD_CACHE_THRESHOLD; 0 = off) may skip
   blocks 1..56 of a pass when block 0's output barely changed since the window batch's previous step.
+- Batching (Task 9, docs/engine/09-batching.md): every active window of a step goes through each transformer pass
+  together, up to FLUX_BATCH (VECWORLD_BATCH) windows a pass, each with its own text embedding stacked in its place,
+  so the weights are copied in and walked once per pass for all of them.
   VECWORLD_KERNEL=off keeps diffusers for all of it, streamed with diffusers' group offload.
 """
 import itertools
@@ -30,14 +33,14 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 
-from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
+from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE,
                              FLUX_GGUF, FLUX_GRAPH_MAX, FLUX_SLOT_RING, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
                              FLUX_STYLE, FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
-from vecworld.engine import (engine_cache_threshold, engine_fuse, engine_graphs, engine_kernel, keep_for,
-                             load_engine_ext)
+from vecworld.engine import (engine_batch, engine_cache_threshold, engine_fuse, engine_graphs, engine_kernel,
+                             keep_for, load_engine_ext)
 from vecworld.engine.cache import BlockCache, cached_forward
 
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
@@ -155,6 +158,8 @@ class FluxPainter(Painter):
     always off under "off") is the first-block cache's threshold (vecworld.engine.cache; self.cache_threshold,
     self.cache): each job (a panorama or a step) keys its window batches by (job, window ids), and after a job
     self.last_cache holds its passes and skipped passes.
+    VECWORLD_BATCH (vecworld.engine.engine_batch; unset: config.FLUX_BATCH) is self.batch, the most windows a
+    transformer pass carries: each step's active windows run as ceil(active / batch) passes.
     """
 
     style = FLUX_STYLE
@@ -170,6 +175,7 @@ class FluxPainter(Painter):
 
         self.kernel = engine_kernel()           # a typo or a broken extension build fails here, before the
         self.fused = engine_fuse(self.kernel)   # minute-long model load, with a hint to set VECWORLD_KERNEL=off
+        self.batch = engine_batch()
         if self.kernel is not None or self.fused:
             load_engine_ext()
         dev, bf16 = torch.device("cuda"), torch.bfloat16
@@ -225,6 +231,7 @@ class FluxPainter(Painter):
         self._slots = getattr(self, "_slots", None)                     # engine.slots.BlockSlots (engine kernels)
         self._runner = getattr(self, "_runner", None)                   # engine.graphs.GraphRunner
         self.cache_threshold: float = getattr(self, "cache_threshold", 0.0)
+        self.batch: int = getattr(self, "batch", None) or engine_batch()   # windows per pass, at most
         self.cache: BlockCache | None = BlockCache(self.cache_threshold)  # first-block cache (engine.cache)
         self.last_cache: dict | None = None                             # the last job's passes and skips
         self._jobs = itertools.count(1)
@@ -410,6 +417,9 @@ class FluxPainter(Painter):
         a column changes, and FLUX's windows disagree enough (each settles its own exposure, worst in haze) for
         that to show as a hard vertical line every FLUX_STRIDE.
 
+        A step's active windows go through the transformer self.batch at a time (all of them in one pass when they
+        fit), their text embeddings stacked in window order; the block cache keys each pass by its exact window tuple.
+
         embs[i] = (t5, pooled) for window i. keep = (orig, noise, rw): at step k, rw[k] (per column) of the latent
         is reset to orig noised to sigmas[k] (differential diffusion), so a column held up to its release step
         denoises only from there, like img2img; rw[-1] pastes orig back after the last step (strength 0). Windows
@@ -424,7 +434,8 @@ class FluxPainter(Painter):
         n_steps = len(sigmas) - 1
         full = None if keep is None else [(r.reshape(-1) >= 1).cpu().numpy() for r in keep[2]]
         acts = [_active(wins, None if full is None or k + 1 >= n_steps else full[k + 1]) for k in range(n_steps)]
-        total, done = sum(math.ceil(len(a) / FLUX_BATCH) for a in acts), 0
+        nb = self.batch
+        total, done = sum(math.ceil(len(a) / nb) for a in acts), 0
         wt = torch.from_numpy(ramp(FLUX_WIN, FLUX_WIN // 2)).to(grid.device)
         job, cache = next(self._jobs), self.cache
         skips0 = cache.stats["skips"] if cache is not None else 0
@@ -437,9 +448,9 @@ class FluxPainter(Painter):
                     orig, noise, rw = keep
                     grid = (1 - rw[k]) * grid + rw[k] * ((1 - s) * orig + s * noise)
                 vel, cnt = torch.zeros_like(grid), torch.zeros_like(grid[:, :1])
-                for b in range(0, len(act), FLUX_BATCH):
+                for b in range(0, len(act), nb):     # every active window, nb a pass (the last may be ragged)
                     check_stop()
-                    idx = act[b:b + FLUX_BATCH]
+                    idx = act[b:b + nb]
                     cols = [wrap_cols(wins[i][1], FLUX_WIN, w) for i in idx]
                     tiles = torch.cat([grid[..., y:y + FLUX_WIN, :][..., c] for (y, _), c in
                                        zip((wins[i] for i in idx), cols)])

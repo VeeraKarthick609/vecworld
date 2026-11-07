@@ -208,14 +208,15 @@ def do_tile512(R, mon):
 
 
 def do_peak(R, mon):
-    """Peak allocated memory and pass time at 1, 2 and 4 windows per pass (the painter's _forward at sigma 1): per
-    batch, a first pass (with graphs: warm-up + capture) and then the median of 3 timed passes; the peak covers both."""
+    """Peak allocated memory and pass time at 1, 2, 4, 6 and 8 windows per pass (the painter's _forward at sigma 1; 8
+    is a panorama step's every window): per batch, a first pass (with graphs: warm-up + capture) and then the median
+    of 3 timed passes; the peak covers both."""
     import torch
     from vecworld.config import FLUX_WIN
     p, prompt, _ = load_painter(R, mon)
     with torch.inference_mode():
         e = p._embed(prompt)
-        for b in (1, 2, 4):
+        for b in (1, 2, 4, 6, 8):
             g = torch.randn(b, 64, FLUX_WIN, FLUX_WIN, device="cuda", generator=torch.Generator("cuda").manual_seed(b))
             torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
             t = time.time(); p._forward(g, [e] * b, 1.0); torch.cuda.synchronize(); first = time.time() - t
@@ -228,10 +229,31 @@ def do_peak(R, mon):
                                   s_per_window=round(med / b, 3), passes_s=[round(x, 3) for x in ts])
 
 
+def _count_windows(p):
+    """Count the windows the painter's passes carry (wins[0]); returns the counter."""
+    wins, fwd = [0], p._forward
+
+    def counted(tiles, embs, s, **kw):            # a pass carries up to painter.batch windows
+        wins[0] += tiles.shape[0]
+        return fwd(tiles, embs, s, **kw)
+
+    p._forward = counted
+    return wins
+
+
+def _per_window(res, wins):
+    """The job's window passes, and its GPU pass time per window-step (all its passes' GPU time over its window
+    passes: what one window costs at one denoising step, the batching metric)."""
+    res["window_passes"] = wins
+    res["s_per_window_step"] = round(sum(res["s_per_pass"]) / max(wins, 1), 3)
+
+
 def do_pano(R, mon):
     p, prompt, passes = load_painter(R, mon)
     p.cache.rel.clear()
+    wins = _count_windows(p)
     img, R["pano"] = timed(lambda: p.panorama(prompt, seed=21), passes, mon)
+    _per_window(R["pano"], wins[0])
     R["pano"]["cache"] = _cache_record(p)
     (ROOT / "bench").mkdir(exist_ok=True); img.save(ROOT / "bench/last_pano.png")
 
@@ -242,16 +264,10 @@ def do_step(R, mon):
     from vecworld.roam.spot import focus_half
     p, prompt, passes = load_painter(R, mon)
     prev = dolly(p.panorama(prompt, seed=21), 1.6)
-    wins, fwd = [0], p._forward
-
-    def counted(tiles, embs, s, **kw):            # a pass carries up to FLUX_BATCH windows
-        wins[0] += tiles.shape[0]
-        return fwd(tiles, embs, s, **kw)
-
-    p._forward = counted
+    wins = _count_windows(p)
     p.cache.rel.clear()
     img, R["step"] = timed(lambda: p.step(prev, prompt, None, 0.5, seed=22, focus_half=focus_half(1.6)), passes, mon)
-    R["step"]["window_passes"] = wins[0]
+    _per_window(R["step"], wins[0])
     R["step"]["cache"] = _cache_record(p)
     R["step"]["s_per_window_pass"] = round(R["step"]["s"] / max(wins[0], 1), 2)   # wall time incl. VAE and text
     (ROOT / "bench").mkdir(exist_ok=True); img.save(ROOT / "bench/last_step.png")
@@ -507,8 +523,9 @@ def main():
     import torch
     mon = Mon()
     from vecworld.engine import engine_fuse
-    from vecworld.engine import engine_cache_threshold, engine_graphs
+    from vecworld.engine import engine_batch, engine_cache_threshold, engine_graphs
     R = {"what": a.what, "painter": a.painter, "kernel": engine_kernel(), "fused": engine_fuse(engine_kernel()),
+         "batch": engine_batch(),
          "graphs": engine_graphs(engine_kernel()), "cache_threshold": engine_cache_threshold(engine_kernel()), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
     t0 = time.time()
     WHATS[a.what](R, mon)

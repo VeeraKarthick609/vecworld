@@ -1,5 +1,6 @@
 """The first-block cache (Task 8, docs/engine/08-block-cache.md): BlockCache on its own and in the painter's pass loop
 on a small fake FLUX (CPU), then on the real transformer (gpu, run with the game server stopped)."""
+import math
 import threading
 from types import SimpleNamespace
 
@@ -261,7 +262,7 @@ def test_painter_cache_threshold_zero_is_the_plain_transformer():
     plain.cache = None                                     # no cache object at all: the transformer called as is
     a, b = _job(off), _job(plain)
     assert torch.equal(a, b)
-    passes = FLUX_STEPS * 8 // FLUX_BATCH
+    passes = FLUX_STEPS * math.ceil(8 / FLUX_BATCH)
     assert off.transformer.block_calls() == [passes] * 5
     assert off.last_cache == {"passes": passes, "skips": 0}
 
@@ -269,7 +270,7 @@ def test_painter_cache_threshold_zero_is_the_plain_transformer():
 def test_painter_skips_at_a_high_threshold_but_never_at_step_0():
     p = _painter(100.0)
     out = _job(p)
-    per_step = 8 // FLUX_BATCH
+    per_step = math.ceil(8 / FLUX_BATCH)
     passes = FLUX_STEPS * per_step
     assert p.last_cache == {"passes": passes, "skips": passes - per_step}   # all but each batch's step 0
     calls = p.transformer.block_calls()
@@ -287,10 +288,47 @@ def test_painter_keys_batches_by_job_and_windows():
     _job(p)
     jobs = {k[0] for k, _ in seen}
     assert len(jobs) == 1
-    assert {k[1] for k, _ in seen} == {(0, 1, 2, 3), (4, 5, 6, 7)}
-    assert [s for _, s in seen] == [k for k in range(FLUX_STEPS) for _ in range(2)]
+    assert {k[1] for k, _ in seen} == {tuple(range(i, min(i + FLUX_BATCH, 8))) for i in range(0, 8, FLUX_BATCH)}
+    assert [s for _, s in seen] == [k for k in range(FLUX_STEPS) for _ in range(math.ceil(8 / FLUX_BATCH))]
     _job(p)
     assert len({k[0] for k, _ in seen}) == 2
+
+
+@pytest.mark.parametrize("batch", [3, 8])
+def test_painter_batches_never_reuse_another_compositions_residual(batch):
+    """Task 9, cache forced on: with the windows batched (ragged at 3; all of a step's active windows at 8) and the
+    active set changing from step to step, a pass only ever skips with the residual stored under its own exact window
+    tuple, of its own batch size; a batch whose composition changed computes."""
+    p = _painter(100.0)
+    p.batch = batch
+    probes, stores, applied = [], [], []
+    probe, store, apply = p.cache.probe, p.cache.store, p.cache.apply
+    p.cache.probe = lambda key, r0, step: probes.append((key, step, probe(key, r0, step))) or probes[-1][2]
+    p.cache.store = lambda key, res: (stores.append((key, res.shape[0])), store(key, res))[1]
+    p.cache.apply = lambda key, x: (applied.append((key, x.shape[0], p.cache._e[key].residual.shape[0])),
+                                    apply(key, x))[1]
+    g = torch.Generator().manual_seed(4)
+    w = 8 * FLUX_WIN // 2
+    grid, orig, noise = (torch.randn(1, 64, FLUX_WIN, w, generator=g) for _ in range(3))
+    e = [(torch.randn(1, 4, 8, generator=g), torch.randn(1, 8, generator=g)) for _ in range(8)]
+    rw = [torch.zeros(1, 1, 1, w) for _ in range(5)]
+    rw[1][..., :w // 2] = 1.0                              # step 0: windows 0..2 idle (reset again at step 1)
+    rw[3][..., w // 4:] = 1.0                              # step 2: only windows 0, 1, 7
+    with torch.inference_mode():
+        out = p._denoise(grid, p._sigmas(4), e, keep=(orig, noise, rw))
+    assert torch.isfinite(out).all()
+    sets = [{k for k, s, _ in probes if s == step} for step in range(4)]
+    assert sets[0] != sets[1] != sets[2]                    # the composition does change
+    skipped = [(k, s) for k, s, skip in probes if skip]
+    assert skipped and len(applied) == len(skipped)
+    for key, step in skipped:
+        assert key in sets[step]
+        assert any(k == key for k, _ in stores), key        # stored under this very key, at an earlier step
+    for key, n, rn in applied:
+        assert n == rn == len(key[1])                       # its own batch's residual, window for window
+    for step in (1, 2):                                     # a window tuple new at this step computes
+        for key in sets[step] - set().union(*sets[:step]):
+            assert (key, step, False) in probes
 
 
 def test_painter_stop_clears_the_cache_and_the_next_job_starts_cold():
@@ -308,8 +346,9 @@ def test_painter_stop_clears_the_cache_and_the_next_job_starts_cold():
     p.progress = None
     before = p.transformer.block_calls()[1]
     _job(p)
-    assert p.transformer.block_calls()[1] - before == 8 // FLUX_BATCH   # only the cold step 0 computes block 1
-    assert p.last_cache["skips"] == (FLUX_STEPS - 1) * 8 // FLUX_BATCH
+    per_step = math.ceil(8 / FLUX_BATCH)
+    assert p.transformer.block_calls()[1] - before == per_step          # only the cold step 0 computes block 1
+    assert p.last_cache["skips"] == (FLUX_STEPS - 1) * per_step
 
 
 def test_engine_cache_threshold_rule(monkeypatch):

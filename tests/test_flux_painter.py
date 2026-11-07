@@ -108,6 +108,84 @@ def test_progress_counts_only_active_windows_in_a_step():
     assert sum(len(c) for c in tr.calls) < (len(sig) - 1) * N_WIN     # background windows skipped early
 
 
+class WindowwiseTransformer(FakeTransformer):
+    """A velocity that depends on each window's own tokens, text and sigma only (elementwise, so exact in any batch):
+    batching must not change any window's output. Records each pass's batch size."""
+
+    def __call__(self, hidden_states, encoder_hidden_states, pooled_projections, timestep, *a, **k):
+        super().__call__(hidden_states, encoder_hidden_states, pooled_projections, timestep, *a, **k)
+        t = encoder_hidden_states.float().mean((1, 2))[:, None, None] + pooled_projections.float().mean(1)[:, None, None]
+        return (torch.tanh(hidden_states * 1.5 + t) - timestep[:, None, None] * hidden_states,)
+
+
+def _distinct_embs(n):
+    """One (t5, pooled) per window, all different (the step's focus / base split, exaggerated)."""
+    return [(torch.full((1, 4, 8), 0.1 * i, dtype=torch.bfloat16), torch.full((1, 8), -0.05 * i, dtype=torch.bfloat16))
+            for i in range(n)]
+
+
+@pytest.mark.parametrize("batch", [1, 2, 3, 5, 8, 16])
+def test_batched_equals_unbatched(batch):
+    """Task 9: the same window outputs whatever the batch size, in a panorama and in a walk step (whose active
+    windows change from step to step), ragged last batches included (8 windows at 3: 3, 3, 2), with each window's own
+    text embedding stacked in its place."""
+    g = torch.Generator().manual_seed(5)
+    grid = torch.randn(1, 64, GH, GW, generator=g)
+    embs = _distinct_embs(N_WIN)
+    orig, noise = torch.randn(1, 64, GH, GW, generator=g), torch.randn(1, 64, GH, GW, generator=g)
+    rw = [torch.zeros(1, 1, 1, GW) for _ in range(5)]
+    rw[1][..., :GW // 2] = 1.0                              # the left half reset again at step 1: windows idle at 0
+    rw[3][..., GW // 4:] = 1.0                              # most of it at step 3: only the windows over 0..1/4
+    outs, sizes = {}, {}
+    for b in (1, batch):
+        tr = WindowwiseTransformer()
+        p = fake_painter(tr)
+        p.batch = b
+        pano = p._denoise(grid.clone(), p._sigmas(FLUX_STEPS), embs)
+        step = p._denoise(grid.clone(), p._sigmas(4), embs, keep=(orig, noise, rw))
+        outs[b], sizes[b] = (pano, step), [c.shape[0] for c in tr.calls]
+    assert torch.equal(outs[batch][0], outs[1][0]) and torch.equal(outs[batch][1], outs[1][1])
+    assert max(sizes[batch]) == min(batch, N_WIN)
+    assert sum(sizes[batch]) == sum(sizes[1])               # the same window passes, fewer transformer passes
+
+
+def test_every_active_window_of_a_step_in_as_few_passes_as_the_batch_allows():
+    """Each step's active windows go through the transformer as ceil(active / batch) passes of up to `batch` windows
+    (the painter's batch: FLUX_BATCH unless VECWORLD_BATCH says otherwise); a panorama's 8 windows at FLUX_BATCH."""
+    tr = TimedTransformer()
+    p = fake_painter(tr)
+    assert p.batch == FLUX_BATCH
+    p.panorama([("a forest", 1.0)], seed=3)
+    assert [c.shape[0] for c in tr.calls] == [min(FLUX_BATCH, N_WIN)] * (FLUX_STEPS * math.ceil(N_WIN / FLUX_BATCH))
+    for b in (3, N_WIN):
+        tr.calls.clear(), tr.sigmas.clear()
+        p.batch = b
+        p.step(Image.new("RGB", (PANO_W, PANO_H), (90, 120, 60)), [("a forest", 1.0)], None, 0.5, seed=4)
+        per_sigma = {}
+        for s, c in zip(tr.sigmas, tr.calls):
+            per_sigma.setdefault(s, []).append(c.shape[0])
+        for s, sizes in per_sigma.items():
+            n = sum(sizes)
+            assert sizes == [b] * (n // b) + ([n % b] if n % b else []), (b, s, sizes)
+
+
+def test_engine_batch_rule(monkeypatch):
+    """VECWORLD_BATCH (vecworld.engine.engine_batch, one rule for the painter, the walk and the bench): unset or empty,
+    config.FLUX_BATCH; otherwise a whole number >= 1, under every kernel ("off" too: the diffusers path batches the
+    same way). Anything else is refused."""
+    from vecworld.engine import engine_batch
+
+    monkeypatch.delenv("VECWORLD_BATCH", raising=False)
+    assert engine_batch() == FLUX_BATCH
+    for value, want in (("", FLUX_BATCH), ("1", 1), ("6", 6), (" 8 ", 8)):
+        monkeypatch.setenv("VECWORLD_BATCH", value)
+        assert engine_batch() == want, value
+    for bad in ("0", "-2", "2.5", "lots"):
+        monkeypatch.setenv("VECWORLD_BATCH", bad)
+        with pytest.raises(ValueError, match="VECWORLD_BATCH"):
+            engine_batch()
+
+
 def test_check_stop_between_steps():
     stop = threading.Event()
     tr = FakeTransformer(on_call=lambda n: stop.set())        # asked to stop during the first pass

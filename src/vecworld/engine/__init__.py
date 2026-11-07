@@ -69,6 +69,20 @@ def engine_cache_threshold(kernel: str | None) -> float:
     return t if kernel is not None else 0.0
 
 
+def engine_batch() -> int:
+    """Windows per transformer pass (Task 9, docs/engine/09-batching.md), the one rule for the painter, the walk and the
+    bench: VECWORLD_BATCH (a whole number >= 1) or, unset or empty, config.FLUX_BATCH. Under every kernel ("off" too:
+    the diffusers path batches its windows the same way)."""
+    from vecworld.config import FLUX_BATCH
+
+    v = (os.environ.get("VECWORLD_BATCH") or "").strip()
+    if not v:
+        return int(FLUX_BATCH)
+    if not v.isdigit() or int(v) < 1:
+        raise ValueError(f"VECWORLD_BATCH={v!r}; use a whole number >= 1 (unset: config.FLUX_BATCH)")
+    return int(v)
+
+
 def keep_for(kernel: str | None) -> tuple[str, ...]:
     """The linears (fnmatch patterns of module names, for swap_linears' keep_a16) that stay on "mma" under `kernel`:
     config.FLUX_A16_KEEP under "w4a8" (W4A8's per-layer policy, docs/engine/04-w4a8.md), nothing under any other

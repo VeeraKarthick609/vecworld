@@ -333,21 +333,63 @@ def test_runner_refuses_another_thread(eng):
 
 
 def test_graph_shape_change(eng):
-    """Key A (batch 1, 1024 + 256), then B (batch 3, 1024 + 256), then C (batch 1, 1024 + 77), then A again: each
-    matches eager, and A's second run replays the graphs captured for it (no new capture)."""
-    runs = [("A", 1, 256), ("B", 3, 256), ("C", 1, 77), ("A", 1, 256)]
+    """Review Focus 8, at the batch sizes Task 9 runs: key A (batch 1, 1024 + 256), B (batch 3), its ragged last batch R
+    (2: 8 windows at 3 are 3, 3, 2), C (batch 1, 1024 + 77), W (5: a walk step's partial active set), P (FLUX_BATCH: a
+    panorama step's every window), then A again: each matches eager, each new shape captures its own graphs, and A's
+    second run replays the graphs captured for it (no new capture)."""
+    from vecworld.config import FLUX_BATCH
+
+    runs = [("A", 1, 256), ("B", 3, 256), ("R", 2, 256), ("C", 1, 77), ("W", 5, 256), ("P", FLUX_BATCH, 256),
+            ("A", 1, 256)]
+    r = eng.runner
+    old = r.max_graphs
+    r.clear()
+    r.max_graphs = len({(b, t) for _, b, t in runs})        # keep every key: A must still be there at the end
     caps = {}
-    for name, b, t in runs:
-        kw = _inputs(b, t, seed=b * 1000 + t)
-        want = _fwd(eng, kw, graphs=False)
-        before = eng.runner.stats.copy()
-        got = _fwd(eng, kw, graphs=True)
-        assert torch.equal(got, want), name
-        caps.setdefault(name, []).append(eng.runner.stats["captures"] - before["captures"])
-        assert (b, 1024, t) in eng.runner.keys()
+    try:
+        for name, b, t in runs:
+            kw = _inputs(b, t, seed=b * 1000 + t)
+            want = _fwd(eng, kw, graphs=False)
+            before = r.stats.copy()
+            got = _fwd(eng, kw, graphs=True)
+            assert torch.equal(got, want), name
+            caps.setdefault(name, []).append(r.stats["captures"] - before["captures"])
+            assert (b, 1024, t) in r.keys()
+            del kw, want, got
+    finally:
+        r.max_graphs = old
+        r.clear()
     n = len(eng.tr.transformer_blocks) + len(eng.tr.single_transformer_blocks)
-    assert caps["B"] == [n] and caps["C"] == [n]
-    assert caps["A"][-1] == 0                                # A's second run reused its graphs
+    for name in ("B", "R", "C", "W"):
+        assert caps[name] == [n], name
+    assert caps["P"] == [n] or FLUX_BATCH in (1, 2, 3, 5)
+    assert caps["A"] == [n, 0]                               # A's second run reused its graphs
+
+
+@pytest.mark.parametrize("graphs", [False, True], ids=["eager", "graphs"])
+def test_batched_windows_match_single_windows(eng, graphs):
+    """Task 9: each window of a batched pass (FLUX_BATCH, and a ragged 2 and 5) equals that window run alone, on the
+    eager slot path and on the graphs, to bf16 rounding: its output's relative L2 error against the single-window
+    pass stays under 1e-2 (bit-identical where the kernels' sums don't depend on M)."""
+    from vecworld.config import FLUX_BATCH
+
+    eng.runner.clear()
+    worst = 0.0
+    for b in sorted({FLUX_BATCH, 2, 5}):
+        kw = _inputs(b, 256, seed=50 + b)
+        out = _fwd(eng, kw, graphs)
+        for i in range(b):
+            one = {k: (v[i:i + 1] if k in ("hidden_states", "encoder_hidden_states", "pooled_projections", "timestep")
+                       else v) for k, v in kw.items()}
+            ref = _fwd(eng, one, graphs=False).float()
+            err = float((out[i:i + 1].float() - ref).norm() / ref.norm())
+            worst = max(worst, err)
+            assert torch.isfinite(out[i]).all()
+            assert err < 1e-2, (b, i, err)
+        del kw, out
+    eng.runner.clear()
+    print(f"\nworst relative error of a batched window against it alone ({'graphs' if graphs else 'eager'}): "
+          f"{worst:.2e}")
 
 
 def test_graph_lru_evicts_beyond_max(eng):
@@ -433,16 +475,18 @@ def test_graph_stop_between_steps(eng):
     assert mem0 == mem1 == mem2
 
 
-def test_graph_peak_memory_batch4(eng):
-    """Peak allocated < 3.6 GB at batch 4 (FLUX_BATCH windows) with graphs on, the capture pass included."""
-    eng.runner.clear()                                       # drop earlier keys: the first batch-4 use captures
+def test_graph_peak_memory_at_flux_batch(eng):
+    """Peak allocated < 3.6 GB at FLUX_BATCH windows a pass with graphs on (opt-in), the capture pass included."""
+    from vecworld.config import FLUX_BATCH
+
+    eng.runner.clear()                                       # drop earlier keys: the first FLUX_BATCH use captures
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    _fwd(eng, _inputs(4, 256, seed=4), graphs=True)
-    _fwd(eng, _inputs(4, 256, seed=4), graphs=True)
+    _fwd(eng, _inputs(FLUX_BATCH, 256, seed=4), graphs=True)
+    _fwd(eng, _inputs(FLUX_BATCH, 256, seed=4), graphs=True)
     peak = torch.cuda.max_memory_allocated()
-    print(f"\npeak allocated at batch 4 with graphs: {peak / 1e9:.3f} GB")
+    print(f"\npeak allocated at batch {FLUX_BATCH} with graphs: {peak / 1e9:.3f} GB")
     assert peak < 3.6e9
 
 
