@@ -169,6 +169,41 @@ def test_every_active_window_of_a_step_in_as_few_passes_as_the_batch_allows():
             assert sizes == [b] * (n // b) + ([n % b] if n % b else []), (b, s, sizes)
 
 
+def test_rowwise_runs_the_outer_layers_a_window_at_a_time():
+    """Task 9: cuBLAS picks its bf16 GEMM by M, so the transformer's layers outside the blocks (x / context embedders,
+    the time-text embedder, the output norm's linear and the projection out, M = batch or batch x tokens) round a window
+    differently in a batch than alone, and under w4a8 that one ulp became a different sample (25.7 dB). rowwise() runs
+    each a window at a time: the same rows, the same result, whatever the batch."""
+    from vecworld.flux.painter import ROWWISE, rowwise
+
+    class Rec(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen = []
+
+        def forward(self, x, y=None):
+            self.seen.append(x.shape[0])
+            return x * 2 + (0 if y is None else y.sum(-1, keepdim=True))
+
+    tr = torch.nn.Module()
+    tr.norm_out = torch.nn.Module()
+    for name in ROWWISE:
+        parent, _, leaf = name.rpartition(".")
+        setattr(tr.get_submodule(parent), leaf, Rec())
+    rowwise(tr)
+    x, y = torch.randn(3, 5), torch.randn(3, 4)
+    for name in ROWWISE:
+        m = tr.get_submodule(name)
+        m.seen.clear()
+        got = m(x, y)
+        assert torch.equal(got, x * 2 + y.sum(-1, keepdim=True)) and m.seen == [1, 1, 1], name
+    rowwise(tr)                                              # twice: still one level of rows
+    m = tr.get_submodule(ROWWISE[0])
+    m.seen.clear()
+    m(x)
+    assert m.seen == [1, 1, 1]
+
+
 def test_engine_batch_rule(monkeypatch):
     """VECWORLD_BATCH (vecworld.engine.engine_batch, one rule for the painter, the walk and the bench): unset or empty,
     config.FLUX_BATCH; otherwise a whole number >= 1, under every kernel ("off" too: the diffusers path batches the
@@ -644,7 +679,7 @@ def test_graphs_default_off_opt_in(monkeypatch):
 def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
     """Under an engine kernel FluxPainter puts the blocks on fixed-address slots with a GraphRunner
     (vecworld.engine.graphs.stream_blocks; graphs as engine_graphs says) instead of diffusers' group offload, after
-    the swap, the fused patch and the pinning; under VECWORLD_KERNEL=off it keeps group offload (the reference)."""
+    the swap, the fused patch, the rowwise outer layers (Task 9, every kernel) and the pinning; under VECWORLD_KERNEL=off it keeps group offload (the reference)."""
     import diffusers
 
     import vecworld.engine.blocks as blocks_mod
@@ -665,6 +700,7 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
     monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
     monkeypatch.setattr(swap_mod, "swap_linears", lambda *a, **k: order.append("swap") or 1)
     monkeypatch.setattr(blocks_mod, "patch_blocks", lambda tr: order.append("patch") or 57)
+    monkeypatch.setattr(painter_mod, "rowwise", lambda tr: order.append("rows"))
     monkeypatch.setattr(painter_mod, "_pin_in_place", lambda mods: order.append("pin") or [])
     monkeypatch.setattr(graphs_mod, "stream_blocks",
                         lambda tr, dev, graphs, **k: order.append(f"slots graphs={graphs}") or ("slots", "runner"))
@@ -673,9 +709,9 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
         raise Loaded
 
     monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", stop_at_vae)
-    for kernel, graphs, want in ((None, None, ["swap", "patch", "pin", "slots graphs=False"]),
-                                 ("mma", "1", ["swap", "patch", "pin", "slots graphs=True"]),
-                                 ("off", None, ["pin", "offload"]), ("off", "1", ["pin", "offload"])):
+    for kernel, graphs, want in ((None, None, ["swap", "patch", "rows", "pin", "slots graphs=False"]),
+                                 ("mma", "1", ["swap", "patch", "rows", "pin", "slots graphs=True"]),
+                                 ("off", None, ["rows", "pin", "offload"]), ("off", "1", ["rows", "pin", "offload"])):
         for k in ("VECWORLD_KERNEL", "VECWORLD_FUSE", "VECWORLD_GRAPHS"):
             monkeypatch.delenv(k, raising=False)
         if kernel:

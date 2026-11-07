@@ -1,4 +1,11 @@
+import os
+
 from PIL import Image
+
+# The allocator the painter runs (FluxPainter.__init__ sets it before CUDA starts): GPU tests that build the
+# transformer without the painter (test_graphs, test_cache) must see the same fragmentation behaviour, or batch-8 graph
+# pools that fit the game run out of memory in the tests. Set before anything touches CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 class FakePainter:

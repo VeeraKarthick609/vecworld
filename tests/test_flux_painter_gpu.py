@@ -74,10 +74,13 @@ def psnr(a, b) -> float:
 @pytest.mark.gpu
 def test_flux_pano_batched_matches(painter, pano):
     """Task 9: the panorama painted with every window of a step in one pass (FLUX_BATCH) matches the one painted a
-    window per pass, same seed: PSNR >= 35 dB (the passes' GEMMs see a different M, so bf16 sums may round apart)."""
+    window per pass, same seed: PSNR >= 35 dB (the brief's bar; with rowwise outer layers it is identical)."""
     from vecworld.config import FLUX_BATCH
 
+    from vecworld.flux.painter import ROWWISE, _Rows
+
     assert painter.batch == FLUX_BATCH
+    assert all(isinstance(painter.transformer.get_submodule(n).forward, _Rows) for n in ROWWISE)
     try:
         painter.batch = 1
         one = painter.panorama(BASE, seed=21)

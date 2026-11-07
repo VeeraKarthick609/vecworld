@@ -104,14 +104,18 @@ FLUX_A16_KEEP: tuple[str, ...] = (
     "transformer_blocks.*.attn.add_v_proj", "transformer_blocks.*.attn.add_q_proj",
     "transformer_blocks.*.ff.net.2", "transformer_blocks.*.attn.to_out.0", "transformer_blocks.*.attn.to_add_out",
 )
-FLUX_BATCH = 4             # windows per transformer pass (peak 1.4 GB allocated on AC; Task 6 re-batches)
+# Windows per transformer pass (Task 9, docs/engine/09-batching.md; VECWORLD_BATCH overrides): 8 = a panorama step's
+# every window in one pass. Measured on AC at 1 / 2 / 4 / 6 / 8: panorama 30.3 / 30.6 / 30.3 / 30.4 / 30.2 s, walk step
+# 40.3 / 39.9 / 39.4 / 39.5 / 39.3 s, peak 1.76-2.05 GB: compute-bound, so per-window time is flat (an interleaved
+# A/B: 0.918 s at 4, 0.915 at 8), but 8 halves the passes, the per-block Python and every per-pass weight copy.
+FLUX_BATCH = 8
 # Under an engine kernel the transformer's blocks stream their weights through FLUX_SLOT_RING fixed-address device
 # slots (vecworld.engine.slots, each the size of the largest block, 191 MB) and replay as one CUDA graph per block
 # and input shape (vecworld.engine.graphs, VECWORLD_GRAPHS). 3, not 2: block i uses slot i % ring, and with 2 slots
 # the 57 blocks (odd) put the last block and the next pass's first in the same slot, so every pass waited ~13.5 ms
 # for block 0's copy (measured; 3 divides 57: tile512 pass 0.869 -> 0.859 s, +191 MB; docs/engine/07-cuda-graphs.md).
 # FLUX_GRAPH_MAX shapes (batch, image tokens, text tokens) keep their graphs, the least recently used dropped beyond
-# it: a walk uses up to FLUX_BATCH (1..4 windows a pass).
+# it: a walk uses up to FLUX_BATCH (1..8 windows a pass; graphs are opt-in).
 FLUX_SLOT_RING = 3
 FLUX_GRAPH_MAX = 4
 # First-block cache (Task 8, docs/engine/08-block-cache.md): a pass skips blocks 1..56 while block 0's residual has

@@ -109,6 +109,40 @@ def _unpin(ptrs) -> None:
         cudart.cudaHostUnregister(ptr)
 
 
+# The transformer's layers outside the blocks, run a window at a time by rowwise(): their M is the batch (the
+# time-text embedder, the output norm's modulation) or the batch x its tokens (the embedders, the projection out).
+ROWWISE = ("x_embedder", "context_embedder", "time_text_embed", "norm_out.linear", "proj_out")
+
+
+class _Rows:
+    """A module's forward over each row of the batch alone (every argument split along dim 0), concatenated."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __call__(self, *args):
+        import torch
+
+        n = args[0].shape[0]
+        if n == 1:
+            return self.inner(*args)
+        return torch.cat([self.inner(*(a[i:i + 1] for a in args)) for i in range(n)])
+
+
+def rowwise(transformer) -> None:
+    """Make a batched pass give each window exactly what it gets alone (Task 9, docs/engine/09-batching.md).
+
+    The blocks already do: every token-facing GEMM is the engine's (its sums per row don't depend on M), the
+    modulation GEMV reads its rows apart and attention is per window (measured: all 57 blocks bit-identical given the
+    same inputs). The layers outside them run cuBLAS bf16 GEMMs, which pick their algorithm by M, so a window's
+    time-text embedding rounded one ulp apart in a batch, and under w4a8 that grew into a different sample (25.7 dB
+    against batch 1). These layers are a few MFLOP a window: ROWWISE runs them a window at a time. Safe twice."""
+    for name in ROWWISE:
+        m = transformer.get_submodule(name)
+        if not isinstance(m.__dict__.get("forward"), _Rows):
+            m.forward = _Rows(m.forward)
+
+
 def _wrap_dist(w: int, at: float) -> np.ndarray:
     """Per column (centre), the distance round the cylinder to fraction `at`, in fractions of a turn (0..0.5)."""
     d = np.abs((np.arange(w) + 0.5) / w - at) % 1.0
@@ -194,6 +228,7 @@ class FluxPainter(Painter):
             from vecworld.engine.blocks import patch_blocks
 
             patch_blocks(tr)
+        rowwise(tr)                             # a window's pass is the same in any batch (Task 9)
         self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
         self.graphs = engine_graphs(self.kernel)
         self.cache_threshold = engine_cache_threshold(self.kernel)
