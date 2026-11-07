@@ -9,7 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
-| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08 | 2b, 3, 4, 5, 5b, 5c, 6, 7 |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08 | 2b, 3, 4, 5, 5b, 5c, 6, 7, 8 |
 
 ---
 
@@ -57,6 +57,12 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
   - Ring 3, not 2: with 57 (odd) blocks, ring 2 wraps block 0 onto block 56's slot.
   - Graphs are opt-in: no speed gain, but capture latency and extra memory.
   - Time async GPU work with CUDA events, not CPU clocks.
+- Entry 2, Task 8:
+  - Residual reuse skips blocks whose input barely moved.
+  - A 4-step distilled model moves 20–80% per step, so there is little to skip.
+  - Thresholds 0.3 and 0.25 failed the seam gate (up to +0.166); 0.2 passed vacuously, with 0 skips.
+  - The cache would buy 1.32× (tile, panorama) and 1.63× (walk step) at 0.3, and still ships off.
+  - On a chained walk, PSNR measures trajectory divergence, so the gate decides on seams.
 - Entry 2, Patterns so far: roofline first; data in registers; overlap loads with math; gate on the real output; measure before trusting estimates.
 
 **Understand.** The exact Q4_K bytes, `mma` tile shapes, the min-term algebra, CUDA graphs, block caching and glue fusion.
@@ -774,10 +780,12 @@ One 512 px window, one transformer pass (1024 image + 256 text tokens, 17.67 TFL
 | **Task 5c: modulation on a Q4_K GEMV** | **1.12** | 15.78 (bf16-equivalent) | 82.6% | 47.6 (47.0 when re-run in Task 6's session) |
 | **Task 6: glue fusion (bit-identical)** | **0.93** | 19.00 (bf16-equivalent) | 99.4% (see Task 6 for why this isn't "at the limit") | **39.5** (against 47.0 in the same session) |
 | **Task 7: fixed weight slots, eager by default (graphs opt-in)** | **0.85** (Task 6 re-run in the same session: 0.92) | 20.79 (bf16-equivalent) | 108.8% (bf16-equivalent, see Task 6) | **38.3** (Task 6 same session: 39.0) |
+| **Task 8: first-block cache, off by default; step unchanged** | **0.86** (Task 7 in its own session: 0.85) | 20.55 | 107.6% | unchanged (39.2 s wall in Task 8's bench session) |
+| *Task 8, would-be at threshold 0.3 (fails the quality gate, not shipped)* | *0.650 mean (1.32×)* | *27.19 nominal: work skipped, not done faster* | — | *24.6 s wall (1.59×; 1.63× per pass)* |
 
 From Task 5b on, "TFLOP/s" counts the same 17.67 TFLOP even though 75% of it runs as INT8, so it is **bf16-equivalent**: how fast a bf16 engine would need to be to match. It can pass the bf16 roof without breaking physics.
 
-Through Task 5c the step was 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step only 1.29× (61.4 → 47.6 s). After Task 6: step 2.95× (0.93 s), walk step 1.55× (39.5 s). After Task 7: step 3.2× (0.85 s), walk step 1.6× (38.3 s). Why the walk gains less is the first lesson of Task 5.
+Through Task 5c the step was 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step only 1.29× (61.4 → 47.6 s). After Task 6: step 2.95× (0.93 s), walk step 1.55× (39.5 s). After Task 7: step 3.2× (0.85 s), walk step 1.6× (38.3 s). Task 8 added no speed: its cache ships off. Why the walk gains less is the first lesson of Task 5.
 
 **How the Entry 1 estimates did.**
 
@@ -1339,6 +1347,102 @@ The speed-first goal gets nothing for those costs. Graphs do help when the CPU i
 
 ---
 
+### Task 8: first-block cache (built, measured, shipped off)
+
+`Must` for the plain version, why a 4-step model has little to skip, the vacuous pass, and "speed is never bought with an untested quality loss". `Understand` for residual reuse, the probe, the chained-walk PSNR effect and the multi-scene gate. `Skip` the slot hold/release bookkeeping and the cache-key details.
+
+> **Plain version.** Each FLUX block *adds* something to the running picture. If block 0's contribution barely changed since the last denoising step, the other 56 blocks' total contribution probably barely changed either, so reuse it and skip them. That's a first-block cache (TeaCache / First-Block-Cache). On FLUX-schnell it **does** buy speed: 1.32× on a tile, 1.32× on a panorama, 1.63× on a walk step at threshold 0.3. But schnell takes only 4 big steps, so a skip reuses a contribution from a quarter of the way back. On the new three-scene walk gate, every threshold that skipped anything **made seams worse** (up to +0.166). The only threshold that "passed" (0.2) **never skipped once**. So the cache **ships off**: we don't buy speed with a quality loss the gate hasn't approved. The code stays, tested, behind one config value.
+
+**Residual reuse** (`Understand`). A block computes `h_{i+1} = h_i + f_i(h_i)`, so blocks 1–56 add up to a residual `R = h_56 − h_0`. If `h_0` barely moved since the last step, reuse the stored R:
+
+```
+ computed pass:  x_emb ─[blk 0]─probe─[blk 1]─ ... ─[blk 56]─> output        store R = h56 − h0
+ skipped pass:   x_emb ─[blk 0]─probe─ h0 + R(stored) ─────────> output        56 blocks AND their weight copies skipped
+
+ probe:  rel(t) = |r0(t) − r0(t−1)|₁ / |r0(t−1)|₁      r0 = block 0's own residual
+         acc + rel < threshold → skip (acc += rel)      else compute (acc = 0, store new R)      step 0 never skips
+```
+
+A skipped pass costs block 0, the embedders, the output layers and one host sync: **21 ms** at batch 1 against 0.86 s. Skipping also skips the weight copies: `BlockSlots.hold` stops block 0 from prefetching block 3 into its slot, so a skip copies **0** bytes and the next full pass starts with blocks 0–2 already in place.
+
+**Why a 4-step distilled model has little to skip** (`Must`). The probe's measured `rel`, step to step:
+
+| | Step 1 | Step 2 | Step 3 | Step 4 |
+|---|---|---|---|---|
+| Panorama (sigmas 1, 0.75, 0.5, 0.25) | 0.83 | **0.23** | 0.29 | |
+| Walk step (`sharp`, 5 sigmas) | 0.62 | **0.19** | 0.23 | 0.29 |
+
+Thresholds published for 25–50-step models are **0.05–0.15**, and every step here is above that. Schnell is distilled to jump a quarter of the way from noise to image each step, so block 0's residual moves by **20–80%** between steps. Only the step right after the big first jump (0.19–0.23) is ever a candidate. Skipping it means reusing a residual from a quarter of the trajectory earlier. This is Entry 1 Technique 5's prediction (1.0–1.33× for a 4-step model), and the tile and panorama numbers (1.32×) land at its top.
+
+**The sweep** (`Must`). Three scenes × 6 spots, against cache-off base walks. Pass = no spot's seam more than 0.03 above its base.
+
+| Threshold | Skips (panorama / per walk step) | Worst seam rise | Min PSNR vs cache-off | Gate |
+|---|---|---|---|---|
+| 0.3 | 2 of 8 / 2–4 of 10 | **+0.150 / +0.131 / +0.153** (forest / desert / coast) | 21.70 dB | **fail**, all 3 scenes |
+| 0.25 (added between) | 0–2 / 2 | **+0.166 / +0.074 / +0.082** | 22.05 dB | **fail**, all 3 scenes |
+| 0.2 | **0 / 0 in all 18 jobs** | 0 (byte-identical) | inf | **"pass", vacuously** |
+| 0.15, 0.1, 0.05 | pruned: every probe on these walks was ≥ 0.2, so they skip nothing either | — | — | not walked |
+
+**A vacuous pass isn't a pass** (`Must`). 0.2 passed only because it never did anything on the gate's walks. Yet on the bench prompt a walk step probes **0.19** and *would* skip, a lossy path the gate never saw. Shipping 0.2 would buy no measured speed, add a ~1.5% probe cost per pass, and leave an ungated skip in the game. Ruling: **threshold 0.0** (off), over the brief's "largest passing threshold". The review asked the gate to flag this case in future (M4: a lossy setting that changes nothing should read "pass, nothing exercised").
+
+**What the cache would buy at 0.3** (`Must`). Same session, measured. Labelled because it's **not shipped**:
+
+| | Off | Threshold 0.3 | Speedup |
+|---|---|---|---|
+| tile512, s per pass (mean of 4; one pass skipped at **0.021 s**) | 0.859 | 0.650 | **1.32×** |
+| Panorama: s per pass (mean of 8) / wall | 3.49 / 29.7 s | 2.65 / 22.7 s | **1.32× / 1.31×** |
+| Walk step: s per pass (mean of 10) / wall | 3.78 / 39.2 s | 2.32 / 24.6 s | **1.63× / 1.59×** |
+| Nominal TFLOP/s (tile512) | 20.55 | 27.19 (above the bf16 roof because work is *skipped*, not done faster) | |
+
+That is a large win, and it still ships off. **Speed is never bought with a quality loss the gate hasn't approved.** The ruling's cost-if-wrong: 1.3–1.6× left on the table until a smarter probe or a panorama-only cache passes a gate.
+
+**Why PSNR diverges on a chained walk after one skip** (`Understand`). Each walk step starts from the previous spot's picture. One skip changes spot 0 slightly (30.6–37.1 dB against cache-off: a softer, hazier panorama, same composition). Spot 1 then starts from a *different picture*, and four denoising steps grow the difference into different details: **22–29 dB from spot 1 on**. The forest's spot 1 loses the house on the right. So per-spot PSNR along a chained walk measures **trajectory divergence**, not quality: a single skip anywhere upstream drags every later spot below 30 dB. That's why the ruling made the **seam** score, a quality metric, the deciding measure, with PSNR reported but not decisive. Seams moved both ways (some −0.25, some +0.17), and the gate fails on the worsening.
+
+**The new multi-scene relative gate** (`Understand`). Task 6 had already shown one scene is too noisy for a fixed limit (spot 1 sits at 1.15 > 1.1 even lossless). From Task 8 on, the gate is:
+- three deterministic scenes ("haunted forest" seed 7, "red desert" 11, "stormy coast" 23), 6 spots each;
+- base walks with the change off, at the task's BASE;
+- pass = **no spot's seam more than 0.03 above the same spot of its base**, in every scene; per-spot PSNR is reported;
+- `walk_sheet.py --scenes ... --relative BASE CAND`, reused as the gate for Tasks 9 and 10.
+
+The review's follow-ups for it: check that base and candidate are the same scene and route (M3), and flag vacuous passes (M4).
+
+**An untested future option: a panorama-only cache** (`Understand`). The panorama alone did look acceptable at 0.3: spot 0 scored 30.6 / 37.1 / 32.3 dB against cache-off, inside the 30 dB floor, for 1.31× on the first panorama the player waits for (29.7 → 22.7 s wall). It was **never gated on its own**. In the 0.3 walks the walk steps skipped too, and a changed panorama still seeds every later spot. Turning it on would need its own gate: cache the panorama only, and check that the walk that follows doesn't regress on seams in all three scenes.
+
+**Results.** Default off, so the step is unchanged: **0.86 s**, 20.55 TFLOP/s in Task 8's session (Task 7's own session: 0.85 / 20.79). The probe alone, when on, costs about +1.5% per pass.
+
+**In an interview.** "I built a first-block residual cache for FLUX-schnell. It measured 1.32× on a panorama and 1.63× on a walk step, and I shipped it off. Schnell takes four big steps, so block 0's residual moves 20–80% per step, far above the thresholds used for 50-step models. Every threshold that actually skipped worsened seams on a three-scene end-to-end gate, and the only passing threshold never skipped, which is a vacuous pass, not evidence. On a chained walk PSNR measures trajectory divergence, so I gated on a seam metric instead."
+
+**Tried and not chosen** (`Understand`):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **Threshold 0.3** (largest in the brief's sweep) | 1.32× tile/panorama, 1.63× walk-step passes; worst seam +0.153; min PSNR 21.70 dB | Fails the seam gate in all 3 scenes | A model with many small steps (25–50), where adjacent steps barely differ |
+| **Threshold 0.25** (added) | 0–2 panorama skips, 2 per walk step; worst +0.166 | One skip per batch per step is enough to change a chained walk | Same as 0.3 |
+| **Threshold 0.2** | 0 skips in 18 jobs; byte-identical walks; would skip at 0.19 on the bench prompt | Vacuous pass: no measured gain, an ungated lossy path, +~1.5% probe cost | Never as a default; a gate that exercises it could change that |
+| **0.15 / 0.1 / 0.05** | Not walked: every probe on these walks was ≥ 0.2, so they skip nothing | Provably identical to 0.2 (and to off) on the gate | Many-step models (where these are the usual values) |
+| **A panorama-only cache** | Spot 0 at 0.3: 30.6–37.1 dB, 1.31× panorama wall; never gated alone | Untested: a changed panorama seeds the whole walk | If a gate shows the following walk doesn't regress; it speeds up the wait players notice most |
+| **Cache decision inside `engine/graphs.py`** (the brief's place) | Graphs are off by default since Task 7 | It would only work on the opt-in path; the shared pass loop serves both (tested on both) | — |
+| **Skipping the compute but keeping the slot prefetch** | A skip would still copy block 3 (14 ms), and the next pass would find the wrong block in slot 0 (another 14 ms stall) | `hold` / `release` makes a skip copy nothing (tested) | — |
+| **Probe against the last *computed* step** (ParaAttention FBCache) instead of step to step | Not measured separately | The step-to-step sum is the stricter of the two (it bounds the change since the last compute); the gate fails at the first skip either way | A many-step model, where the looser probe skips more |
+| **Per-window cache keys** | Not built | Nothing passes; exact (job, window-tuple) keys are never wrong, only miss more | Task 9 batches windows differently; needed if the cache is ever turned on |
+| **Cache on the reference path (`VECWORLD_KERNEL=off`)** | — | Group offload's prefetch order assumes every block runs; skipping would desynchronise it | Never on that path |
+
+<details><summary>Check yourself (Task 8)</summary>
+
+**Q1.** Published first-block caches skip 30–50% of steps at thresholds of 0.05–0.15. Why does FLUX-schnell skip nothing below 0.2?
+
+**A1.** Schnell is distilled to 4 steps, each moving a quarter of the way from noise to image, so block 0's residual changes by 20–80% between steps (measured rel 0.19–0.83). Thresholds tuned for 25–50 small steps sit below every step here. Only the step right after the first big jump comes close.
+
+**Q2.** Threshold 0.2 passed the gate with zero seam change. Why wasn't it shipped?
+
+**A2.** It passed because it never skipped, on any of the 18 gate jobs, so the gate tested nothing lossy. Yet it would skip on other prompts (the bench prompt probes 0.19). Shipping it means an ungated lossy path, no measured speedup and a probe cost on every pass.
+
+</details>
+
+> **Remember this:** a big speedup with an unapproved quality loss isn't a win, and a "pass" that exercised nothing isn't a pass. On a 4-step distilled model, adjacent steps are too different to reuse.
+
+---
+
 ### Patterns so far
 
 `Must`
@@ -1350,6 +1454,7 @@ The speed-first goal gets nothing for those costs. Graphs do help when the CPU i
 > 5. **Measure before trusting an estimate.** Task 5 beat its estimate (92% of cuBLAS, not 65–85%), Task 5b fell short (1.5×, not 2–4×), and Task 5c's 0.29 s premise was stale. Task 6's "0.4 s of glue" was 68 ms, and the real cost (RoPE, 147 ms) wasn't in the plan at all. Task 7's launch overhead was 0.34%; the real 10.9% was offload syncs. Re-measure the thing you're about to optimize, and keep the ablation builds.
 > 6. **Make lossless changes bit-identical** (Task 6). Then the gate proves Δ = 0 instead of arguing about noise, which matters most upstream of a lossy stage like W4A8.
 > 7. **Amdahl moves the target.** Each speedup makes the untouched parts a bigger share: glue went from small to 31% of GPU time by Task 5c, and after Task 6 the GEMMs are 85% again.
+> 8. **Never buy speed with an unapproved quality loss, and don't trust a vacuous pass** (Task 8). The cache measured 1.32–1.63× and shipped off; the threshold that "passed" had skipped nothing.
 
 ---
 
