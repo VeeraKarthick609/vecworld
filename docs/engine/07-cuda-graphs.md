@@ -222,7 +222,17 @@ other threads mostly wait on I/O, so this is a stress case, not today's game, bu
 Relative walk gate (ruling 2026-11-06): no spot worse than the base walk by more than 0.03. Base: `~/walk-archive/t7-base`
 (BASE ee3baae, w4a8 + fused, git recorded); ours: `~/walk-archive/t7` at the final commit.
 
-WALK_TABLE
+| spot | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| t7-base (ee3baae, w4a8 + fused, group offload) | 0.726 | 1.151 | 0.898 | 1.079 | 0.879 | 0.576 |
+| **t7 (931c3ad, w4a8 + fused, slots + graphs)** | **0.726** | **1.151** | **0.898** | **1.079** | **0.879** | **0.576** |
+| Δ | 0 | 0 | 0 | 0 | 0 | 0 |
+
+All six spot images are **byte-identical** to the base (`cmp`), so the gate passes and `VECWORLD_GRAPHS` is on by
+default. Both walks record kernel w4a8, the same 8-pattern keep-list and their git sha (the t7 walk also
+`graphs: true`, on a clean tree). The fixed 1.1 limit is reported, not gated: spot 1 scores 1.151 in both, as at
+Task 6. Mean walk step (spots 1..5) 47.5 s base, 46.9 s t7; the t7 panorama (spot 0) is 4.7 s slower, its first
+passes capturing the graphs. Sheet: `~/walk-archive/t7-vs-base.png` (looked at: the same pictures).
 
 ## Tried and not chosen
 
