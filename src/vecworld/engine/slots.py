@@ -13,6 +13,7 @@ stream; CUDA events order the copy after the slot's previous user (block i - rin
 So block i + 1's copy overlaps block i's compute. A block that runs out of order (or first) has its copy issued on
 demand. Task 10 grows this into BlockStreamer (reads from the SSD instead of host memory).
 """
+import threading
 from collections.abc import Callable
 
 import torch
@@ -57,7 +58,12 @@ class BlockSlots:
                                      f"{tuple(t.shape)}")
                 lay[name] = off
                 off += -(-ht.numel() * ht.element_size() // ALIGN) * ALIGN
-            self._host.append({k: h[k].contiguous() for k in mine})
+            bad = [k for k in mine if not h[k].is_contiguous()]
+            if bad:
+                # Loud, like check_aligned: a contiguous copy would be pageable (no asynchronous copy) and close()
+                # would hand it back in place of the page-locked original.
+                raise ValueError(f"block {i}: host tensors {bad} are not contiguous")
+            self._host.append({k: h[k] for k in mine})
             self._layout.append(lay)
             size = max(size, off)
         self.slot_bytes = size
@@ -80,9 +86,12 @@ class BlockSlots:
         self._freed = [torch.cuda.Event() for _ in range(ring)]    # slot s's last user ended (recorded on main)
         self._used = [False] * ring
         self.copies = 0
+        self._owner: int | None = None                      # the thread that ran the first block (see before())
+        # always_call: the slot is released after a block whose forward raised too, ordered after whatever kernels
+        # it queued, so a later copy into the slot can't overwrite weights they still read
         self._hooks = [h for i, b in enumerate(self.blocks) for h in (
             b.register_forward_pre_hook(lambda m, a, i=i: self.before(i)),
-            b.register_forward_hook(lambda m, a, o, i=i: self.after(i)))]
+            b.register_forward_hook(lambda m, a, o, i=i: self.after(i), always_call=True))]
 
     def next_user(self, i: int) -> int:
         """The block that uses block i's slot after it, cyclically (the blocks repeat every pass)."""
@@ -102,7 +111,14 @@ class BlockSlots:
         self.copies += 1
 
     def before(self, i: int) -> None:
-        """Block i is about to run: make the current stream wait for its weights."""
+        """Block i is about to run: make the current stream wait for its weights. The slots' bookkeeping and event
+        order assume one thread (the game's GPU queue worker): the first block run claims the slots for its thread
+        and a block run from any other thread raises."""
+        me = threading.get_ident()
+        if self._owner is None:
+            self._owner = me
+        elif self._owner != me:
+            raise RuntimeError(f"BlockSlots belongs to thread {self._owner}; block {i} was run from thread {me}")
         s = i % self.ring
         if self.loaded[s] != i:
             self.load(i)

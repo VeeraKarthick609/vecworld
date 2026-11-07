@@ -10,6 +10,7 @@ transformer to diffusers' group offload, runs last.
 """
 import gc
 import threading
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -87,6 +88,70 @@ def test_slots_stream_blocks_in_any_order():
     for b, h in zip(blocks, host):                           # close() puts the host tensors back
         assert all(t.device.type == "cpu" for t in b.parameters())
         assert torch.equal(b.w, h["w"])
+
+
+def test_slots_refuse_a_non_contiguous_host_tensor():
+    """A non-contiguous host tensor would need a pageable copy (no async transfer, and close() would put the copy back
+    in place of the page-locked original), so BlockSlots raises instead of copying it."""
+    from vecworld.engine.slots import BlockSlots
+
+    blocks, host = _toys(2)
+    host[1]["w"] = host[1]["w"].t().contiguous().t()                 # same shape, transposed strides
+    with pytest.raises(ValueError, match="contiguous"):
+        BlockSlots(blocks, lambda i: host[i], ring=2)
+
+
+def test_slot_is_released_after_its_block_when_the_block_raises():
+    """A block whose forward raises still marks its slot free after the kernels it queued, and starts the next user's
+    copy (an always-called hook), so a later copy is ordered after them; the next pass computes correctly."""
+    from vecworld.engine.slots import BlockSlots
+
+    blocks, host = _toys(5)
+    ref = [Toy(i).cuda() for i in range(5)]
+    s = BlockSlots(blocks, lambda i: host[i], ring=2)
+    x = torch.randn(8, 64, device="cuda").bfloat16()
+    orig = Toy.forward
+
+    def boom(self, x):
+        orig(self, x)                                       # queue its kernels, then fail
+        raise RuntimeError("boom")
+
+    with torch.inference_mode():
+        blocks[0](x)
+        blocks[1].forward = types.MethodType(boom, blocks[1])
+        with pytest.raises(RuntimeError, match="boom"):
+            blocks[1](x)
+        del blocks[1].forward
+        assert s._used[1] and s.loaded[1] == s.next_user(1)  # released, the slot's next user on its way in
+        for i in range(5):
+            assert torch.equal(blocks[i](x), ref[i](x)), i
+    s.close()
+
+
+def test_slots_refuse_another_thread():
+    """BlockSlots' state and event ordering assume one thread (the game's GPU queue worker): a block run from a
+    second thread raises instead of interleaving."""
+    from vecworld.engine.slots import BlockSlots
+
+    blocks, host = _toys(3)
+    s = BlockSlots(blocks, lambda i: host[i], ring=2)
+    x = torch.randn(8, 64, device="cuda").bfloat16()
+    with torch.inference_mode():
+        blocks[0](x)
+    err = []
+
+    def other():
+        try:
+            with torch.inference_mode():
+                blocks[1](x)
+        except RuntimeError as e:
+            err.append(str(e))
+
+    t = threading.Thread(target=other)
+    t.start()
+    t.join()
+    assert err and "thread" in err[0]
+    s.close()
 
 
 # --- the attached quantization's staleness guard ----------------------------------------------------------------------
@@ -210,6 +275,61 @@ def test_graph_matches_eager(eng):
     # replay pass: no Python block forward at all, every block replayed
     assert c2 == c1 and q2 == q1
     assert s2["replays"] - s1["replays"] == nd + ns and s2["captures"] == s1["captures"]
+
+
+def _block0_inputs(e, seed=0):
+    """Inference-tensor inputs for block 0 called on its own (1 window, 1024 + 256 tokens), as the painter's pass makes
+    them: hidden / text streams, temb, rotary tables."""
+    g = torch.Generator().manual_seed(seed)
+    L, T = 1024, 256
+    ids = torch.zeros(T + L, 3, device="cuda")
+    ids[T:, 1], ids[T:, 2] = torch.arange(L, device="cuda") // 32, torch.arange(L, device="cuda") % 32
+    with torch.inference_mode():
+        return dict(hidden_states=torch.randn(1, L, H, generator=g).to("cuda", torch.bfloat16),
+                    encoder_hidden_states=torch.randn(1, T, H, generator=g).to("cuda", torch.bfloat16),
+                    temb=torch.randn(1, H, generator=g).to("cuda", torch.bfloat16),
+                    image_rotary_emb=e.tr.pos_embed(ids))
+
+
+def _block0(e, kw, graphs):
+    e.runner.enabled = graphs
+    with torch.inference_mode():
+        out = e.tr.transformer_blocks[0](**kw)
+        out = [t.clone() for t in out]                      # graph outputs are reused buffers: keep a copy
+    torch.cuda.synchronize()
+    return out
+
+
+def test_graph_input_written_in_place_is_copied_again(eng):
+    """The same input tensors written in place between calls (inference tensors: no version counter) are copied into
+    the graph's static buffers again: the replay equals eager on the new values, not the old ones."""
+    kw = _block0_inputs(eng, seed=21)
+    _block0(eng, kw, graphs=True)                           # capture (or replay) with the first values
+    with torch.inference_mode():
+        for t in (kw["hidden_states"], kw["temb"], kw["image_rotary_emb"][0]):
+            t.mul_(1.5)
+    got = _block0(eng, kw, graphs=True)
+    want = _block0(eng, kw, graphs=False)
+    assert all(torch.equal(a, b) for a, b in zip(got, want))
+
+
+def test_runner_refuses_another_thread(eng):
+    """A block run through the GraphRunner from a thread other than the one that first ran it raises."""
+    kw = _block0_inputs(eng, seed=22)
+    _block0(eng, kw, graphs=True)
+    err = []
+
+    def other():
+        try:
+            with torch.inference_mode():
+                eng.tr.transformer_blocks[0].forward(**kw)  # the runner's forward, past the slots' hooks
+        except RuntimeError as e:
+            err.append(str(e))
+
+    t = threading.Thread(target=other)
+    t.start()
+    t.join()
+    assert err and "thread" in err[0]
 
 
 def test_graph_shape_change(eng):

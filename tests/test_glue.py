@@ -131,6 +131,20 @@ def test_rnm_quantize_matches_quantize_act(m):
         assert a.dtype == b.dtype and torch.equal(a, b)
 
 
+def test_gated_residual_into_out():
+    """gated_residual(out=) writes the same values into the given buffer and returns it; a buffer of the wrong shape
+    is refused."""
+    from vecworld.engine.glue import gated_residual
+
+    res, y, gate, _, _ = _inputs(2 * 256, 2, seed=31)
+    want = gated_residual(res, y, gate)
+    out = torch.full_like(res, 7.0)
+    got = gated_residual(res, y, gate, out=out)
+    assert got.data_ptr() == out.data_ptr() and torch.equal(out, want)
+    with pytest.raises(RuntimeError):
+        gated_residual(res, y, gate, out=torch.empty(2 * 256 - 1, H, device="cuda", dtype=torch.bfloat16))
+
+
 def _rope_tables(T, L):
     """FLUX's rotary cos / sin (fp32 [T + L, 128]) for T text tokens and a 32-wide image grid of L tokens."""
     from diffusers.models.transformers.transformer_flux import FluxPosEmbed
@@ -307,6 +321,36 @@ def test_patched_block_matches_unpatched(two, kernel):
         assert torch.isfinite(ours).all()
         assert err < 2e-2
         assert torch.equal(ours, ref)                       # the glue rounds as diffusers does: bit-identical
+
+
+def test_double_block_out_buffers_with_an_ip_adapter_output(two):
+    """The fused double block given out= (a CUDA graph's buffers) writes both outputs into them, also when the
+    attention returns an IP-adapter output that is added to the image stream after the residual; the values equal
+    the same block without out=."""
+    from diffusers.models.transformers.transformer_flux import FluxAttnProcessor
+
+    from vecworld.engine.blocks import double_forward
+
+    class IPProcessor(FluxAttnProcessor):                   # not the plain processor: the block calls attn(...)
+        def __call__(self, *a, **k):
+            o = super().__call__(*a, **k)
+            return (*o, torch.ones_like(o[0]) * 0.25)
+
+    m, kw = two
+    blk = m.transformer_blocks[0]
+    blk.to("cuda")
+    proc = blk.attn.processor
+    try:
+        blk.attn.set_processor(IPProcessor())
+        with torch.inference_mode():
+            want = double_forward(blk, **kw)
+            out = (torch.empty_like(want[0]), torch.empty_like(want[1]))
+            got = double_forward(blk, **kw, out=out)
+    finally:
+        blk.attn.set_processor(proc)
+        blk.to("cpu")
+    assert got[0].data_ptr() == out[0].data_ptr() and got[1].data_ptr() == out[1].data_ptr()
+    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
 
 
 def test_patch_blocks_counts_and_skips_patched(two):

@@ -20,6 +20,7 @@ ping-pong buffers, allocated outside the pool), so every graph's intermediates m
 whatever order the graphs replay in.
 """
 import inspect
+import threading
 import weakref
 from collections import Counter, OrderedDict
 
@@ -32,17 +33,18 @@ BLOCK_LISTS = ("transformer_blocks", "single_transformer_blocks")
 
 
 class _Shared:
-    """A static input buffer and (weakly) the source last copied into it: the copy is skipped while the same tensor,
-    unwritten since (its version, when it tracks one), comes again, as temb and the rotary tables do for every block
-    of a pass."""
+    """A static input buffer and (weakly) the source last copied into it. Block 0 always copies (force): a caller may
+    hand the same tensor object again with new values written in place, and an inference tensor has no version
+    counter to tell. Later blocks of the same pass skip the copy while the very same tensor comes again (temb and the
+    rotary tables, for blocks 1..56)."""
 
     def __init__(self, like: torch.Tensor):
         self.t = torch.empty(like.shape, dtype=like.dtype, device=like.device)
         self.src, self.ver = None, None
 
-    def fill(self, src: torch.Tensor) -> torch.Tensor:
+    def fill(self, src: torch.Tensor, force: bool = False) -> torch.Tensor:
         ver = None if src.is_inference() else src._version
-        if self.src is None or self.src() is not src or ver != self.ver:
+        if force or self.src is None or self.src() is not src or ver != self.ver:
             self.t.copy_(src)
             self.src, self.ver = weakref.ref(src), ver
         return self.t
@@ -82,7 +84,15 @@ class GraphRunner:
     Blocks run outside inference mode (under no_grad), so their activations track versions and the fused glue's
     attached quantization can be checked for staleness (q4k.attach_quantized).
 
-    stats counts "captures", "replays", "eager" block calls and key "evictions"."""
+    stats counts "captures", "replays", "eager" block calls and key "evictions".
+
+    With graphs, a block's returned outputs are the key's fixed ping-pong buffers, the same tensor objects on every
+    call: they are overwritten by the next call of the same block, and within a pass by block i + 2 (same parity).
+    The transformer consumes each output before then; a caller that keeps a block output (a residual cache, a debug
+    hook) must clone it. Eager calls return fresh tensors. All calls must come from one thread (the first caller's).
+
+    Off by default in the painter since the Task 7 review (VECWORLD_GRAPHS=1 to opt in): eager on the slots is as fast
+    and the graphs cost captures on each new shape and memory (docs/engine/07-cuda-graphs.md)."""
 
     def __init__(self, blocks: list[torch.nn.Module], slots: BlockSlots | None, max_graphs: int = FLUX_GRAPH_MAX,
                  enabled: bool = True):
@@ -90,6 +100,7 @@ class GraphRunner:
         self.stats: Counter = Counter()
         self.pool = torch.cuda.graph_pool_handle()
         self._keys: OrderedDict[tuple, _Key] = OrderedDict()
+        self._owner: int | None = None
         self._inner, self._own = [], []
         for i, b in enumerate(self.blocks):
             self._own.append("forward" in b.__dict__)
@@ -123,6 +134,11 @@ class GraphRunner:
 
     def _run(self, i, hs, es, temb, rot, kwargs):
         inner, takes_out = self._inner[i]
+        me = threading.get_ident()                          # one thread, as BlockSlots (unsynchronised state)
+        if self._owner is None:
+            self._owner = me
+        elif self._owner != me:
+            raise RuntimeError(f"GraphRunner belongs to thread {self._owner}; block {i} was run from thread {me}")
         with torch.inference_mode(False), torch.no_grad():
             if (not self.enabled or kwargs or rot is None or hs.dtype != torch.bfloat16 or not hs.is_cuda):
                 self.stats["eager"] += 1
@@ -137,11 +153,12 @@ class GraphRunner:
                     ins[0].copy_(es)
                     ins[1].copy_(hs)
                 else:
-                    k.shared["es"].fill(es)
-                    k.shared["hs"].fill(hs)
-            k.shared["temb"].fill(temb)
-            k.shared["cos"].fill(rot[0])
-            k.shared["sin"].fill(rot[1])
+                    k.shared["es"].fill(es, force=True)
+                    k.shared["hs"].fill(hs, force=True)
+            first = i == 0                                  # a new pass: copy everything again (see _Shared)
+            k.shared["temb"].fill(temb, first)
+            k.shared["cos"].fill(rot[0], first)
+            k.shared["sin"].fill(rot[1], first)
             k.graphs[i].replay()
             self.stats["replays"] += 1
             return k.outs[i]
@@ -150,7 +167,7 @@ class GraphRunner:
         s = k.shared.get(name)
         if s is None:
             s = k.shared[name] = _Shared(src)
-        return s.fill(src)
+        return s.fill(src, force=True)
 
     def _capture(self, k, i, inner, takes_out, hs, es, temb, rot):
         prev = k.outs[i - 1] if i > 0 else None

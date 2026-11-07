@@ -16,7 +16,7 @@ crossfade. The differences:
   (vecworld.engine; VECWORLD_KERNEL, default FLUX_KERNEL = "w4a8") instead of diffusers' dequantize-then-matmul, its
   blocks run their norm / modulate / residual and q / k norm + RoPE glue fused (VECWORLD_FUSE, default on with an
   engine kernel), bit-identical to diffusers', and they stream block by block through fixed-address weight slots,
-  each replayed as a CUDA graph (VECWORLD_GRAPHS, default on with an engine kernel; "0": eager on the same slots).
+  optionally replayed as CUDA graphs (VECWORLD_GRAPHS=1; default off: eager on the same slots, as fast).
   VECWORLD_KERNEL=off keeps diffusers for all of it, streamed with diffusers' group offload.
 """
 import math
@@ -144,8 +144,8 @@ class FluxPainter(Painter):
     VECWORLD_FUSE (vecworld.engine.engine_fuse; unset: on with an engine kernel, off under "off") patches the blocks to
     run their glue fused (vecworld.engine.blocks, bit-identical to diffusers'); self.fused records it.
     Under an engine kernel the blocks stream through FLUX_SLOT_RING fixed-address weight slots (vecworld.engine.slots)
-    instead of diffusers' group offload, and VECWORLD_GRAPHS (vecworld.engine.engine_graphs; unset: on) replays each
-    as a CUDA graph per input shape (vecworld.engine.graphs, bit-identical to eager); self.graphs records it.
+    instead of diffusers' group offload, and VECWORLD_GRAPHS=1 (vecworld.engine.engine_graphs; unset: off) replays
+    each as a CUDA graph per input shape (vecworld.engine.graphs, bit-identical to eager); self.graphs records it.
     """
 
     style = FLUX_STYLE
@@ -237,14 +237,19 @@ class FluxPainter(Painter):
         can't paint after it."""
         self._closed = True
         runner, slots = getattr(self, "_runner", None), getattr(self, "_slots", None)
+        ptrs = getattr(self, "_pinned", [])
         self._runner = self._slots = None
-        if runner is not None:
-            runner.close()
-        if slots is not None:
-            slots.close()                   # waits for the copies from the pinned memory before it is released
-        ptrs, self._pinned = getattr(self, "_pinned", []), []
-        if ptrs:
-            _unpin(ptrs)
+        self._pinned = []
+        try:
+            if runner is not None:
+                runner.close()              # may raise (its sync surfaces a pending CUDA error): free the rest anyway
+        finally:
+            try:
+                if slots is not None:
+                    slots.close()           # waits for the copies from the pinned memory before it is released
+            finally:
+                if ptrs:
+                    _unpin(ptrs)
 
     def __del__(self):
         try:

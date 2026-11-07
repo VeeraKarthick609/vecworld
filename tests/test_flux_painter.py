@@ -543,18 +543,18 @@ def test_painter_patches_blocks_when_fused(monkeypatch):
         assert order == want, (kernel, fuse)
 
 
-def test_graphs_default_on_with_an_engine_kernel(monkeypatch):
-    """VECWORLD_GRAPHS (vecworld.engine.engine_graphs, one rule for the painter and the bench): unset or empty, the
-    blocks replay as CUDA graphs under every engine kernel; "0" / "off" runs them eagerly on the same weight slots;
-    "1" / "on" asks for graphs. Under VECWORLD_KERNEL=off there are no slots (diffusers' group offload), so never
+def test_graphs_default_off_opt_in(monkeypatch):
+    """VECWORLD_GRAPHS (vecworld.engine.engine_graphs, one rule for the painter and the bench): unset, empty, "0" or
+    "off", the blocks run eagerly on the fixed weight slots (the default since the Task 7 review: graphs tie with
+    eager and cost first-use captures and memory); "1" / "on" replays them as CUDA graphs under an engine kernel. Under VECWORLD_KERNEL=off there are no slots (diffusers' group offload), so never
     graphs. Anything else is refused."""
     from vecworld.engine import engine_graphs
 
     monkeypatch.delenv("VECWORLD_GRAPHS", raising=False)
     for kernel in ("w4a8", "mma", "tiled", "naive"):
-        assert engine_graphs(kernel) is True
+        assert engine_graphs(kernel) is False
     assert engine_graphs(None) is False
-    for value, want in (("", True), ("0", False), ("off", False), ("1", True), ("on", True)):
+    for value, want in (("", False), ("0", False), ("off", False), ("1", True), ("on", True)):
         monkeypatch.setenv("VECWORLD_GRAPHS", value)
         assert engine_graphs("w4a8") is want, value
         assert engine_graphs(None) is False, value
@@ -595,8 +595,8 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
         raise Loaded
 
     monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", stop_at_vae)
-    for kernel, graphs, want in ((None, None, ["swap", "patch", "pin", "slots graphs=True"]),
-                                 ("mma", "0", ["swap", "patch", "pin", "slots graphs=False"]),
+    for kernel, graphs, want in ((None, None, ["swap", "patch", "pin", "slots graphs=False"]),
+                                 ("mma", "1", ["swap", "patch", "pin", "slots graphs=True"]),
                                  ("off", None, ["pin", "offload"]), ("off", "1", ["pin", "offload"])):
         for k in ("VECWORLD_KERNEL", "VECWORLD_FUSE", "VECWORLD_GRAPHS"):
             monkeypatch.delenv(k, raising=False)
@@ -608,3 +608,28 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
         with pytest.raises(Loaded):
             FluxPainter()
         assert order == want, (kernel, graphs)
+
+
+def test_close_frees_slots_and_unpins_even_if_the_runner_fails(monkeypatch):
+    """FluxPainter.close() still closes the weight slots and unregisters the page-locked host memory when closing the
+    graph runner raises (e.g. a sticky CUDA error surfacing in its sync); the error is raised after that."""
+    import vecworld.flux.painter as painter_mod
+
+    done = []
+
+    class Runner:
+        def close(self):
+            raise RuntimeError("sticky CUDA error")
+
+    class Slots:
+        def close(self):
+            done.append("slots")
+
+    monkeypatch.setattr(painter_mod, "_unpin", lambda ptrs: done.append(("unpin", tuple(ptrs))))
+    p = fake_painter()
+    p._runner, p._slots, p._pinned = Runner(), Slots(), [1, 2]
+    with pytest.raises(RuntimeError, match="sticky"):
+        p.close()
+    assert done == ["slots", ("unpin", (1, 2))]
+    assert p._runner is None and p._slots is None and p._pinned == []
+    p.close()                                               # safe twice

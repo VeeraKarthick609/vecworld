@@ -43,12 +43,13 @@ def engine_fuse(kernel: str | None) -> bool:
 def engine_graphs(kernel: str | None) -> bool:
     """Whether the FLUX blocks replay as CUDA graphs (vecworld.engine.graphs, docs/engine/07-cuda-graphs.md), the one
     rule for the painter and the bench. Under an engine kernel the blocks always run from fixed-address weight slots
-    (engine.slots); VECWORLD_GRAPHS unset or empty, "1" / "on": replayed as graphs; "0" / "off": run eagerly on the
-    same slots. Under "off" (kernel None) the blocks stay on diffusers' group offload, so never graphs."""
+    (engine.slots); VECWORLD_GRAPHS unset, empty, "0" / "off": run eagerly on them (the default: as fast, without the
+    graphs' first-use captures and memory); "1" / "on": replayed as graphs. Under "off" (kernel None) the blocks stay
+    on diffusers' group offload, so never graphs."""
     v = (os.environ.get("VECWORLD_GRAPHS") or "").strip().lower()
     if v and v not in FUSE_ON + FUSE_OFF:
-        raise ValueError(f"VECWORLD_GRAPHS={v!r}; use 1 / on or 0 / off (unset: on with an engine kernel)")
-    return kernel is not None and v not in FUSE_OFF
+        raise ValueError(f"VECWORLD_GRAPHS={v!r}; use 1 / on or 0 / off (unset: off, eager on the weight slots)")
+    return kernel is not None and v in FUSE_ON
 
 
 def keep_for(kernel: str | None) -> tuple[str, ...]:
