@@ -12,11 +12,12 @@ crossfade. The differences:
   Euler step per sigma on the window-averaged velocity. No guidance, no CFG.
 - Text: T5-XXL sequence embeddings (vecworld.flux.text, GPU block by block, cached) plus CLIP-L pooled (GPU).
   A Prompt's texts blend as a weighted sum of both.
-- The transformer is the 4-bit GGUF through diffusers, streamed block by block with diffusers' group offload.
-  Its Q4_K linears run on the engine's hand-written kernel (vecworld.engine; VECWORLD_KERNEL, default FLUX_KERNEL =
-  "w4a8") instead of diffusers' dequantize-then-matmul, and its blocks run their norm / modulate / residual and
-  q / k norm + RoPE glue fused (VECWORLD_FUSE, default on with an engine kernel), bit-identical to diffusers'.
-  VECWORLD_KERNEL=off keeps diffusers for all of it.
+- The transformer is the 4-bit GGUF through diffusers. Its Q4_K linears run on the engine's hand-written kernel
+  (vecworld.engine; VECWORLD_KERNEL, default FLUX_KERNEL = "w4a8") instead of diffusers' dequantize-then-matmul, its
+  blocks run their norm / modulate / residual and q / k norm + RoPE glue fused (VECWORLD_FUSE, default on with an
+  engine kernel), bit-identical to diffusers', and they stream block by block through fixed-address weight slots,
+  each replayed as a CUDA graph (VECWORLD_GRAPHS, default on with an engine kernel; "0": eager on the same slots).
+  VECWORLD_KERNEL=off keeps diffusers for all of it, streamed with diffusers' group offload.
 """
 import math
 import os
@@ -27,12 +28,12 @@ import numpy as np
 from PIL import Image
 
 from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_BATCH,
-                             FLUX_GGUF, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
+                             FLUX_GGUF, FLUX_GRAPH_MAX, FLUX_SLOT_RING, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
                              FLUX_STYLE, FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
-from vecworld.engine import engine_fuse, engine_kernel, keep_for, load_engine_ext
+from vecworld.engine import engine_fuse, engine_graphs, engine_kernel, keep_for, load_engine_ext
 
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
 
@@ -142,6 +143,9 @@ class FluxPainter(Painter):
     self.kernel records it (None: diffusers), self.keep_a16 the patterns kept on mma (vecworld.engine.keep_for).
     VECWORLD_FUSE (vecworld.engine.engine_fuse; unset: on with an engine kernel, off under "off") patches the blocks to
     run their glue fused (vecworld.engine.blocks, bit-identical to diffusers'); self.fused records it.
+    Under an engine kernel the blocks stream through FLUX_SLOT_RING fixed-address weight slots (vecworld.engine.slots)
+    instead of diffusers' group offload, and VECWORLD_GRAPHS (vecworld.engine.engine_graphs; unset: on) replays each
+    as a CUDA graph per input shape (vecworld.engine.graphs, bit-identical to eager); self.graphs records it.
     """
 
     style = FLUX_STYLE
@@ -176,8 +180,17 @@ class FluxPainter(Painter):
 
             patch_blocks(tr)
         self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
-        tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"), offload_type="block_level",
-                                num_blocks_per_group=1, use_stream=True)
+        self.graphs = engine_graphs(self.kernel)
+        if self.kernel is not None:
+            # The engine streams the blocks through fixed-address slots and replays them as CUDA graphs (Task 7,
+            # docs/engine/07-cuda-graphs.md); after the patch, which the runner wraps.
+            from vecworld.engine import graphs as graphs_mod
+
+            self._slots, self._runner = graphs_mod.stream_blocks(tr, dev, graphs=self.graphs,
+                                                                 ring=FLUX_SLOT_RING, max_graphs=FLUX_GRAPH_MAX)
+        else:
+            tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"),
+                                    offload_type="block_level", num_blocks_per_group=1, use_stream=True)
         vae = AutoencoderKL.from_pretrained(FLUX_BASE, subfolder="vae", torch_dtype=bf16).to(dev)
         self._clip = CLIPTextModel.from_pretrained(FLUX_BASE, subfolder="text_encoder", torch_dtype=bf16).to(dev)
         self._ctok = CLIPTokenizer.from_pretrained(FLUX_BASE, subfolder="tokenizer")
@@ -198,6 +211,9 @@ class FluxPainter(Painter):
         self.kernel: str | None = getattr(self, "kernel", None)
         self.keep_a16: tuple[str, ...] = getattr(self, "keep_a16", ())   # the linears kept on mma (keep_for)
         self.fused: bool = getattr(self, "fused", False)                # blocks run fused glue (engine_fuse)
+        self.graphs: bool = getattr(self, "graphs", False)              # blocks replay as graphs (engine_graphs)
+        self._slots = getattr(self, "_slots", None)                     # engine.slots.BlockSlots (engine kernels)
+        self._runner = getattr(self, "_runner", None)                   # engine.graphs.GraphRunner
         self._closed = False
         self._dev, self._dtype = dev, dtype
         self._sf, self._shift = vae.config.scaling_factor, vae.config.shift_factor
@@ -217,8 +233,15 @@ class FluxPainter(Painter):
         self._recipe = name
 
     def close(self) -> None:
-        """Unregister the page-locked weights (safe twice). The painter can't paint after it."""
+        """Drop the CUDA graphs and weight slots and unregister the page-locked weights (safe twice). The painter
+        can't paint after it."""
         self._closed = True
+        runner, slots = getattr(self, "_runner", None), getattr(self, "_slots", None)
+        self._runner = self._slots = None
+        if runner is not None:
+            runner.close()
+        if slots is not None:
+            slots.close()                   # waits for the copies from the pinned memory before it is released
         ptrs, self._pinned = getattr(self, "_pinned", []), []
         if ptrs:
             _unpin(ptrs)

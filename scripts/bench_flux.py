@@ -6,7 +6,7 @@ also carry the step's FLOP count, achieved TFLOP/s and % of the measured bf16 pe
   uv run python scripts/bench_flux.py --painter reference --what pano --out bench/x.json
   VECWORLD_KERNEL=naive uv run python scripts/bench_flux.py --painter engine --what tile512 --out bench/t3-naive.json
 
-tile512, pano and step run the real painter (its T5 and CLIP included; T5 is encoded once, before timing, and
+tile512, pano, step and peak run the real painter (its T5 and CLIP included; T5 is encoded once, before timing, and
 its cold encode is recorded). blocks and bw measure the bare transformer and the machine; blocks also times the
 modulation linears per pass (do_modulation). gemm times
 VECWORLD_KERNEL's GEMM alone on the FLUX linear shapes against torch.matmul on the same weight pre-dequantized to
@@ -131,7 +131,9 @@ def load_painter(R, mon):
     from vecworld.flux.painter import FluxPainter
     passes = []
     t0 = time.time()
-    p = FluxPainter(progress=lambda k, n: passes.append(time.time()))
+    # a CUDA event per pass, on the stream the passes run on: the CPU runs ahead of the GPU (graph replays, and no
+    # offload syncs since Task 7), so a CPU clock at progress() would time the enqueueing, not the pass
+    p = FluxPainter(progress=lambda k, n: passes.append(_event()))
     R["load_s"] = round(time.time() - t0, 1)
     R["rss_after_setup_gb"] = round(rss_gb(), 2)
     prompt = [(f"{PROMPT}, {FLUX_STYLE}", 1.0)]
@@ -141,12 +143,22 @@ def load_painter(R, mon):
     return p, prompt, passes
 
 
+def _event():
+    import torch
+    e = torch.cuda.Event(enable_timing=True)
+    e.record()
+    return e
+
+
 def timed(fn, passes, mon):
+    """Run fn; its wall time, and each pass's GPU time (between the CUDA events progress() recorded)."""
     import torch
     torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); mon.reset(); passes.clear()
-    t = time.time(); out = fn(); torch.cuda.synchronize(); dt = time.time() - t
-    gaps = [b - a for a, b in zip([t] + passes[:-1], passes)]
+    t = time.time(); t0 = _event(); out = fn(); torch.cuda.synchronize(); dt = time.time() - t
+    gaps = [a.elapsed_time(b) / 1000 for a, b in zip([t0] + passes[:-1], passes)]
     return out, dict(s=round(dt, 1), passes=len(passes), s_per_pass_median=round(sorted(gaps)[len(gaps) // 2], 2),
+                     s_per_pass_min=round(min(gaps), 3), s_per_pass_max=round(max(gaps), 3),
+                     s_per_pass=[round(g, 3) for g in gaps],
                      peak_alloc_gb=round(torch.cuda.max_memory_allocated() / 1e9, 2), **mon.report())
 
 
@@ -174,6 +186,27 @@ def do_tile512(R, mon):
         e = p._embed(prompt)
         run_tile512(p, e, 1)                                                 # warm-up
         _, R["tile512"] = timed(lambda: run_tile512(p, e, FLUX_STEPS), passes, mon)
+
+
+def do_peak(R, mon):
+    """Peak allocated memory and pass time at 1, 2 and 4 windows per pass (the painter's _forward at sigma 1): per
+    batch, a first pass (with graphs: warm-up + capture) and then the median of 3 timed passes; the peak covers both."""
+    import torch
+    from vecworld.config import FLUX_WIN
+    p, prompt, _ = load_painter(R, mon)
+    with torch.inference_mode():
+        e = p._embed(prompt)
+        for b in (1, 2, 4):
+            g = torch.randn(b, 64, FLUX_WIN, FLUX_WIN, device="cuda", generator=torch.Generator("cuda").manual_seed(b))
+            torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+            t = time.time(); p._forward(g, [e] * b, 1.0); torch.cuda.synchronize(); first = time.time() - t
+            ts = []
+            for _ in range(3):
+                t = time.time(); p._forward(g, [e] * b, 1.0); torch.cuda.synchronize(); ts.append(time.time() - t)
+            med = sorted(ts)[1]
+            R[f"batch{b}"] = dict(peak_alloc_gb=round(torch.cuda.max_memory_allocated() / 1e9, 3),
+                                  first_pass_s=round(first, 3), s_per_pass=round(med, 3),
+                                  s_per_window=round(med / b, 3), passes_s=[round(x, 3) for x in ts])
 
 
 def do_pano(R, mon):
@@ -426,7 +459,7 @@ def add_engine_fields(R):
             R[k] = engine_fields(R[k], (w // 16) * (h // 16), 256, key="resident_step_s")
 
 
-WHATS = dict(tile512=do_tile512, pano=do_pano, step=do_step, blocks=do_blocks, bw=do_bw, gemm=do_gemm)
+WHATS = dict(tile512=do_tile512, pano=do_pano, step=do_step, blocks=do_blocks, bw=do_bw, gemm=do_gemm, peak=do_peak)
 
 
 def main():
@@ -449,7 +482,9 @@ def main():
     import torch
     mon = Mon()
     from vecworld.engine import engine_fuse
-    R = {"what": a.what, "painter": a.painter, "kernel": engine_kernel(), "fused": engine_fuse(engine_kernel()), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
+    from vecworld.engine import engine_graphs
+    R = {"what": a.what, "painter": a.painter, "kernel": engine_kernel(), "fused": engine_fuse(engine_kernel()),
+         "graphs": engine_graphs(engine_kernel()), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
     t0 = time.time()
     WHATS[a.what](R, mon)
     R["wall_s"] = round(time.time() - t0, 1)

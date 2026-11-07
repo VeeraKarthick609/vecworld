@@ -1,0 +1,123 @@
+{
+ "what": "peak allocated and pass time at 1, 2, 4 windows per pass (bench_flux --what peak), w4a8 + fused; same session",
+ "task6_group_offload": {
+  "git": "ee3baae-dirty",
+  "power": "ac",
+  "kernel": "w4a8",
+  "fused": true,
+  "graphs": null,
+  "batch1": {
+   "peak_alloc_gb": 1.011,
+   "first_pass_s": 1.436,
+   "s_per_pass": 0.922,
+   "s_per_window": 0.922,
+   "passes_s": [
+    0.926,
+    0.921,
+    0.922
+   ]
+  },
+  "batch2": {
+   "peak_alloc_gb": 1.106,
+   "first_pass_s": 1.778,
+   "s_per_pass": 1.764,
+   "s_per_window": 0.882,
+   "passes_s": [
+    1.758,
+    1.764,
+    1.765
+   ]
+  },
+  "batch4": {
+   "peak_alloc_gb": 1.296,
+   "first_pass_s": 3.455,
+   "s_per_pass": 3.577,
+   "s_per_window": 0.894,
+   "passes_s": [
+    3.492,
+    3.577,
+    3.593
+   ]
+  }
+ },
+ "slots_eager": {
+  "git": "ee3baae-dirty",
+  "power": "ac",
+  "kernel": "w4a8",
+  "fused": true,
+  "graphs": false,
+  "batch1": {
+   "peak_alloc_gb": 1.225,
+   "first_pass_s": 0.948,
+   "s_per_pass": 0.863,
+   "s_per_window": 0.863,
+   "passes_s": [
+    0.86,
+    0.863,
+    0.865
+   ]
+  },
+  "batch2": {
+   "peak_alloc_gb": 1.342,
+   "first_pass_s": 1.7,
+   "s_per_pass": 1.697,
+   "s_per_window": 0.849,
+   "passes_s": [
+    1.696,
+    1.697,
+    1.701
+   ]
+  },
+  "batch4": {
+   "peak_alloc_gb": 1.576,
+   "first_pass_s": 3.362,
+   "s_per_pass": 3.426,
+   "s_per_window": 0.856,
+   "passes_s": [
+    3.369,
+    3.426,
+    3.478
+   ]
+  }
+ },
+ "slots_graphs": {
+  "git": "ee3baae-dirty",
+  "power": "ac",
+  "kernel": "w4a8",
+  "fused": true,
+  "graphs": true,
+  "batch1": {
+   "peak_alloc_gb": 1.249,
+   "first_pass_s": 1.984,
+   "s_per_pass": 0.871,
+   "s_per_window": 0.871,
+   "passes_s": [
+    0.869,
+    0.871,
+    0.872
+   ]
+  },
+  "batch2": {
+   "peak_alloc_gb": 1.431,
+   "first_pass_s": 3.695,
+   "s_per_pass": 1.752,
+   "s_per_window": 0.876,
+   "passes_s": [
+    1.751,
+    1.752,
+    1.763
+   ]
+  },
+  "batch4": {
+   "peak_alloc_gb": 1.792,
+   "first_pass_s": 7.596,
+   "s_per_pass": 3.57,
+   "s_per_window": 0.892,
+   "passes_s": [
+    3.56,
+    3.57,
+    3.592
+   ]
+  }
+ }
+}

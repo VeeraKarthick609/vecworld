@@ -6,7 +6,7 @@ packed Q4_K super-blocks; swap.swap_linears puts it in place of a model's Q4_K l
 import os
 
 KERNEL_OFF = ("off", "reference")    # VECWORLD_KERNEL values that keep the diffusers path
-FUSE_ON, FUSE_OFF = ("1", "on", "true", "yes"), ("0", "off", "false", "no")   # VECWORLD_FUSE values
+FUSE_ON, FUSE_OFF = ("1", "on", "true", "yes"), ("0", "off", "false", "no")   # VECWORLD_FUSE / _GRAPHS values
 
 
 def engine_kernel() -> str | None:
@@ -38,6 +38,17 @@ def engine_fuse(kernel: str | None) -> bool:
     if v in FUSE_OFF:
         return False
     raise ValueError(f"VECWORLD_FUSE={v!r}; use 1 / on or 0 / off (unset: on with an engine kernel)")
+
+
+def engine_graphs(kernel: str | None) -> bool:
+    """Whether the FLUX blocks replay as CUDA graphs (vecworld.engine.graphs, docs/engine/07-cuda-graphs.md), the one
+    rule for the painter and the bench. Under an engine kernel the blocks always run from fixed-address weight slots
+    (engine.slots); VECWORLD_GRAPHS unset or empty, "1" / "on": replayed as graphs; "0" / "off": run eagerly on the
+    same slots. Under "off" (kernel None) the blocks stay on diffusers' group offload, so never graphs."""
+    v = (os.environ.get("VECWORLD_GRAPHS") or "").strip().lower()
+    if v and v not in FUSE_ON + FUSE_OFF:
+        raise ValueError(f"VECWORLD_GRAPHS={v!r}; use 1 / on or 0 / off (unset: on with an engine kernel)")
+    return kernel is not None and v not in FUSE_OFF
 
 
 def keep_for(kernel: str | None) -> tuple[str, ...]:

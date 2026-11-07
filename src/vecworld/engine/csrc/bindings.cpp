@@ -12,7 +12,8 @@ torch::Tensor q4k_gemv(torch::Tensor x, torch::Tensor w, c10::optional<torch::Te
 std::vector<torch::Tensor> glue_rnm(torch::Tensor res, c10::optional<torch::Tensor> y,
                                     c10::optional<torch::Tensor> gate, torch::Tensor shift, torch::Tensor scale,
                                     double eps, bool quantize);
-torch::Tensor glue_gated_residual(torch::Tensor res, torch::Tensor y, torch::Tensor gate);
+torch::Tensor glue_gated_residual(torch::Tensor res, torch::Tensor y, torch::Tensor gate,
+                                  c10::optional<torch::Tensor> out);
 void glue_qk_norm_rope(torch::Tensor x, c10::optional<torch::Tensor> weight, torch::Tensor cos, torch::Tensor sin,
                        torch::Tensor out, int64_t offset, double eps);
 
@@ -43,8 +44,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "x_mod = LayerNorm(res_out) * (1 + scale) + shift, then with quantize xq, s, xsum of x_mod as "
           "q4k_quantize_act, else empty)", py::arg("res"), py::arg("y"), py::arg("gate"), py::arg("shift"),
           py::arg("scale"), py::arg("eps") = 1e-6, py::arg("quantize") = false);
-    m.def("glue_gated_residual", &glue_gated_residual, "res + gate * y, gate [B, H] broadcast per image",
-          py::arg("res"), py::arg("y"), py::arg("gate"));
+    m.def("glue_gated_residual", &glue_gated_residual,
+          "res + gate * y, gate [B, H] broadcast per image, into out (bf16 [M, H]) if given",
+          py::arg("res"), py::arg("y"), py::arg("gate"), py::arg("out") = py::none());
     m.def("glue_qk_norm_rope", &glue_qk_norm_rope,
           "x bf16 [B, S, heads * 128] -> out[:, offset:offset + S] (bf16 [B, S_out, heads, 128]) = rotary(RMSNorm(x) "
           "per head, cos / sin fp32 [S_out, 128] at positions offset..)", py::arg("x"), py::arg("weight"),

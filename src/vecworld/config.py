@@ -105,6 +105,15 @@ FLUX_A16_KEEP: tuple[str, ...] = (
     "transformer_blocks.*.ff.net.2", "transformer_blocks.*.attn.to_out.0", "transformer_blocks.*.attn.to_add_out",
 )
 FLUX_BATCH = 4             # windows per transformer pass (peak 1.4 GB allocated on AC; Task 6 re-batches)
+# Under an engine kernel the transformer's blocks stream their weights through FLUX_SLOT_RING fixed-address device
+# slots (vecworld.engine.slots, each the size of the largest block, 191 MB) and replay as one CUDA graph per block
+# and input shape (vecworld.engine.graphs, VECWORLD_GRAPHS). 3, not 2: block i uses slot i % ring, and with 2 slots
+# the 57 blocks (odd) put the last block and the next pass's first in the same slot, so every pass waited ~13.5 ms
+# for block 0's copy (measured; 3 divides 57: tile512 pass 0.869 -> 0.859 s, +191 MB; docs/engine/07-cuda-graphs.md).
+# FLUX_GRAPH_MAX shapes (batch, image tokens, text tokens) keep their graphs, the least recently used dropped beyond
+# it: a walk uses up to FLUX_BATCH (1..4 windows a pass).
+FLUX_SLOT_RING = 3
+FLUX_GRAPH_MAX = 4
 FLUX_BG_STRENGTH = 0.15    # a walk step releases its background at this sigma (0.25: SSIM 0.58 outside the focus, 0.15: 0.67)
 # Behind the camera (from a quarter turn off the walking direction, feathered over FLUX_BACK_FEATHER) the dolly
 # shrank the view and mirrored rows in at the top and bottom edges; there the background is released at

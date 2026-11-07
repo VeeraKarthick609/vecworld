@@ -1,0 +1,159 @@
+{
+ "what": "nsys GPU idle between kernels, 3 tile512 passes back to back (scripts/profile_gaps.py); ring = FLUX_SLOT_RING",
+ "task6_group_offload": {
+  "passes": 3,
+  "window": {
+   "span_ms": 2821.43,
+   "kernel_busy_ms": 2515.0,
+   "idle_ms": 306.43,
+   "idle_pct": 10.86,
+   "kernels": 3660,
+   "gaps": 3659,
+   "gaps_over_10us": 398,
+   "gaps_over_100us": 178,
+   "gaps_over_1ms": 9,
+   "idle_in_gaps_over_100us_ms": 296.86,
+   "median_gap_us": 0.64,
+   "largest_gaps_us": [
+    40427.3,
+    39783.7,
+    38318.5,
+    15146.6,
+    14557.0
+   ],
+   "cpu_wall_ms": 2821.74,
+   "memcpy_gb": 20.642
+  },
+  "per_pass_idle_ms": 102.14
+ },
+ "slots_eager_ring2": {
+  "passes": 3,
+  "window": {
+   "span_ms": 2573.57,
+   "kernel_busy_ms": 2542.26,
+   "idle_ms": 31.31,
+   "idle_pct": 1.22,
+   "kernels": 3660,
+   "gaps": 3659,
+   "gaps_over_10us": 24,
+   "gaps_over_100us": 6,
+   "gaps_over_1ms": 2,
+   "idle_in_gaps_over_100us_ms": 27.55,
+   "median_gap_us": 0.64,
+   "largest_gaps_us": [
+    13422.8,
+    13413.2,
+    247.2,
+    245.0,
+    121.5
+   ],
+   "cpu_wall_ms": 2588.51,
+   "memcpy_gb": 19.995
+  },
+  "per_pass_idle_ms": 10.44
+ },
+ "slots_graphs_ring2": {
+  "passes": 3,
+  "window": {
+   "span_ms": 2576.14,
+   "kernel_busy_ms": 2547.45,
+   "idle_ms": 28.7,
+   "idle_pct": 1.11,
+   "kernels": 3660,
+   "gaps": 575,
+   "gaps_over_10us": 22,
+   "gaps_over_100us": 5,
+   "gaps_over_1ms": 2,
+   "idle_in_gaps_over_100us_ms": 27.64,
+   "median_gap_us": 0.67,
+   "largest_gaps_us": [
+    13556.0,
+    13483.4,
+    243.3,
+    186.1,
+    166.8
+   ],
+   "cpu_wall_ms": 2590.98,
+   "memcpy_gb": 20.022
+  },
+  "per_pass_idle_ms": 9.57
+ },
+ "slots_graphs_ring3": {
+  "passes": 3,
+  "window": {
+   "span_ms": 2558.42,
+   "kernel_busy_ms": 2556.13,
+   "idle_ms": 2.29,
+   "idle_pct": 0.09,
+   "kernels": 3660,
+   "gaps": 575,
+   "gaps_over_10us": 24,
+   "gaps_over_100us": 5,
+   "gaps_over_1ms": 0,
+   "idle_in_gaps_over_100us_ms": 0.96,
+   "median_gap_us": 0.67,
+   "largest_gaps_us": [
+    265.4,
+    246.1,
+    199.6,
+    124.3,
+    123.6
+   ],
+   "cpu_wall_ms": 2574.32,
+   "memcpy_gb": 20.022
+  },
+  "per_pass_idle_ms": 0.76
+ },
+ "batch4_slots_eager_ring3": {
+  "passes": 2,
+  "window": {
+   "span_ms": 6790.06,
+   "kernel_busy_ms": 6787.33,
+   "idle_ms": 2.73,
+   "idle_pct": 0.04,
+   "kernels": 2524,
+   "gaps": 2523,
+   "gaps_over_10us": 9,
+   "gaps_over_100us": 2,
+   "gaps_over_1ms": 0,
+   "idle_in_gaps_over_100us_ms": 0.49,
+   "median_gap_us": 0.67,
+   "largest_gaps_us": [
+    375.5,
+    117.3,
+    79.9,
+    73.3,
+    52.4
+   ],
+   "cpu_wall_ms": 6802.98,
+   "memcpy_gb": 13.326
+  },
+  "per_pass_idle_ms": 1.36
+ },
+ "batch4_slots_graphs_ring3": {
+  "passes": 2,
+  "window": {
+   "span_ms": 6891.66,
+   "kernel_busy_ms": 6890.07,
+   "idle_ms": 1.59,
+   "idle_pct": 0.02,
+   "kernels": 2524,
+   "gaps": 391,
+   "gaps_over_10us": 10,
+   "gaps_over_100us": 3,
+   "gaps_over_1ms": 0,
+   "idle_in_gaps_over_100us_ms": 0.89,
+   "median_gap_us": 0.64,
+   "largest_gaps_us": [
+    406.7,
+    377.0,
+    104.2,
+    64.0,
+    52.7
+   ],
+   "cpu_wall_ms": 6904.58,
+   "memcpy_gb": 13.391
+  },
+  "per_pass_idle_ms": 0.8
+ }
+}

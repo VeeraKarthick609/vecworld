@@ -541,3 +541,70 @@ def test_painter_patches_blocks_when_fused(monkeypatch):
         with pytest.raises(AttributeError):
             FluxPainter()
         assert order == want, (kernel, fuse)
+
+
+def test_graphs_default_on_with_an_engine_kernel(monkeypatch):
+    """VECWORLD_GRAPHS (vecworld.engine.engine_graphs, one rule for the painter and the bench): unset or empty, the
+    blocks replay as CUDA graphs under every engine kernel; "0" / "off" runs them eagerly on the same weight slots;
+    "1" / "on" asks for graphs. Under VECWORLD_KERNEL=off there are no slots (diffusers' group offload), so never
+    graphs. Anything else is refused."""
+    from vecworld.engine import engine_graphs
+
+    monkeypatch.delenv("VECWORLD_GRAPHS", raising=False)
+    for kernel in ("w4a8", "mma", "tiled", "naive"):
+        assert engine_graphs(kernel) is True
+    assert engine_graphs(None) is False
+    for value, want in (("", True), ("0", False), ("off", False), ("1", True), ("on", True)):
+        monkeypatch.setenv("VECWORLD_GRAPHS", value)
+        assert engine_graphs("w4a8") is want, value
+        assert engine_graphs(None) is False, value
+    monkeypatch.setenv("VECWORLD_GRAPHS", "maybe")
+    with pytest.raises(ValueError, match="maybe"):
+        engine_graphs("w4a8")
+
+
+def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
+    """Under an engine kernel FluxPainter puts the blocks on fixed-address slots with a GraphRunner
+    (vecworld.engine.graphs.stream_blocks; graphs as engine_graphs says) instead of diffusers' group offload, after
+    the swap, the fused patch and the pinning; under VECWORLD_KERNEL=off it keeps group offload (the reference)."""
+    import diffusers
+
+    import vecworld.engine.blocks as blocks_mod
+    import vecworld.engine.ext as ext_mod
+    import vecworld.engine.graphs as graphs_mod
+    import vecworld.engine.swap as swap_mod
+    import vecworld.flux.painter as painter_mod
+
+    class Loaded(Exception):
+        pass
+
+    order = []
+    tr = SimpleNamespace(transformer_blocks=[], single_transformer_blocks=[],
+                         enable_group_offload=lambda **k: order.append("offload"))
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: tr)
+    monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
+    monkeypatch.setattr(swap_mod, "swap_linears", lambda *a, **k: order.append("swap") or 1)
+    monkeypatch.setattr(blocks_mod, "patch_blocks", lambda tr: order.append("patch") or 57)
+    monkeypatch.setattr(painter_mod, "_pin_in_place", lambda mods: order.append("pin") or [])
+    monkeypatch.setattr(graphs_mod, "stream_blocks",
+                        lambda tr, dev, graphs, **k: order.append(f"slots graphs={graphs}") or ("slots", "runner"))
+
+    def stop_at_vae(*a, **k):
+        raise Loaded
+
+    monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", stop_at_vae)
+    for kernel, graphs, want in ((None, None, ["swap", "patch", "pin", "slots graphs=True"]),
+                                 ("mma", "0", ["swap", "patch", "pin", "slots graphs=False"]),
+                                 ("off", None, ["pin", "offload"]), ("off", "1", ["pin", "offload"])):
+        for k in ("VECWORLD_KERNEL", "VECWORLD_FUSE", "VECWORLD_GRAPHS"):
+            monkeypatch.delenv(k, raising=False)
+        if kernel:
+            monkeypatch.setenv("VECWORLD_KERNEL", kernel)
+        if graphs:
+            monkeypatch.setenv("VECWORLD_GRAPHS", graphs)
+        order.clear()
+        with pytest.raises(Loaded):
+            FluxPainter()
+        assert order == want, (kernel, graphs)

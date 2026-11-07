@@ -35,12 +35,15 @@ def residual_norm_modulate(res: torch.Tensor, y: torch.Tensor | None, gate: torc
     return res_out, x
 
 
-def gated_residual(res: torch.Tensor, y: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+def gated_residual(res: torch.Tensor, y: torch.Tensor, gate: torch.Tensor,
+                   out: torch.Tensor | None = None) -> torch.Tensor:
     """res + gate * y in one pass (a block's last residual, which no norm follows): res, y bf16 [M, H], gate bf16
-    [B, H] broadcast per image as above; gate * y is rounded to bf16 before the add, as the reference rounds."""
+    [B, H] broadcast per image as above; gate * y is rounded to bf16 before the add, as the reference rounds.
+    out: a contiguous bf16 [M, H] buffer to write the result into (a CUDA graph's fixed output buffer,
+    engine/graphs.py) instead of a new tensor. Returns the result."""
     from vecworld.engine.ext import load_ext
 
-    return load_ext().glue_gated_residual(res, y, _rows(gate))
+    return load_ext().glue_gated_residual(res, y, _rows(gate), out)
 
 
 def qk_norm_rope(x: torch.Tensor, weight: torch.Tensor | None, cos: torch.Tensor, sin: torch.Tensor,

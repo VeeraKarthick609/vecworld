@@ -13,12 +13,18 @@ Under w4a8 a norm's output also carries its INT8 quantization when one of its co
 to_q / to_k / proj_mlp / ff.net.0 don't each re-read it to quantize it; keep-listed (mma) consumers take the bf16 x.
 """
 import types
+from collections import Counter
 
 import torch
 from diffusers.models.transformers.transformer_flux import FluxAttnProcessor, dispatch_attention_fn
 
 from vecworld.engine.glue import gated_residual, qk_norm_rope, residual_norm_modulate
-from vecworld.engine.q4k import Q4KLinear
+from vecworld.engine.q4k import Q4KLinear, attach_quantized, quantized_of
+
+# Python-time counts of the fused forwards ("double", "single") and of norms that attached a quantization
+# ("quantize"): eager calls and CUDA-graph captures add to them, a graph replay runs no Python and adds nothing
+# (Task 7: a test can see the fused blocks were the ones captured).
+CALLS: Counter = Counter()
 
 
 def _int8(*mods) -> bool:
@@ -32,15 +38,18 @@ def _rnm(res, y, gate, shift, scale, quantize):
     r2, x2 = residual_norm_modulate(res.reshape(-1, shape[-1]), None if y is None else y.reshape(-1, shape[-1]),
                                     gate, shift, scale, quantize=quantize)
     x = x2.view(shape)
-    if quantize:                                   # view() makes a new tensor object: carry the quantization over
-        from vecworld.engine.q4k import attach_quantized, quantized_of
-        attach_quantized(x, quantized_of(x2))
+    q = quantized_of(x2) if quantize else None
+    if q is not None:                              # view() makes a new tensor object: carry the quantization over
+        attach_quantized(x, q)
+        CALLS["quantize"] += 1
     return r2.view(shape), x
 
 
-def _gres(res, y, gate):
+def _gres(res, y, gate, out=None):
+    """gated_residual on [B, L, H] activations, into out ([B, L, H], contiguous) if given."""
     shape = res.shape
-    return gated_residual(res.reshape(-1, shape[-1]), y.reshape(-1, shape[-1]), gate).view(shape)
+    o = None if out is None else out.view(-1, shape[-1])
+    return gated_residual(res.reshape(-1, shape[-1]), y.reshape(-1, shape[-1]), gate, out=o).view(shape)
 
 
 def _c(t):
@@ -91,9 +100,11 @@ def _joint(es, hs):
 
 
 def double_forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, temb: torch.Tensor,
-                   image_rotary_emb=None, joint_attention_kwargs=None):
+                   image_rotary_emb=None, joint_attention_kwargs=None, out=None):
     """FluxTransformerBlock.forward with fused glue (same signature and outputs: (encoder_hidden_states,
-    hidden_states))."""
+    hidden_states)). out: (es, hs) buffers ([B, T, H], [B, L, H], contiguous) the block's last passes write its two
+    outputs into, instead of new tensors (a CUDA graph's fixed output buffers, engine/graphs.py)."""
+    CALLS["double"] += 1
     hs, es = _c(hidden_states), _c(encoder_hidden_states)
     attn = self.attn
     emb = self.norm1.linear(self.norm1.silu(temb))
@@ -114,20 +125,23 @@ def double_forward(self, hidden_states: torch.Tensor, encoder_hidden_states: tor
                     **(joint_attention_kwargs or {}))
     attn_output, context_attn_output = outs[0], outs[1]
 
+    ip = len(outs) == 3                            # an IP-adapter's attention output, as diffusers adds it
     hs, x = _rnm(hs, _c(attn_output), gate_msa, shift_mlp, scale_mlp, _int8(self.ff.net[0].proj))
-    hs = _gres(hs, _c(self.ff(x)), gate_mlp)
-    if len(outs) == 3:                             # an IP-adapter's attention output, as diffusers adds it
-        hs = hs + outs[2]
+    hs = _gres(hs, _c(self.ff(x)), gate_mlp, None if out is None or ip else out[1])
+    if ip:
+        hs = hs + outs[2] if out is None else torch.add(hs, outs[2], out=out[1])
 
     es, cx = _rnm(es, _c(context_attn_output), c_gate_msa, c_shift_mlp, c_scale_mlp,
                   _int8(self.ff_context.net[0].proj))
-    es = _gres(es, _c(self.ff_context(cx)), c_gate_mlp)
+    es = _gres(es, _c(self.ff_context(cx)), c_gate_mlp, None if out is None else out[0])
     return es, hs
 
 
 def single_forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, temb: torch.Tensor,
-                   image_rotary_emb=None, joint_attention_kwargs=None):
-    """FluxSingleTransformerBlock.forward with fused glue (same signature and outputs)."""
+                   image_rotary_emb=None, joint_attention_kwargs=None, out=None):
+    """FluxSingleTransformerBlock.forward with fused glue (same signature and outputs). out: a [B, T + L, H] buffer
+    (contiguous) the last pass writes the joint output into; the outputs are then its two halves."""
+    CALLS["single"] += 1
     text_seq_len = encoder_hidden_states.shape[1]
     joint = _joint(encoder_hidden_states, hidden_states)
     attn = self.attn
@@ -143,7 +157,7 @@ def single_forward(self, hidden_states: torch.Tensor, encoder_hidden_states: tor
         cat[..., :H] = _attention(attn, x, None, image_rotary_emb)
     else:
         cat[..., :H] = attn(hidden_states=x, image_rotary_emb=image_rotary_emb, **(joint_attention_kwargs or {}))
-    joint = _gres(joint, self.proj_out(cat), gate)
+    joint = _gres(joint, self.proj_out(cat), gate, out)
     return joint[:, :text_seq_len], joint[:, text_seq_len:]
 
 

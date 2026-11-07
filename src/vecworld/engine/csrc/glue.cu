@@ -332,14 +332,21 @@ std::vector<torch::Tensor> glue_rnm(torch::Tensor res, c10::optional<torch::Tens
     return {res_out, x_out, xq, s, xsum};
 }
 
-torch::Tensor glue_gated_residual(torch::Tensor res, torch::Tensor y, torch::Tensor gate) {
+torch::Tensor glue_gated_residual(torch::Tensor res, torch::Tensor y, torch::Tensor gate,
+                                  c10::optional<torch::Tensor> out_) {
     check_rows(res, "res");
     check_rows(y, "y");
     TORCH_CHECK(y.sizes() == res.sizes() && y.device() == res.device(), "y must match res's shape and device");
     const int64_t B = images(res, gate);
     check_mod(gate, res, B, "gate");
     const c10::cuda::CUDAGuard guard(res.device());
-    auto out = torch::empty_like(res);
+    // out: a caller's buffer to write into (a CUDA graph's fixed output, engine/graphs.py), else a new tensor
+    if (out_) {
+        check_rows(*out_, "out");
+        TORCH_CHECK(out_->sizes() == res.sizes() && out_->device() == res.device(),
+                    "out must match res's shape and device");
+    }
+    auto out = out_ ? *out_ : torch::empty_like(res);
     const int chunks = int(res.size(1) / 8);
     const int64_t total = res.size(0) * chunks;
     if (total == 0) return out;
