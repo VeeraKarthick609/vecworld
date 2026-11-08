@@ -42,6 +42,18 @@ The full report is in the session scratchpad (`flux-spike/report.md`); its scrip
   - Its style is smooth digital painting.
   - The 512 version drew a fake signature.
 
+- **Measured on the finished engine** (2026-11-09, Task 10c, AC; the game server with the dreamer on, the SSD weight
+  source and every default; `docs/engine/12-t5-and-results.md`):
+  - one 512x512 window pass: 2.74 s (Task 0, diffusers) -> 0.88 s per window in a batch-8 pass (7.04 s for 8), 20.1
+    bf16-equivalent TFLOP/s; alone at batch 1 it is SSD-bound, 3.81 s;
+  - first panorama (start of a journey): 34.1 s (the panorama job 33.2-33.6 s, 4 batch-8 passes);
+  - walk step: 38.6 s in the bench, 39.1-45.9 s in the game (median 42.0); the player waits 32.3-39.4 s in the fog
+    at the rim (mean 36.1) after 7.8 s of walking;
+  - T5-XXL: 2.30-2.56 s a new text (was 6.7 s; 27 s on the CPU in the spike), streamed from the SSD;
+  - memory: the whole server 9.75 GB RSS at most in play (11.18 GB while loading), no swap; peak allocated 2.15 GB,
+    2552 MiB per nvidia-smi;
+  - SSD: 1.84 GB/s O_DIRECT; a batch-8 pass reads 6.66 GB and waits for it ~1.7 s a pass.
+
 ## 3. Goals
 
 - **Every spot is painted by FLUX.1-schnell.** It runs at 4-bit, as a 2048×512 wrap-around panorama with the same image/depth/meta contract the viewer already uses. Depth, places, signposts, compass, moods, walking and walk-back all keep working.

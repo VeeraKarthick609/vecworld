@@ -21,6 +21,8 @@ walk step's wall time (not gated).
 | 8: first-block cache (skip blocks 1..56 when block 0's residual barely moved), **off by default** (no threshold that skips passes the gate) | `--painter engine`; `VECWORLD_CACHE_THRESHOLD` (default `FLUX_CACHE_THRESHOLD` = 0.0, off) | **0.86** (off, the default; mean = median); at 0.3: 0.65 mean (1.32x, 1 of 4 passes skipped) | **20.55** (off); 27.19 at 0.3 (nominal FLOPs / mean time: skipped work, above the hardware rate) | 107.6 (off); 142.4 at 0.3 | **39.2** (off); 24.6 at 0.3 (1.59x wall, 1.63x per pass, 4 of 10 passes skipped); panorama 29.7 -> 22.7 s (2 of 8) | 1.22 / 1.77 (0.3: 1.26 / 1.77) | lossy when on, multi-scene relative gate (3 scenes x 6 spots vs cache-off base at 4a063b2; pass = seam rise <= 0.03 per spot and min PSNR >= 30 dB): 0.3 fails (worst +0.153, 21.70 dB), 0.25 fails (+0.166, 22.05 dB), 0.2 passes vacuously (0 skips, byte-identical), 0.15-0.05 pruned (skip nothing). Default stays off; with it the pass is bit-identical to Task 7 | 6388713 (bench + walks) |
 | 9: window batching: every active window of a step in one pass (`FLUX_BATCH` 4 -> 8), outer layers run a window at a time (`rowwise`) so a batched window is **bit-identical** to it alone (engine kernels: w4a8 and mma tested); the reference (`VECWORLD_KERNEL=off`) is pinned to batch 1 | `--painter engine`; `VECWORLD_BATCH` (default `FLUX_BATCH` = 8; always 1 under `off`) | **0.87** (one window; batch does not apply) | **20.31** | 106.3 | **39.3** (5 passes, was 10; same-session batch 4: 39.4); panorama 29.8 s in 4 passes (batch 4: 30.2 in 8); s / window-step 0.884 pano, 0.946 step | 1.22 / 2.05 (one pass at 1 / 2 / 4 / 6 / 8 windows: 1.225 / 1.342 / 1.576 / 1.810 / 2.045; graphs at 8: 1.82, four keys 2.23) | lossless against one window a pass: batch-8 panorama vs batch 1 PSNR inf; every window of a batch of 8 / 5 / 2 `torch.equal` to it alone (eager and graphs); the 3-scene walks byte-identical to BASE (4795918) walked at batch 1. Against Task 8's default (batch 4 without `rowwise`, itself rounded by cuBLAS at M = 4) the walks are another sample: relative gate FAIL at 2 of 18 spots (coast 5 +0.166, desert 4 +0.045; 11 spots lower, by up to -0.224), ruling requested | 48e19c1 (bench + walks); sweep 64506e0 |
 | 10a: layer streamer: the blocks packed into one page-locked host arena (one `cudaHostRegister`), one copy per block (was ~20), the slot copies / events and the graph launches issued from the extension without releasing the GIL; **bit-identical** | `--painter engine` (default: eager on the streamer; `VECWORLD_GRAPHS=1` graphs) | **0.86** | **20.55** | 107.6 | **38.6** (5 passes; batch 4: 39.1 in 10); panorama 29.3 s (batch 4: 29.9); s / window-step 0.861 pano, 0.929 step | 1.22 / 2.05 (one pass at 1 / 4 / 8 windows: 1.225 / 1.576 / 2.045, as Task 9); host RSS 7.52 GB after setup, 8.54 in a walk step, 6.66 GB page-locked (the arena) | lossless, bit for bit: streamed passes `torch.equal` to the same blocks resident on the GPU (batch 1 and 2, eager and graphs); 3-scene relative gate vs t9-b8: 18 / 18 spots byte-identical, worst delta 0, PASS. GIL stress (2 spinning threads, batch-1 pass median): eager 23.7 -> 22.9 s, graphs 7.2 -> 0.86 s. nsys: 57 copies a pass (was 1,140), 98.8% under a kernel, SM idle 1.6 ms a pass | a1d78dc (bench + walks); graph launch 470a036 |
+| 10b: the blocks read from the GGUF on the SSD (O_DIRECT through io_uring, 3 page-locked staging buffers, a Gather of per-tensor DMAs); nothing resident; the dreamer back on beside FLUX; **bit-identical** | `--painter engine`; `FLUX_WEIGHTS_SOURCE` (default `ssd`; `ram` = the 10a arena) | 3.64-3.74 (SSD-bound at batch 1; RAM 0.88) | 4.72-4.86 (one window; ~19.3 per window at batch 8) | 25 | **38.0** (5 passes; RAM 38.9); panorama 30.6 s (RAM 29.9) | 1.22 / 2.05; painter RSS 1.58 GB after setup, 2.60 in a step (RAM 7.52 / 8.54); game with Qwen 9.45 GB max, no swap | lossless, bit for bit: SSD vs RAM `torch.equal` (tile latent, batch-8 panorama), every block's bytes in its slot; 3-scene relative gate vs t9-b8: 18 / 18 byte-identical, PASS | 11a144b; R6 rows 86cda48 |
+| 10c: T5-XXL on the engine (its 24 blocks streamed from the SSD by the same streamer and reader; Q5_K / Q6_K dequantized per linear on the GPU); C5, N1, N4; the game end to end; **bit-identical** | `--painter engine`; `FLUX_T5` (default `engine`; `pread` = Task 1's path) | 3.81 (SSD-bound at batch 1, as 10b) | 4.64 (one window); 20.1 per window in a batch-8 pass (7.04 s) | 24 | **38.6** (5 passes); panorama 30.9 s; in the game (dreamer on) 39.1-45.9 s, median 42.0; T5 cold 6.68 -> **2.30-2.56 s** | 1.22 / 2.05; game: 2.15 GB peak allocated, 2552 MiB nvidia-smi, RSS 9.75 GB max, VmSwap 0 | lossless, bit for bit: T5 embeddings `torch.equal` to Task 1's (cosine >= 0.999 asked); 3-scene relative gate vs t10b: 18 / 18 spots byte-identical, worst delta 0, min PSNR inf, PASS | 3a6db42 (bench + walks) |
 
 Task 3 is the correctness reference, **8.2x slower** than the baseline step: CUDA cores, one thread per output, no
 reuse. See `docs/engine/01-q4k-naive.md`.
@@ -96,3 +98,42 @@ so with two threads spinning a graphs pass runs at its quiet speed (median 7.2 -
 collapses (22.9 s), its block forward's own PyTorch calls being the hand-offs left. Batch 8 stays: 1.4-2.9% faster per
 window-step than batch 4 under the streamer, at twice the stop latency (7.9 vs 4.4 s worst); revisited after 10b. See
 `docs/engine/10-streamer.md`.
+
+Task 10b reads the blocks from the SSD instead of a 6.66 GB RAM arena: O_DIRECT reads through io_uring into three
+page-locked staging buffers, then one DMA per tensor into the slots. At batch 8 (the game) speed holds (walk step 38.0
+vs 38.9 s); a lone window pass is SSD-bound (3.64 s: 6.66 GB at the drive's 1.84 GB/s). The painter's RSS falls 7.52 ->
+1.58 GB, so the Qwen dreamer runs beside FLUX again without swap. See `docs/engine/11-io-uring.md`.
+
+Task 10c moves T5-XXL onto the same streamer and reader: a cold encode 6.68 -> 2.30 s with bit-identical embeddings
+(3 s of the old time was parsing the GGUF's tensor table every encode), and its file no longer fills the page cache.
+In the game a walk step is 39-46 s (bench 38.6 s); the gap is T5 inside the step (2.3 s per new text) and ~1 s of
+CPU / GIL contention while the dreamer generates; no GPU sharing or SSD contention. See
+`docs/engine/12-t5-and-results.md`.
+
+## Task 0 to 10c in one table
+
+Step s is the tile512 pass (one window, batch 1); TFLOP/s bf16-equivalent from 5b on. From 10b the tile512 pass is
+SSD-bound, so the per-window figure at the game's batch 8 (a batch-8 pass / 8) is given beside it. Walk step is
+`--what step` (4 windows a pass to Task 8, 8 from Task 9).
+
+| piece | step s before -> after | TFLOP/s before -> after | walk step s before -> after | gate |
+|---|---|---|---|---|
+| 0: baseline (diffusers + GGUF + group offload) | 2.74 | 6.45 | (not measured) | the reference |
+| 1: FluxPainter on the reference | 2.74 -> 2.79 | 6.45 -> 6.33 | 61.4 | the reference |
+| 3: Q4_K naive (correctness reference) | 2.79 -> 22.98 | 6.33 -> 0.77 | 61.4 -> 945.1 | lossless (block, forward, 29.87 dB) |
+| 4: Q4_K tiled | 22.98 -> 3.77 | 0.77 -> 4.69 | 945.1 -> 156.3 | lossless (29.05 dB) |
+| 5: Q4_K on the tensor cores (mma, W4A16) | 3.77 -> **1.40** | 4.69 -> 12.62 | 156.3 -> 57.4 | lossless (29.37 dB) |
+| 5b: W4A8 (INT8 tensor cores, 75% of token FLOPs) | 1.40 -> **1.15** | 12.62 -> 15.37 | 57.4 -> 48.9 | lossy: walk `--check` passes |
+| 5c: modulation GEMV | 1.15 -> 1.12 | 15.37 -> 15.78 | 48.9 -> 47.6 | lossless |
+| 6: glue fusion | 1.12 -> **0.93** | 15.78 -> 19.00 | 47.6 -> 39.5 | bit-identical; walk byte-identical |
+| 7: fixed-address slots (graphs opt-in) | 0.93 -> **0.85** | 19.00 -> 20.79 | 39.5 -> 38.3 | bit-identical; walk byte-identical |
+| 8: first-block cache (off by default) | 0.85 -> 0.86 (0.65 at 0.3) | 20.79 -> 20.55 | 38.3 -> 39.2 (24.6 at 0.3) | 0.3 / 0.25 fail the 3-scene gate: ships off |
+| 9: window batching (batch 8, rowwise) | 0.86 -> 0.87 | 20.55 -> 20.31 | 39.2 -> 39.3 (5 passes, was 10) | bit-identical to batch 1 |
+| 10a: layer streamer (one host arena) | 0.87 -> 0.86 | 20.31 -> 20.55 | 39.3 -> 38.6 | bit-identical; 18 / 18 spots |
+| 10b: SSD reader (O_DIRECT, io_uring) | 0.86 -> 3.64 batch 1 (SSD-bound); 0.88 per window at batch 8 | 20.55 -> 4.86 batch 1; ~20 per window | 38.6 -> 38.0 | bit-identical; 18 / 18 spots |
+| 10c: T5 on the engine | 3.64 -> 3.81 batch 1; 0.88 per window at batch 8 | 4.86 -> 4.64; 20.1 per window | 38.0 -> 38.6 (game 39-46, median 42.0; T5 6.68 -> 2.30 s) | bit-identical; 18 / 18 spots |
+
+From the baseline to the finished engine: a window's pass **2.74 -> 0.88 s (3.1x)**, 6.45 -> 20.1 bf16-equivalent
+TFLOP/s (105% of the measured bf16 matmul peak, by running 75% of the token FLOPs in INT8), the walk step **61.4 ->
+38.6 s** in the bench, the painter's RAM 9.6 GB (spike) -> 1.6 GB, with the dreamer on beside it and no swap.
+
