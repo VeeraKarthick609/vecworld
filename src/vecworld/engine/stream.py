@@ -25,6 +25,18 @@ import torch
 from vecworld.engine.slots import ALIGN, BlockSlots, _tensors, block_layout
 
 
+def _trim() -> None:
+    """malloc_trim(0): glibc keeps freed heap memory (the GGUF tensors the painter read, each under its 32 MB mmap
+    threshold) mapped and counted in RSS, so without it packing would hold the old copies and the arena both (a 13.8 GB
+    process, OOM-killed on this 14 GB laptop)."""
+    import ctypes
+
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def _register(ptr: int, n: int) -> None:
     err = torch.cuda.cudart().cudaHostRegister(ptr, n, 0)
     if int(err) != 0:
@@ -60,6 +72,7 @@ class HostArena:
                 v = self.buf[base + lay[name]:base + lay[name] + nb].view(t.dtype).view(t.shape)
                 v.copy_(t.data)
                 t.data = v
+            _trim()             # hand the block's freed host copies back to the OS before the next block's pages
         _register(self._raw.data_ptr(), self._raw.numel())
         self._registered = True
         self._blocks = [self.buf[o:o + n] for o, n in zip(self.offsets, self.sizes)]

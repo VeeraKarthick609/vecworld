@@ -380,3 +380,38 @@ def test_stream_stop_then_reuse(fx):
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() == mem0
     assert fx.st.pinned_bytes == pin0 and [t.data_ptr() for t in fx.st.slots] == slots0
+
+
+PAINTER_RSS = """
+import resource, sys
+import vecworld.engine.stream as stream
+if sys.argv[1] == "notrim":
+    stream._trim = lambda: None
+from vecworld.flux.painter import FluxPainter
+p = FluxPainter()
+print("RESULT", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024, p._arena.nbytes, flush=True)
+p.close()
+"""
+
+
+def _painter_rss(mode="trim"):
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("VECWORLD_")}
+    out = subprocess.run([sys.executable, "-c", PAINTER_RSS, mode], capture_output=True, text=True, env=env,
+                         timeout=900)
+    line = [x for x in out.stdout.splitlines() if x.startswith("RESULT")]
+    assert line, out.stderr[-2000:]
+    peak, arena = map(int, line[0].split()[1:])
+    return peak, arena
+
+
+def test_painter_packs_the_arena_without_a_second_copy():
+    """FluxPainter reads the GGUF into ordinary host memory and packs it into the arena block by block: the process'
+    peak resident memory stays about one model (arena + ~1 GB of the rest), not two (13.8 GB, OOM-killed on this 14 GB
+    laptop, when glibc kept the freed copies). Run alone, in a fresh process."""
+    peak, arena = _painter_rss()
+    print(f"\npeak RSS {peak / 1e9:.2f} GB, arena {arena / 1e9:.3f} GB")
+    assert arena > 6e9 and peak < arena + 2e9

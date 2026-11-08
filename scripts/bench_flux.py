@@ -140,6 +140,8 @@ def load_painter(R, mon):
     p = FluxPainter(progress=lambda k, n: passes.append(_event()))
     R["load_s"] = round(time.time() - t0, 1)
     R["rss_after_setup_gb"] = round(rss_gb(), 2)
+    arena = getattr(p, "_arena", None)          # page-locked host memory: the blocks' arena (Task 10a); None when pinned in place (off)
+    R["pinned_gb"] = round(arena.nbytes / 1e9, 2) if arena is not None else None
     prompt = [(f"{PROMPT}, {FLUX_STYLE}", 1.0)]
     mon.reset()
     t = time.time(); p.t5.encode(prompt[0][0]); R["t5_encode_cold_s"] = round(time.time() - t, 2)
