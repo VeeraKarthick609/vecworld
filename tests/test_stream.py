@@ -147,6 +147,95 @@ def test_slot_hooks_keep_the_gil():
     a.close()
 
 
+def test_graph_launch_keeps_the_gil():
+    """The extension's graph_launch replays a captured graph like CUDAGraph.replay() (same result) without releasing
+    the GIL, so a graph replay per block costs microseconds with other Python threads busy (replay() waits for one)."""
+    import time
+
+    from vecworld.engine.ext import load_ext
+
+    launch = load_ext().graph_launch
+    x = torch.randn(4096, device="cuda")
+    y = torch.zeros_like(x)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        y.copy_(x * 2 + 1)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        y.copy_(x * 2 + 1)
+    x.normal_()
+    launch(g.raw_cuda_graph_exec())
+    torch.cuda.synchronize()
+    assert torch.equal(y, x * 2 + 1)
+
+    def per_call(f, n=50):
+        t = time.perf_counter()
+        for _ in range(n):
+            f()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t) / n
+
+    stop = [False]
+
+    def spin():
+        while not stop[0]:
+            pass
+
+    th = [threading.Thread(target=spin, daemon=True) for _ in range(2)]
+    for t in th:
+        t.start()
+    try:
+        ours = per_call(lambda: launch(g.raw_cuda_graph_exec()))
+        theirs = per_call(g.replay)
+    finally:
+        stop[0] = True
+        for t in th:
+            t.join()
+    print(f"\nwith 2 spinning threads: graph_launch {ours * 1e6:.0f} us, CUDAGraph.replay {theirs * 1e6:.0f} us")
+    assert ours < 1e-3
+
+
+# VmHWM, this process' own peak: getrusage's ru_maxrss carries the parent's peak over fork + exec (pytest's, after
+# the modules before it loaded a transformer from a memory-mapped file).
+PAINTER_RSS = """
+import sys
+import vecworld.engine.stream as stream
+if sys.argv[1] == "notrim":
+    stream._trim = lambda: None
+from vecworld.flux.painter import FluxPainter
+p = FluxPainter()
+hwm = [int(x.split()[1]) for x in open("/proc/self/status") if x.startswith("VmHWM:")][0] * 1024
+print("RESULT", hwm, p._arena.nbytes, flush=True)
+p.close()
+"""
+
+
+def _painter_rss(mode="trim"):
+    import os
+    import subprocess
+    import sys
+
+    _trim()                         # hand the freed memory of earlier tests back first: two processes share 14 GB
+    env = {k: v for k, v in os.environ.items() if not k.startswith("VECWORLD_")}
+    out = subprocess.run([sys.executable, "-c", PAINTER_RSS, mode], capture_output=True, text=True, env=env,
+                         timeout=900)
+    line = [x for x in out.stdout.splitlines() if x.startswith("RESULT")]
+    assert line, out.stderr[-2000:]
+    peak, arena = map(int, line[0].split()[1:])
+    return peak, arena
+
+
+def test_painter_packs_the_arena_without_a_second_copy():
+    """FluxPainter reads the GGUF into ordinary host memory and packs it into the arena block by block: the process'
+    peak resident memory stays about one model (arena + ~1 GB of the rest), not two (13.8 GB, OOM-killed on this 14 GB
+    laptop, when glibc kept the freed copies). Measured in a fresh process, before this module loads its transformer."""
+    peak, arena = _painter_rss()
+    print(f"\npeak RSS {peak / 1e9:.2f} GB, arena {arena / 1e9:.3f} GB")
+    assert arena > 6e9 and peak < arena + 2e9
+
+
 # --- the real model ---------------------------------------------------------------------------------------------------
 
 def _trim():
@@ -381,40 +470,3 @@ def test_stream_stop_then_reuse(fx):
     assert torch.cuda.memory_allocated() == mem0
     assert fx.st.pinned_bytes == pin0 and [t.data_ptr() for t in fx.st.slots] == slots0
 
-
-# VmHWM, this process' own peak: getrusage's ru_maxrss carries the parent's peak over fork + exec (pytest's, after
-# the modules before it loaded a transformer from a memory-mapped file).
-PAINTER_RSS = """
-import sys
-import vecworld.engine.stream as stream
-if sys.argv[1] == "notrim":
-    stream._trim = lambda: None
-from vecworld.flux.painter import FluxPainter
-p = FluxPainter()
-hwm = [int(x.split()[1]) for x in open("/proc/self/status") if x.startswith("VmHWM:")][0] * 1024
-print("RESULT", hwm, p._arena.nbytes, flush=True)
-p.close()
-"""
-
-
-def _painter_rss(mode="trim"):
-    import os
-    import subprocess
-    import sys
-
-    env = {k: v for k, v in os.environ.items() if not k.startswith("VECWORLD_")}
-    out = subprocess.run([sys.executable, "-c", PAINTER_RSS, mode], capture_output=True, text=True, env=env,
-                         timeout=900)
-    line = [x for x in out.stdout.splitlines() if x.startswith("RESULT")]
-    assert line, out.stderr[-2000:]
-    peak, arena = map(int, line[0].split()[1:])
-    return peak, arena
-
-
-def test_painter_packs_the_arena_without_a_second_copy():
-    """FluxPainter reads the GGUF into ordinary host memory and packs it into the arena block by block: the process'
-    peak resident memory stays about one model (arena + ~1 GB of the rest), not two (13.8 GB, OOM-killed on this 14 GB
-    laptop, when glibc kept the freed copies). Run alone, in a fresh process."""
-    peak, arena = _painter_rss()
-    print(f"\npeak RSS {peak / 1e9:.2f} GB, arena {arena / 1e9:.3f} GB")
-    assert arena > 6e9 and peak < arena + 2e9

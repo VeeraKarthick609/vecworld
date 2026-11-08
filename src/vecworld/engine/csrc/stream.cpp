@@ -97,6 +97,14 @@ bool host_pinned(int64_t ptr) {
     return a.type == cudaMemoryTypeHost;
 }
 
+// Launch an instantiated CUDA graph (torch.cuda.CUDAGraph.raw_cuda_graph_exec()) on the current stream, keeping the
+// GIL: CUDAGraph.replay() releases it (and, under contention, waits a switch interval to get it back). replay() also
+// runs the graph's RNG prologue, which the FLUX blocks' graphs don't need (they draw no random numbers).
+void graph_launch(int64_t exec) {
+    check(cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(exec), c10::cuda::getCurrentCUDAStream().stream()),
+          "cudaGraphLaunch");
+}
+
 }  // namespace
 
 void register_stream(pybind11::module& m) {
@@ -109,4 +117,5 @@ void register_stream(pybind11::module& m) {
         .def("after", &SlotRing::after, py::arg("slot"))
         .def("copied", &SlotRing::copied, py::arg("slot"));
     m.def("host_pinned", &host_pinned, "whether a host address is page-locked", py::arg("ptr"));
+    m.def("graph_launch", &graph_launch, "cudaGraphLaunch(exec, current stream), keeping the GIL", py::arg("exec"));
 }

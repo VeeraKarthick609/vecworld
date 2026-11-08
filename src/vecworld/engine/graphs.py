@@ -55,6 +55,7 @@ class _Key:
 
     def __init__(self, n: int):
         self.graphs: list[torch.cuda.CUDAGraph | None] = [None] * n
+        self.execs: list[int] = [0] * n                 # each graph's cudaGraphExec_t, launched by the extension
         self.ins: list[tuple | None] = [None] * n       # (es, hs) graph i reads
         self.outs: list[tuple | None] = [None] * n      # (es, hs) block i returns (views of its output buffer)
         self.shared: dict[str, _Shared] = {}
@@ -99,6 +100,10 @@ class GraphRunner:
         self.blocks, self.slots, self.max_graphs, self.enabled = list(blocks), slots, max_graphs, enabled
         self.stats: Counter = Counter()
         self.pool = torch.cuda.graph_pool_handle()
+        from vecworld.engine.ext import load_ext
+
+        # a replay is the extension's cudaGraphLaunch, which keeps the GIL (Task 10a, docs/engine/10-streamer.md)
+        self._launch = load_ext().graph_launch
         self._keys: OrderedDict[tuple, _Key] = OrderedDict()
         self._owner: int | None = None
         self._inner, self._own = [], []
@@ -126,7 +131,7 @@ class GraphRunner:
         for g in k.graphs:
             if g is not None:
                 g.reset()
-        k.graphs, k.ins, k.outs, k.shared, k.bufs = [], [], [], {}, {}
+        k.graphs, k.execs, k.ins, k.outs, k.shared, k.bufs = [], [], [], [], {}, {}
         if not any(g is not None for kk in self._keys.values() for g in kk.graphs):
             # The last graph of the pool is gone, and with it the pool: capturing into its old handle again trips
             # the caching allocator ("use_count > 0" internal assert, torch 2.14). Start a fresh pool.
@@ -159,7 +164,7 @@ class GraphRunner:
             k.shared["temb"].fill(temb, first)
             k.shared["cos"].fill(rot[0], first)
             k.shared["sin"].fill(rot[1], first)
-            k.graphs[i].replay()
+            self._launch(k.execs[i])
             self.stats["replays"] += 1
             return k.outs[i]
 
@@ -203,8 +208,9 @@ class GraphRunner:
                     o.copy_(r)                              # a forward without out=: one copy, in the graph
             del res
         k.graphs[i], k.ins[i], k.outs[i] = g, ins, outs
+        k.execs[i] = g.raw_cuda_graph_exec()
         self.stats["captures"] += 1
-        g.replay()
+        self._launch(k.execs[i])
         self.stats["replays"] += 1
         return outs
 
