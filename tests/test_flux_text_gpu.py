@@ -32,9 +32,13 @@ def _evict(path) -> None:
         os.close(fd)
 
 
-def test_t5_engine_matches_cpu():
-    """The engine's embeddings against the Task 1 path's, three prompts: cosine >= 0.999 over the whole sequence
-    (the plan's bar), and per token."""
+def test_t5_streamed_blocks_match_pread():
+    """The engine path's streaming and slot placement against the Task 1 path (pread into host memory, the same
+    dequantize-then-matmul on the GPU), three prompts: cosine >= 0.999 over the whole sequence (the plan's bar) and
+    per token; in practice identical, so any tensor read from the wrong bytes, put at the wrong slot offset or left
+    stale from another block shows. (Against T5Text(engine="pread", device="cpu"), a CPU bf16 run, the embeddings
+    differ by bf16 accumulation order: cosine 0.9938 overall, real tokens >= 0.998, ten trailing pad positions below
+    0.99; 74 s per encode, too slow for the suite: docs/engine/12-t5-and-results.md.)"""
     from vecworld.config import FLUX_TEXT_LEN
     from vecworld.flux.text import T5Text
 

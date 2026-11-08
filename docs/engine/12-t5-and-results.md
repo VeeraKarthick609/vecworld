@@ -79,11 +79,12 @@ T5's encoder blocks are streamed exactly like FLUX's, by the same code:
 | cold encode, file evicted from the page cache (bench, `t5_encode_cold_s`) | **6.68 s** (`bench/t10c-t5pread-tile512.json`; 10b rows 6.4) | **2.56 s** first in the process, **2.30-2.42 s** after (`bench/t10c-*.json`, in-game probe: 28 misses, 2.32-2.57 s) |
 | inside it | table 3 s + pread 2.2 s + copy / dequant 1.2 s | read 3.28 GB at ~1.8 GB/s (`blocks_s` 2.18-2.34 s, of it waiting on the SSD 0.44 s), setup 0.1 s |
 | embeddings against Task 1 (3 prompts) | | **cosine 1.000000, every token 1.000000, max diff 0: `torch.equal`** |
+| against a CPU bf16 run (`T5Text(engine="pread", device="cpu")`, 1 prompt, 74.0 s, 1.47 GB RSS) | same as engine | cosine 0.9938; the 10 real tokens >= 0.9983; pad positions median 0.9986, 10 trailing ones below 0.99 (worst 0.35); rel L2 0.111: bf16 accumulation order on CPU vs cuBLAS, unmasked pad positions most sensitive |
 | file pages left in the page cache after an encode | 3,387 MB | **0.0 MB** |
 | peak allocated during an encode | 0.66 GB | 0.64 GB (two 141 MB slots + one linear's bf16) |
 | pinned host memory | none | 0.28 GB, only during an encode |
 
-Tests: `tests/test_flux_text_gpu.py::test_t5_engine_matches_cpu` (cosine >= 0.999; measured identical) and
+Tests: `tests/test_flux_text_gpu.py::test_t5_streamed_blocks_match_pread` (cosine >= 0.999 against the pread path; measured identical) and
 `::test_t5_encode_fast` (cold <= 5 s on AC and the file not cached; red at 7.45 s before), CPU
 `test_t5_file_layout_reads_every_tensor_of_its_block_once`, `test_t5_path_rule`,
 `test_ssd_source_reads_a_block_in_several_runs`.
