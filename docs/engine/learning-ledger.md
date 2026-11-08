@@ -9,7 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
-| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08; Task 9 (window batching) added 2026-11-08; Task 10a (block streamer) added 2026-11-08 | 2b, 3, 4, 5, 5b, 5c, 6, 7, 8, 9, 10a |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08; Task 9 (window batching) added 2026-11-08; Task 10a (block streamer) added 2026-11-08, with a Task 10a-g addendum (graphs by default, reverted) |  2b, 3, 4, 5, 5b, 5c, 6, 7, 8, 9, 10a |
 
 ---
 
@@ -1602,7 +1602,7 @@ The fix is per-copy **tickets**: `SlotRing.load` returns a number (1, 2, 3, ...)
 
 No wake-up passed 50 ms, so neither bounded run-ahead nor releasing the GIL around blocking calls was added. With graphs other threads see at most **2.5 ms**. Eager's 24–45 ms worst wake-ups are the same at BASE (42.1 ms): they come from eager execution, not from the streamer. One eager run made while the laptop slipped onto battery (61.5 ms, 42.9 s wall) was discarded and re-run on AC. Caveats: painter only, server stopped, one run per row.
 
-**The ruling: make graphs the default next** (`Must`). The Task 7 ruling said "revisit graphs after Task 10", and the data now exist. Graphs tie eager when quiet (0.86 s, 38.6 s walk step), hold quiet speed under contention (0.86 s against 22.9 s eager), give other threads 2.5 ms worst against 45 ms, and the RNG guard is in. The cost is Task 7's capture: **+3.9 s on the first panorama**. The reviewer's first answer was "not yet" (the stress was synthetic, I3 unmeasured, the guard missing); the last two are now closed. Ruling: a small follow-up step (10a-g) before 10b flips the default. Cost if wrong: one environment default to flip back. Open until then: the stress is still synthetic.
+**The ruling: make graphs the default next** (`Must`). The Task 7 ruling said "revisit graphs after Task 10", and the data now exist. Graphs tie eager when quiet (0.86 s, 38.6 s walk step), hold quiet speed under contention (0.86 s against 22.9 s eager), give other threads 2.5 ms worst against 45 ms, and the RNG guard is in. The cost is Task 7's capture: **+3.9 s on the first panorama**. The reviewer's first answer was "not yet" (the stress was synthetic, I3 unmeasured, the guard missing); the last two are now closed. Ruling: a small follow-up step (10a-g) before 10b flips the default. Cost if wrong: one environment default to flip back. **Reversed the same day: see the Task 10a-g addendum below (graphs stay opt-in).** Open until then: the stress is still synthetic.
 
 **Batch 4 vs 8 under the streamer** (`Understand`). Task 9 left this open. Same session, a1d78dc:
 
@@ -1674,7 +1674,7 @@ Related and found earlier (`Must`): **`malloc_trim` in the arena pack.** Packing
 | **`card_limit` ordering** (chosen) | Walk passes alone at peak 3.32 GiB; fails 5 MB short late in the suite | An ordering fix: the cause (0.24 GB of CUDA library memory) can't be removed in-process. Cost: one flaky `card_limit` test can OOM later modules | — |
 | **`card_limit` first, no host-memory changes** | Suite host-OOM-killed at 17% (anon 13.8 GB) | The walk's leftover heap plus a 13.2 GB test; fixed at the source (loader and trim) instead of reshuffling more tests | — |
 | **Keep diffusers' loader in `bench_flux.load_transformer`** | 12.75–13.17 GB peak for one test; 13.2 GB at fcbfe73 too | It holds the memory map and the copies at once; the painter's `_read_gguf` peaks at 7.75 GB | — |
-| **Make graphs the default inside 10a** | Reviewer: "not yet" (stress synthetic, I3 unmeasured, RNG guard missing) | I3 and the RNG guard are now closed (the stress is still synthetic, the capture cost remains); ruling: a separate step (10a-g) before 10b, one default to flip back | — |
+| **Make graphs the default inside 10a** | Reviewer: "not yet" (stress synthetic, I3 unmeasured, RNG guard missing) | I3 and the RNG guard are now closed (the stress is still synthetic, the capture cost remains); ruling: a separate step (10a-g) before 10b, one default to flip back | — (reversed in 10a-g: see the addendum) |
 | **`host_pinned` check on BlockSlots' per-tensor sources** (M6) | Breaks Task 7's toy tests (pageable host copies) | Deferred; fold BlockSlots into BlockStreamer over a `HostArena` when 10b touches the seam (N1 is one more reason) | — |
 
 Deferred minors: M2, M4 (cost of the 57 trims in the +3 s load not measured), M6, the rest of M7, N1 (the base `BlockSlots` path never retires ticket events, so one CUDA event per load accumulates), N4–N8 (a `close()` racing a reader raises `AttributeError`; tickets restart at 1 after a re-install; the `copy_done` docstring over-promises across threads; the pinned-stats assertion goes silent if its key is missing; CUDA error paths in `SlotRing::load`; `native_dropout(train=None)` read as eval). Folded into 10a-g: N2, N3 and N9 (commit `ticker.py`, which the explainer cites but the repo lacks).
@@ -1700,6 +1700,49 @@ Deferred minors: M2, M4 (cost of the 57 trims in the +3 s load not measured), M6
 </details>
 
 > **Remember this:** when you can't make a hand-off cheap, make it disappear. Pinned memory plus a C++ ring that keeps the GIL gave graphs quiet speed under contention, and a ticker showed it didn't starve other threads. Memory that PyTorch doesn't track (CUDA libraries, glibc's freed heap, a loader's double copy) is still memory, so measure the whole process.
+
+---
+
+#### Task 10a-g addendum: graphs by default, tried and reverted
+
+`Must` for the reversal and its reason (a crash on a long-lived server beats gains the server hasn't shown). `Understand` for the pool-bytes problem and the `f_locals` gotcha. `Skip` the review's minors.
+
+> **Plain version.** Task 10a ended with a ruling to make CUDA graphs the default. In 10a-g it was built, measured, and **reverted the same day**. Quiet speed is a tie, the first panorama costs 8.4 s more, and the pools of captured graphs are capped by *shape count*, not bytes: five window shapes in one process OOM the 4 GB card. In a long-lived server that means a crash, which beats GIL and ticker gains the server has never shown it needs. Graphs stay opt-in (`VECWORLD_GRAPHS=1`). The ruling was wrong about its own "cost if wrong" (it assumed +3.9 s and a flag to flip back; the real first-panorama cost was +8.4 s and the real risk was memory).
+
+**What was measured** (`Must`). AC, server stopped, same session, graphs measured with the default flipped on:
+
+| | graphs | eager |
+|---|---|---|
+| tile512 s / pass | 0.874-0.881 | 0.880-0.888 (**tie**) |
+| walk step s (5 passes) | 38.6 | 38.8 |
+| first panorama, cold process | **38.0** (batch-8 capture pass 15.06 s vs 7.05 s) | **29.6** (+8.4 s) |
+| device peak, batch 1 / batch 8 | 1.249 / **2.235 GB** | 1.225 / **2.045 GB** |
+| batches 1, 2, 4, 6 in one process | 1.249 / 1.431 / 1.792 / 2.233 GB | 1.225 / 1.342 / 1.576 / 1.810 GB |
+| peak sweep over batches 1, 2, 4, 6, 8 in one process | **CUDA OOM at the fifth shape**: 3.35 GiB allocated, **904 MiB in graph pools**, on a 3.68 GiB card | fine |
+| GIL stress / ticker worst (from 10a) | 0.86 s vs 22.9 s eager / 2.5 vs 45 ms | |
+
+The gate with graphs on: **PASS, Δ +0.000, PSNR inf, 18 of 18 spots byte-identical** to Task 9, so the opt-in graphs path is still lossless. The eager default isn't re-walked: its gate is 10a's. Full suite on the final code: **850 passed in 1898 s**.
+
+**Why it was reverted** (`Must`). Graph pools are kept and capped at `FLUX_GRAPH_MAX=4` shapes, but a cap on *shapes* says nothing about *bytes*: a fifth capture pushed allocated memory plus pools past the card. A game server meets several window shapes over a long session, and an OOM there crashes the game. What graphs buy (GIL immunity, 2.5 ms against 45 ms) only matters under contention the real server hasn't shown. Ruling: revert the flip, keep N2/N3/N9, reversing the 10a-close ruling. Cost if wrong: the server keeps eager's 45 ms worst other-thread wake-ups and GIL sensitivity. Done by hand, test flipped red first, because a plain `git revert` conflicted with later doc edits. Lesson: a ruling's "cost if wrong" is a guess, so measure the thing it guessed (here the first-panorama cost, 3.9 vs 8.4 s) before acting, and run the *whole* sweep, not one shape.
+
+**The follow-up, parked until after 10c** (`Understand`). Graphs-by-default needs (a) **byte-budgeted pool eviction**, evicting by pool bytes rather than shape count, and (b) **capture at server startup**, so the +8.4 s isn't paid by the first player. Revisit then.
+
+**N2, N3, N9** (kept, `Understand`):
+- **N2, the arena stays registered if something later fails.** `stream_blocks(pack=True)` now closes slots and arena if the `GraphRunner` fails, and `FluxPainter.__init__` closes everything if anything after the streamer raises (the original error is the one raised). The CPU test holds the traceback on purpose: CPython's `__del__` would otherwise clean up and hide the bug.
+- **N3, a failing `card_limit` test poisoned later GPU modules.** pytest keeps a failure's traceback, which held ~3.3 GB of GPU memory. `tests/gpu_release.py` is a hookwrapper that clears the failing test's frame locals and calls `empty_cache`. **The gotcha:** `traceback.clear_frames` alone left the toy holding **268,435,456 bytes**, because pytest keeps an `f_locals` *snapshot dict* (CPython 3.12) that survives `frame.clear()`, and it still referenced the tensor. The hook clears that dict too. The proof is a toy session in a subprocess: without the hook 2 failed, with it 1 failed and 1 passed.
+- **N9, ticker committed** as `bench/ticker.py` (graphs: `VECWORLD_GRAPHS=1`), referenced from `docs/engine/10-streamer.md`, so the 10a table can be reproduced. Also `BENCH_PEAK_BATCHES` lets the peak bench run one batch per process.
+
+**Tried and not chosen** (`Understand`):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **Graphs on by default** (3c37274, reverted ee23cec) | Tie when quiet (0.877 vs 0.885 s/pass); first panorama 38.0 vs 29.6 s; +0.19 GB at batch 8; OOM at the fifth shape (904 MiB of pools) | Pool size capped by shape count, not bytes: a crash risk in a long-lived server | After byte-budgeted eviction and startup capture; or a server that shows real GIL contention |
+| **`git revert` of the flip** | — | Later commits touch the same docs; reverted by hand | — |
+| **`try/finally` in the two walk tests for N3** | — | Covers only those two tests; the hookwrapper covers any `card_limit` test | — |
+| **`traceback.clear_frames` alone for N3** | Toy kept 268,435,456 bytes | pytest's `f_locals` snapshot dict still referenced the tensor | On Python 3.13+, where it is a proxy |
+| **Whole peak sweep in one process with graphs** | OOM at batch 8 | Split per batch (`BENCH_PEAK_BATCHES`) | — |
+
+> **Remember this:** a default that can crash the server is not a default, however good the quiet-case numbers look. Cap caches by bytes, not by count.
 
 ---
 
