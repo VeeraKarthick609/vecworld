@@ -6,10 +6,11 @@ from typing import Protocol
 import numpy as np
 from PIL import Image
 
-from vecworld.config import (BG_STRENGTH, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, STEP_STEPS, VAE_MARGIN,
-                             VAE_STRIDE, VAE_TILE, WIN)
+from vecworld.config import (BG_STRENGTH, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, STEP_STEPS, VAE_TILE,
+                             WIN)
 from vecworld.dream.gpu import check_stop
-from vecworld.dream.pano import focus_mask, ramp, tile_origins, windows, wrap_cols
+from vecworld.dream.pano import focus_mask, windows, wrap_cols
+from vecworld.dream.vae import TiledVae
 
 Prompt = list[tuple[str, float]]   # (text, weight); weights sum to 1
 BATCH = 4                          # UNet windows per forward pass
@@ -31,7 +32,7 @@ class Painter(Protocol):
              seed: int, bg_strength: float | None = None, focus_half: float | None = None) -> Image.Image: ...
 
 
-class TurboPainter(Painter):
+class TurboPainter(TiledVae, Painter):
     """SD-Turbo (fp16, default SDPA attention) denoising a PANO_W x PANO_H cylinder in wrapping windows.
 
     Attention slicing is deliberately off: it ran out of memory at this size. SD-Turbo has no CFG,
@@ -72,47 +73,6 @@ class TurboPainter(Painter):
 
     def _embed(self, prompt: Prompt):
         return sum(w * self._text(t) for t, w in prompt)
-
-    # --- VAE, tiled along the wrapping width -------------------------------------
-    # Each tile is coded with VAE_MARGIN of wrap-around context, cropped, and crossfaded with its
-    # neighbours over their overlap: per-tile GroupNorm gives each tile its own colour offset, which hard
-    # crops showed as vertical lines. The grid moves with the seed so no boundary stays put.
-
-    def _decode(self, lat, shift: int = 0) -> Image.Image:
-        torch, w, m = self._torch, lat.shape[-1], VAE_MARGIN
-        acc = wsum = None
-        wt = torch.from_numpy(ramp(VAE_TILE * 8, (VAE_TILE - VAE_STRIDE) * 8)).to(lat.device)
-        for x0 in tile_origins(w, shift):
-            check_stop()
-            px = self.vae.decode(lat[..., wrap_cols(x0 - m, VAE_TILE + 2 * m, w)] / self._sf).sample
-            px = px[..., m * 8:(m + VAE_TILE) * 8].float()
-            if acc is None:
-                acc = torch.zeros((*px.shape[:-1], w * 8), device=px.device)
-                wsum = torch.zeros(w * 8, device=px.device)
-            cols = torch.tensor(wrap_cols(x0 * 8, VAE_TILE * 8, w * 8), device=px.device)
-            acc.index_add_(-1, cols, px * wt)
-            wsum.index_add_(0, cols, wt)
-        img = (acc / wsum)[0].clamp(-1, 1)
-        return Image.fromarray(((img + 1) * 127.5).round().byte().permute(1, 2, 0).cpu().numpy())
-
-    def _encode(self, im: Image.Image, shift: int = 0):
-        torch, m = self._torch, VAE_MARGIN
-        a = np.asarray(im.convert("RGB").resize((PANO_W, PANO_H)))
-        x = torch.from_numpy(a.copy()).permute(2, 0, 1)[None].to(self._dev, self._dtype) / 127.5 - 1
-        w = x.shape[-1] // 8
-        acc = wsum = None
-        wt = torch.from_numpy(ramp(VAE_TILE, VAE_TILE - VAE_STRIDE)).to(x.device)
-        for x0 in tile_origins(w, shift):
-            check_stop()
-            lat = self.vae.encode(x[..., wrap_cols((x0 - m) * 8, (VAE_TILE + 2 * m) * 8, w * 8)]).latent_dist.mean
-            lat = lat[..., m:m + VAE_TILE].float()
-            if acc is None:
-                acc = torch.zeros((*lat.shape[:-1], w), device=x.device)
-                wsum = torch.zeros(w, device=x.device)
-            cols = torch.tensor(wrap_cols(x0, VAE_TILE, w), device=x.device)
-            acc.index_add_(-1, cols, lat * wt)
-            wsum.index_add_(0, cols, wt)
-        return (acc / wsum * self._sf).to(self._dtype)
 
     # --- MultiDiffusion -------------------------------------------------------------
 

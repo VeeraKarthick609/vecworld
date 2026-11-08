@@ -938,3 +938,16 @@ def test_close_frees_slots_and_unpins_even_if_the_runner_fails(monkeypatch):
     assert done == ["slots", "arena", ("unpin", (1, 2))]
     assert p._runner is None and p._slots is None and p._arena is None and p._pinned == []
     p.close()                                               # safe twice
+
+
+def test_flux_painter_does_not_borrow_turbo_painter():
+    """C5 (Task 10c): the game's default painter no longer reaches into SD-Turbo's painter. Its tiled VAE decode and
+    encode come from dream.vae.TiledVae (TurboPainter shares it), and the FLUX painter's module doesn't import
+    TurboPainter; TurboPainter stays for VECWORLD_PAINTER=turbo, its GPU tests and the SD-Turbo comparison sheets."""
+    import vecworld.flux.painter as fp
+    from vecworld.dream.painter import TurboPainter
+    from vecworld.dream.vae import TiledVae
+
+    assert not hasattr(fp, "TurboPainter")
+    assert fp.FluxPainter._tiled_decode is TiledVae._decode and fp.FluxPainter._tiled_encode is TiledVae._encode
+    assert TurboPainter not in fp.FluxPainter.__mro__ and issubclass(TurboPainter, TiledVae)

@@ -39,7 +39,8 @@ from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENG
                              FLUX_GGUF, FLUX_GRAPH_MAX, FLUX_SLOT_RING, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
                              FLUX_STYLE, FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
 from vecworld.dream.gpu import check_stop
-from vecworld.dream.painter import Painter, Prompt, TurboPainter
+from vecworld.dream.painter import Painter, Prompt
+from vecworld.dream.vae import TiledVae
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
 from vecworld.engine import (engine_batch, engine_cache_threshold, engine_fuse, engine_graphs, engine_kernel,
                              engine_t5, engine_weights_source, keep_for, load_engine_ext)
@@ -487,18 +488,18 @@ class FluxPainter(Painter):
               for k in range(len(sig))]
         return sig, rw
 
-    # --- VAE, tiled along the wrapping width (TurboPainter's crossfaded tiles) -------------------------------
-    # TurboPainter decodes vae.decode(lat / sf) and encodes mean * sf; FLUX's VAE adds a shift factor:
+    # --- VAE, tiled along the wrapping width (dream.vae.TiledVae's crossfaded tiles, shared with SD-Turbo) ----
+    # TiledVae decodes vae.decode(lat / sf) and encodes mean * sf; FLUX's VAE adds a shift factor:
     # decode (lat / sf + shift) = decode((lat + shift * sf) / sf), encode (mean - shift) * sf.
 
-    _turbo_decode, _turbo_encode = TurboPainter._decode, TurboPainter._encode
+    _tiled_decode, _tiled_encode = TiledVae._decode, TiledVae._encode
 
     def _decode(self, grid, shift: int = 0) -> Image.Image:
         lat = self._unpack(grid).to(self._dtype)
-        return self._turbo_decode(lat + self._shift * self._sf, shift)
+        return self._tiled_decode(lat + self._shift * self._sf, shift)
 
     def _encode(self, im: Image.Image, shift: int = 0):
-        return self._pack(self._turbo_encode(im, shift).float() - self._shift * self._sf)
+        return self._pack(self._tiled_encode(im, shift).float() - self._shift * self._sf)
 
     # --- MultiDiffusion --------------------------------------------------------------------------------
 

@@ -25,7 +25,8 @@ class NoDreamer:
 
 
 def make_painter(name: str):
-    """VECWORLD_PAINTER: flux (default) or turbo."""
+    """VECWORLD_PAINTER: flux (the default) or turbo (SD-Turbo, opt-in only: the earlier painter, kept to compare
+    against; nothing on the FLUX path uses it since Task 10c)."""
     if name == "flux":
         from vecworld.flux.painter import FluxPainter
 
