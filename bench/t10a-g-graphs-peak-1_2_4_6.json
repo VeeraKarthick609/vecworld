@@ -1,0 +1,68 @@
+{
+ "power": "ac",
+ "git": "76605bd-dirty",
+ "results": {
+  "what": "peak",
+  "painter": "engine",
+  "kernel": "w4a8",
+  "fused": true,
+  "batch": 8,
+  "graphs": true,
+  "cache_threshold": 0.0,
+  "gpu_power": "80.00 4 8",
+  "load_s": 13.3,
+  "rss_after_setup_gb": 7.52,
+  "pinned_gb": 6.66,
+  "t5_encode_cold_s": 6.48,
+  "mon_t5": {
+   "rss_gb": 8.07,
+   "smi_mib": 1938
+  },
+  "batch1": {
+   "peak_alloc_gb": 1.249,
+   "first_pass_s": 2.033,
+   "s_per_pass": 0.899,
+   "s_per_window": 0.899,
+   "passes_s": [
+    0.898,
+    0.899,
+    0.899
+   ]
+  },
+  "batch2": {
+   "peak_alloc_gb": 1.431,
+   "first_pass_s": 3.776,
+   "s_per_pass": 1.768,
+   "s_per_window": 0.884,
+   "passes_s": [
+    1.767,
+    1.768,
+    1.77
+   ]
+  },
+  "batch4": {
+   "peak_alloc_gb": 1.792,
+   "first_pass_s": 7.58,
+   "s_per_pass": 3.608,
+   "s_per_window": 0.902,
+   "passes_s": [
+    3.577,
+    3.613,
+    3.608
+   ]
+  },
+  "batch6": {
+   "peak_alloc_gb": 2.233,
+   "first_pass_s": 11.704,
+   "s_per_pass": 5.488,
+   "s_per_window": 0.915,
+   "passes_s": [
+    5.486,
+    5.488,
+    5.54
+   ]
+  },
+  "wall_s": 80.3,
+  "gpu_power_end": "80.00 4 8"
+ }
+}

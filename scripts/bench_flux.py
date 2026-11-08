@@ -222,7 +222,7 @@ def do_peak(R, mon):
     p, prompt, _ = load_painter(R, mon)
     with torch.inference_mode():
         e = p._embed(prompt)
-        for b in (1, 2, 4, 6, 8):
+        for b in [int(x) for x in os.environ.get("BENCH_PEAK_BATCHES", "1,2,4,6,8").split(",")]:   # a subset: one process each
             g = torch.randn(b, 64, FLUX_WIN, FLUX_WIN, device="cuda", generator=torch.Generator("cuda").manual_seed(b))
             torch.cuda.synchronize(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
             t = time.time(); p._forward(g, [e] * b, 1.0); torch.cuda.synchronize(); first = time.time() - t

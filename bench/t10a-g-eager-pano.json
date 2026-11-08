@@ -1,0 +1,48 @@
+{
+ "power": "ac",
+ "git": "76605bd",
+ "results": {
+  "what": "pano",
+  "painter": "engine",
+  "kernel": "w4a8",
+  "fused": true,
+  "batch": 8,
+  "graphs": false,
+  "cache_threshold": 0.0,
+  "gpu_power": "80.00 4 8",
+  "load_s": 12.8,
+  "rss_after_setup_gb": 7.52,
+  "pinned_gb": 6.66,
+  "t5_encode_cold_s": 6.38,
+  "mon_t5": {
+   "rss_gb": 8.06,
+   "smi_mib": 1938
+  },
+  "pano": {
+   "s": 29.6,
+   "passes": 4,
+   "s_per_pass_median": 7.05,
+   "s_per_pass_mean": 7.011,
+   "s_per_pass_min": 6.935,
+   "s_per_pass_max": 7.092,
+   "s_per_pass": [
+    7.051,
+    6.935,
+    6.965,
+    7.092
+   ],
+   "peak_alloc_gb": 2.05,
+   "rss_gb": 8.49,
+   "smi_mib": 2246,
+   "window_passes": 32,
+   "s_per_window_step": 0.876,
+   "cache": {
+    "passes": 4,
+    "skips": 0,
+    "rel": []
+   }
+  },
+  "wall_s": 48.9,
+  "gpu_power_end": "80.00 4 8"
+ }
+}
