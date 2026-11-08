@@ -69,6 +69,22 @@ def engine_cache_threshold(kernel: str | None) -> float:
     return t if kernel is not None else 0.0
 
 
+WEIGHT_SOURCES = ("ssd", "ram")
+
+
+def engine_weights_source(kernel: str | None) -> str:
+    """Where the streamed FLUX blocks' weights come from (Task 10b, docs/engine/11-io-uring.md), the one rule for the
+    painter, the game and the bench: FLUX_WEIGHTS_SOURCE in the environment, else config.FLUX_WEIGHTS_SOURCE; "ssd"
+    (read from the GGUF with O_DIRECT through io_uring, nothing resident) or "ram" (the page-locked arena, Task 10a).
+    Under "off" (kernel None: diffusers' group offload from RAM) always "ram"."""
+    from vecworld.config import FLUX_WEIGHTS_SOURCE
+
+    v = (os.environ.get("FLUX_WEIGHTS_SOURCE") or FLUX_WEIGHTS_SOURCE).strip().lower()
+    if v not in WEIGHT_SOURCES:
+        raise ValueError(f"FLUX_WEIGHTS_SOURCE={v!r}; use ssd or ram")
+    return v if kernel is not None else "ram"
+
+
 def engine_batch(kernel: str | None = "engine") -> int:
     """Windows per transformer pass (Task 9, docs/engine/09-batching.md), the one rule for the painter, the walk and the
     bench. Under an engine kernel (any name; the default, for callers without one such as the CPU fakes):

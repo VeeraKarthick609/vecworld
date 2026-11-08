@@ -286,3 +286,44 @@ def test_ssd_source_hands_out_each_block_and_reuses_buffers_only_after_their_cop
     finally:
         src.close()
         src.close()
+
+
+# --- the switch --------------------------------------------------------------------------------------------------------
+
+def test_weights_source_rule(monkeypatch):
+    """FLUX_WEIGHTS_SOURCE (environment, else config) picks ssd or ram under an engine kernel; under VECWORLD_KERNEL=off
+    (diffusers\x27 group offload from RAM) it is always ram; anything else is refused."""
+    from vecworld.config import FLUX_WEIGHTS_SOURCE
+    from vecworld.engine import engine_weights_source
+
+    monkeypatch.delenv("FLUX_WEIGHTS_SOURCE", raising=False)
+    assert engine_weights_source("w4a8") == FLUX_WEIGHTS_SOURCE == "ssd"
+    monkeypatch.setenv("FLUX_WEIGHTS_SOURCE", " RAM ")
+    assert engine_weights_source("w4a8") == "ram"
+    monkeypatch.setenv("FLUX_WEIGHTS_SOURCE", "ssd")
+    assert engine_weights_source("mma") == "ssd" and engine_weights_source(None) == "ram"
+    monkeypatch.setenv("FLUX_WEIGHTS_SOURCE", "nvme")
+    with pytest.raises(ValueError, match="ssd or ram"):
+        engine_weights_source("w4a8")
+
+
+def test_dreamer_auto_is_on_unless_flux_holds_its_weights_in_ram(monkeypatch):
+    """VECWORLD_DREAMER=auto (the default): the Qwen dreamer runs beside FLUX reading its blocks from the SSD (Task 10b)
+    and beside Turbo; beside FLUX with the 6.66 GB arena in RAM (FLUX_WEIGHTS_SOURCE=ram, or VECWORLD_KERNEL=off) it
+    stays off. on / off are obeyed."""
+    import vecworld.__main__ as main
+    import vecworld.dream.ideas as ideas
+
+    monkeypatch.setattr(ideas, "QwenDreamer", lambda: "qwen")
+    for k in ("FLUX_WEIGHTS_SOURCE", "VECWORLD_KERNEL"):
+        monkeypatch.delenv(k, raising=False)
+    assert main.make_dreamer("auto", "flux") == "qwen"
+    assert main.make_dreamer("auto", "turbo") == "qwen"
+    monkeypatch.setenv("FLUX_WEIGHTS_SOURCE", "ram")
+    assert isinstance(main.make_dreamer("auto", "flux"), main.NoDreamer)
+    assert main.make_dreamer("on", "flux") == "qwen"
+    monkeypatch.setenv("FLUX_WEIGHTS_SOURCE", "ssd")
+    monkeypatch.setenv("VECWORLD_KERNEL", "off")
+    assert isinstance(main.make_dreamer("auto", "flux"), main.NoDreamer)
+    monkeypatch.delenv("VECWORLD_KERNEL")
+    assert isinstance(main.make_dreamer("off", "flux"), main.NoDreamer)

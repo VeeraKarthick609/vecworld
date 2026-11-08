@@ -144,8 +144,9 @@ def load_painter(R, mon):
     p = FluxPainter(progress=lambda k, n: passes.append(_event()))
     R["load_s"] = round(time.time() - t0, 1)
     R["rss_after_setup_gb"] = round(rss_gb(), 2)
-    arena = getattr(p, "_arena", None)          # page-locked host memory: the blocks' arena (Task 10a); None when pinned in place (off)
-    R["pinned_gb"] = round(arena.nbytes / 1e9, 2) if arena is not None else None
+    slots = getattr(p, "_slots", None)          # page-locked host memory: the blocks' arena (Task 10a) or the SSD reader's staging ring (10b); None when pinned in place (off)
+    R["pinned_gb"] = round(slots.pinned_bytes / 1e9, 2) if slots is not None else None
+    R["weights_source"] = getattr(p, "weights_source", None)
     prompt = [(f"{PROMPT}, {FLUX_STYLE}", 1.0)]
     mon.reset()
     t = time.time(); p.t5.encode(prompt[0][0]); R["t5_encode_cold_s"] = round(time.time() - t, 2)
@@ -160,13 +161,37 @@ def _event():
     return e
 
 
-def timed(fn, passes, mon):
-    """Run fn; its wall time, and each pass's GPU time (between the CUDA events progress() recorded)."""
+def _cached_gb():
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("Cached:"):
+                return int(line.split()[1]) / 1e6
+    return 0.0
+
+
+def _ssd(p):
+    """The SSD reader's counters (Task 10b; None when the blocks come from RAM)."""
+    reader = getattr(getattr(p, "_slots", None), "reader", None)
+    return dict(reader.stats) if reader is not None else None
+
+
+def timed(fn, passes, mon, p=None):
+    """Run fn; its wall time, and each pass's GPU time (between the CUDA events progress() recorded). With the
+    painter p reading its blocks from the SSD, also what the reader did meanwhile and the page cache (Cached) change."""
     import torch
     torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); mon.reset(); passes.clear()
+    s0, c0 = _ssd(p), _cached_gb()
     t = time.time(); t0 = _event(); out = fn(); torch.cuda.synchronize(); dt = time.time() - t
     gaps = [a.elapsed_time(b) / 1000 for a, b in zip([t0] + passes[:-1], passes)]
-    return out, dict(s=round(dt, 1), passes=len(passes), s_per_pass_median=round(sorted(gaps)[len(gaps) // 2], 2),
+    extra = {}
+    if s0 is not None:
+        s1 = _ssd(p)
+        d = {k: s1[k] - s0[k] for k in s1}
+        extra["ssd"] = dict(reads=d["reads"], gb=round(d["bytes"] / 1e9, 2), hits=d["hits"],
+                            read_wait_s=round(d["read_wait_s"], 2), buffer_wait_s=round(d["buffer_wait_s"], 2),
+                            gb_per_s_wall=round(d["bytes"] / 1e9 / dt, 2))
+    extra["cached_gb"] = [round(c0, 2), round(_cached_gb(), 2)]
+    return out, dict(**extra, s=round(dt, 1), passes=len(passes), s_per_pass_median=round(sorted(gaps)[len(gaps) // 2], 2),
                      s_per_pass_mean=round(sum(gaps) / len(gaps), 3),
                      s_per_pass_min=round(min(gaps), 3), s_per_pass_max=round(max(gaps), 3),
                      s_per_pass=[round(g, 3) for g in gaps],
@@ -209,7 +234,7 @@ def do_tile512(R, mon):
         e = p._embed(prompt)
         run_tile512(p, e, 1)                                                 # warm-up
         p.cache.rel.clear()
-        _, R["tile512"] = timed(lambda: run_tile512(p, e, FLUX_STEPS), passes, mon)
+        _, R["tile512"] = timed(lambda: run_tile512(p, e, FLUX_STEPS), passes, mon, p)
         R["tile512"]["cache"] = _cache_record(p)
 
 
@@ -258,7 +283,7 @@ def do_pano(R, mon):
     p, prompt, passes = load_painter(R, mon)
     p.cache.rel.clear()
     wins = _count_windows(p)
-    img, R["pano"] = timed(lambda: p.panorama(prompt, seed=21), passes, mon)
+    img, R["pano"] = timed(lambda: p.panorama(prompt, seed=21), passes, mon, p)
     _per_window(R["pano"], wins[0])
     R["pano"]["cache"] = _cache_record(p)
     (ROOT / "bench").mkdir(exist_ok=True); img.save(ROOT / "bench/last_pano.png")
@@ -272,7 +297,7 @@ def do_step(R, mon):
     prev = dolly(p.panorama(prompt, seed=21), 1.6)
     wins = _count_windows(p)
     p.cache.rel.clear()
-    img, R["step"] = timed(lambda: p.step(prev, prompt, None, 0.5, seed=22, focus_half=focus_half(1.6)), passes, mon)
+    img, R["step"] = timed(lambda: p.step(prev, prompt, None, 0.5, seed=22, focus_half=focus_half(1.6)), passes, mon, p)
     _per_window(R["step"], wins[0])
     R["step"]["cache"] = _cache_record(p)
     R["step"]["s_per_window_pass"] = round(R["step"]["s"] / max(wins[0], 1), 2)   # wall time incl. VAE and text

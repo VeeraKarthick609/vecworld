@@ -118,6 +118,15 @@ FLUX_BATCH = 8
 # it: a walk uses up to FLUX_BATCH (1..8 windows a pass; graphs are opt-in).
 FLUX_SLOT_RING = 3
 FLUX_GRAPH_MAX = 4
+# Where the streamed blocks' weights come from (Task 10b, docs/engine/11-io-uring.md; FLUX_WEIGHTS_SOURCE in the
+# environment overrides it): "ssd" reads each block from the GGUF file with O_DIRECT through io_uring into
+# FLUX_SSD_BUFFERS page-locked staging buffers (191 MB each), reading FLUX_SSD_AHEAD blocks ahead, so no weights stay in
+# RAM; "ram" keeps all of them in one 6.66 GB page-locked arena (Task 10a). Under VECWORLD_KERNEL=off always "ram".
+FLUX_WEIGHTS_SOURCE = "ssd"
+FLUX_SSD_BUFFERS = 3
+FLUX_SSD_AHEAD = 2
+FLUX_SSD_QUEUE_DEPTH = 64       # 1 MB reads in the kernel at once (the SSD saturates at any depth from 4)
+FLUX_SSD_CHUNK = 1 << 20
 # First-block cache (Task 8, docs/engine/08-block-cache.md): a pass skips blocks 1..56 while block 0's residual has
 # changed by less than this (summed relative L1 change over the window batch's steps); 0.0 is off.
 # VECWORLD_CACHE_THRESHOLD overrides it; under VECWORLD_KERNEL=off it is always off. Off by the Task 8 sweep: 0.3 and

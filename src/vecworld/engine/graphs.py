@@ -268,19 +268,27 @@ class GraphRunner:
 
 
 def stream_blocks(transformer: torch.nn.Module, device="cuda", ring: int = FLUX_SLOT_RING, graphs: bool = True,
-                  max_graphs: int = FLUX_GRAPH_MAX, pack: bool = False) -> tuple[BlockSlots, GraphRunner]:
+                  max_graphs: int = FLUX_GRAPH_MAX, pack: bool = False, ssd: str | None = None,
+                  reader: dict | None = None) -> tuple[BlockSlots, GraphRunner]:
     """Put a FLUX transformer on the engine's block streaming, in place of diffusers' group offload: everything but
     the blocks moves to `device` for good (embedders, output norm and projection: ~57 MB), the blocks view into `ring`
     slots, and a GraphRunner replays them (graphs=False: eagerly). Call it after swap_linears and patch_blocks.
 
     pack=False: the blocks' current (host, page-locked) tensors become BlockSlots' host copies (Task 7). pack=True (the
     painter, Task 10a): their (not page-locked) host tensors are moved into one page-locked arena, block by block, and
-    an engine.stream.BlockStreamer streams each block with one copy from it (its arena: the streamer's .arena)."""
+    an engine.stream.BlockStreamer streams each block with one copy from it (its arena: the streamer's .arena).
+    ssd=<the GGUF's path> (the painter under FLUX_WEIGHTS_SOURCE=ssd, Task 10b): the BlockStreamer reads each block
+    from the file instead (BlockStreamer.from_ssd; reader: its SsdSource settings; the reader: the streamer's .reader)
+    and the blocks' host tensors are dropped."""
     for name, child in transformer.named_children():
         if name not in BLOCK_LISTS:
             child.to(device)
     blocks = [b for name in BLOCK_LISTS for b in getattr(transformer, name)]
-    if pack:
+    if ssd is not None:
+        from vecworld.engine.stream import BlockStreamer
+
+        slots = BlockStreamer.from_ssd(blocks, ssd, ring=ring, device=device, **(reader or {}))
+    elif pack:
         from vecworld.engine.stream import BlockStreamer
 
         slots = BlockStreamer.packed(blocks, ring=ring, device=device)
@@ -290,9 +298,9 @@ def stream_blocks(transformer: torch.nn.Module, device="cuda", ring: int = FLUX_
     try:
         return slots, GraphRunner(blocks, slots, max_graphs=max_graphs, enabled=graphs)
     except BaseException:
-        if pack:                    # the arena is registered and nobody else owns it yet (the caller never got `slots`)
-            try:
-                slots.close()       # the blocks back on their arena views, then the arena unregistered
+        if pack or ssd is not None:  # the arena / reader is registered and nobody else owns it (the caller never got
+            try:                     # `slots`)
+                slots.close()       # the blocks back on their arena views (placeholders from the SSD), then unregistered
             finally:
-                slots.arena.close()
+                (slots.reader if ssd is not None else slots.arena).close()
         raise

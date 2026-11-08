@@ -22,6 +22,32 @@ p.close()
 """
 
 
+# The painter from the SSD (Task 10b): its peak and settled RSS, its page-locked bytes, and the page cache (Cached in
+# /proc/meminfo) before and after a pass, which reads the whole 6.66 GB of blocks from the file.
+SSD_RSS = """
+import importlib.util, sys
+from pathlib import Path
+import torch
+from vecworld.flux.painter import FluxPainter
+def cached():
+    return [int(x.split()[1]) for x in open("/proc/meminfo") if x.startswith("Cached:")][0] * 1024
+def status(k):
+    return [int(x.split()[1]) for x in open("/proc/self/status") if x.startswith(k + ":")][0] * 1024
+spec = importlib.util.spec_from_file_location("bench_flux", sys.argv[1])
+bench = importlib.util.module_from_spec(spec); spec.loader.exec_module(bench)
+p = FluxPainter()
+hwm, rss = status("VmHWM"), status("VmRSS")
+with torch.inference_mode():
+    e = p._embed([("a quiet lake at dawn", 1.0)])
+    c0 = cached()
+    bench.run_tile512(p, e, 2)
+    torch.cuda.synchronize()
+    c1 = cached()
+print("RESULT", p.weights_source, hwm, rss, status("VmRSS"), p._slots.pinned_bytes, c0, c1, flush=True)
+p.close()
+"""
+
+
 def _painter_rss(mode="trim"):
     import os
     import subprocess
@@ -36,10 +62,19 @@ def _painter_rss(mode="trim"):
     if torch.cuda.is_initialized():
         torch.cuda.empty_cache()    # and this process' cached GPU memory: the child needs ~1 GB of the 4 GB card
     env = {k: v for k, v in os.environ.items() if not k.startswith("VECWORLD_")}
-    out = subprocess.run([sys.executable, "-c", PAINTER_RSS, mode], capture_output=True, text=True, env=env,
-                         timeout=900)
+    if mode == "ssd":
+        from pathlib import Path
+
+        env["FLUX_WEIGHTS_SOURCE"] = "ssd"
+        args = [SSD_RSS, str(Path(__file__).parents[1] / "scripts/bench_flux.py")]
+    else:
+        env["FLUX_WEIGHTS_SOURCE"] = "ram"                  # the arena (the default is the SSD since Task 10b)
+        args = [PAINTER_RSS, mode]
+    out = subprocess.run([sys.executable, "-c", *args], capture_output=True, text=True, env=env, timeout=900)
     line = [x for x in out.stdout.splitlines() if x.startswith("RESULT")]
     assert line, out.stderr[-2000:]
+    if mode == "ssd":
+        return line[0].split()[1:]
     peak, arena = map(int, line[0].split()[1:])
     return peak, arena
 
@@ -52,3 +87,18 @@ def test_painter_packs_the_arena_without_a_second_copy():
     peak, arena = _painter_rss()
     print(f"\npeak RSS {peak / 1e9:.2f} GB, arena {arena / 1e9:.3f} GB")
     assert arena > 6e9 and peak < arena + 2e9
+
+
+def test_painter_from_ssd_holds_no_weights():
+    """From the SSD (FLUX_WEIGHTS_SOURCE=ssd, Task 10b) the painter never reads the blocks' 6.6 GB of Q4_K weights into
+    RAM: its load peaks under 4 GB and it settles under 3 GB (the arena path: 7.87 / 7.52 GB), page-locking the staging
+    ring and the resident biases only (< 1 GB). A pass reads every block from the file with O_DIRECT, which doesn't go
+    through the page cache: Cached grows by less than 0.5 GB over two passes (13.3 GB read)."""
+    src, hwm, rss, rss_pass, pinned, c0, c1 = _painter_rss("ssd")
+    hwm, rss, rss_pass, pinned, c0, c1 = map(int, (hwm, rss, rss_pass, pinned, c0, c1))
+    print(f"\nSSD painter: peak RSS {hwm / 1e9:.2f} GB, after setup {rss / 1e9:.2f} GB, after 2 passes "
+          f"{rss_pass / 1e9:.2f} GB, pinned {pinned / 1e9:.3f} GB, Cached {c0 / 1e9:.2f} -> {c1 / 1e9:.2f} GB")
+    assert src == "ssd"
+    assert hwm < 4e9 and rss < 3e9 and rss_pass < 3e9
+    assert 0 < pinned < 1e9
+    assert c1 - c0 < 0.5e9

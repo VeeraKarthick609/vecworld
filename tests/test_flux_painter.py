@@ -313,7 +313,7 @@ def test_painter_batch_follows_the_kernel(monkeypatch):
     seen = []
     tr = SimpleNamespace(transformer_blocks=[], single_transformer_blocks=[], enable_group_offload=lambda **k: None)
     monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
-    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path, unread=None: {})
     monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: tr)
     monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
     monkeypatch.setattr(swap_mod, "swap_linears", lambda *a, **k: 1)
@@ -321,7 +321,7 @@ def test_painter_batch_follows_the_kernel(monkeypatch):
     monkeypatch.setattr(painter_mod, "rowwise", lambda tr: None)
     monkeypatch.setattr(painter_mod, "_pin_in_place", lambda mods: [])
     monkeypatch.setattr(graphs_mod, "stream_blocks",
-                        lambda tr, dev, graphs, **k: (SimpleNamespace(arena="arena"), "runner"))
+                        lambda tr, dev, graphs, **k: (SimpleNamespace(arena="arena", reader="reader"), "runner"))
 
     def stop_at_vae(*a, **k):
         raise Loaded
@@ -669,7 +669,7 @@ def test_painter_swaps_with_the_kernels_keep_list(monkeypatch):
         raise _Stop                              # far enough: nothing after the swap is under test
 
     monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
-    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path, unread=None: {})
     monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: "transformer")
     monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
     monkeypatch.setattr(swap_mod, "swap_linears", swap)
@@ -760,7 +760,7 @@ def test_painter_patches_blocks_when_fused(monkeypatch):
 
     order = []
     monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
-    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path, unread=None: {})
     monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: "transformer")
     monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
     monkeypatch.setattr(swap_mod, "swap_linears", lambda *a, **k: order.append("swap") or 1)
@@ -806,8 +806,9 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
     """Under an engine kernel FluxPainter puts the blocks on fixed-address slots with a GraphRunner
     (vecworld.engine.graphs.stream_blocks; graphs as engine_graphs says) instead of diffusers' group offload, after
     the swap, the fused patch and the rowwise outer layers (Task 9, every kernel), packing the blocks into one
-    page-locked host arena (pack=True, Task 10a) instead of pinning them in place; under VECWORLD_KERNEL=off it pins in
-    place and keeps group offload (the reference)."""
+    page-locked host arena (pack=True, Task 10a; FLUX_WEIGHTS_SOURCE=ram) or reading them from the GGUF on the SSD
+    (ssd=<path>, Task 10b; the default), when the load leaves the blocks' Q4_K weights unread; under
+    VECWORLD_KERNEL=off it reads everything, pins in place and keeps group offload (the reference), whatever the source."""
     import diffusers
 
     import vecworld.engine.blocks as blocks_mod
@@ -823,7 +824,7 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
     tr = SimpleNamespace(transformer_blocks=[], single_transformer_blocks=[],
                          enable_group_offload=lambda **k: order.append("offload"))
     monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
-    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path, unread=None: order.append(f"read unread={unread}") or {})
     monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: tr)
     monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
     monkeypatch.setattr(swap_mod, "swap_linears", lambda *a, **k: order.append("swap") or 1)
@@ -831,26 +832,34 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
     monkeypatch.setattr(painter_mod, "rowwise", lambda tr: order.append("rows"))
     monkeypatch.setattr(painter_mod, "_pin_in_place", lambda mods: order.append("pin") or [])
     monkeypatch.setattr(graphs_mod, "stream_blocks",
-                        lambda tr, dev, graphs, **k: order.append(f"slots graphs={graphs} pack={k.get('pack')}")
-                        or (SimpleNamespace(arena="arena"), "runner"))
+                        lambda tr, dev, graphs, **k: order.append(f"slots graphs={graphs} pack={k.get('pack')} "
+                                                                  f"ssd={k.get('ssd') is not None}")
+                        or (SimpleNamespace(arena="arena", reader="reader"), "runner"))
 
     def stop_at_vae(*a, **k):
         raise Loaded
 
     monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", stop_at_vae)
-    for kernel, graphs, want in ((None, None, ["swap", "patch", "rows", "slots graphs=False pack=True"]),
-                                 ("mma", "1", ["swap", "patch", "rows", "slots graphs=True pack=True"]),
-                                 ("off", None, ["rows", "pin", "offload"]), ("off", "1", ["rows", "pin", "offload"])):
-        for k in ("VECWORLD_KERNEL", "VECWORLD_FUSE", "VECWORLD_GRAPHS"):
+    ssd, ram = "read unread=<function _block_q4k", "read unread=None"
+    for kernel, graphs, source, want in (
+            (None, None, None, [ssd, "swap", "patch", "rows", "slots graphs=False pack=False ssd=True"]),
+            (None, None, "ram", [ram, "swap", "patch", "rows", "slots graphs=False pack=True ssd=False"]),
+            ("mma", "1", "ssd", [ssd, "swap", "patch", "rows", "slots graphs=True pack=False ssd=True"]),
+            ("mma", "1", "ram", [ram, "swap", "patch", "rows", "slots graphs=True pack=True ssd=False"]),
+            ("off", None, None, [ram, "rows", "pin", "offload"]), ("off", "1", "ssd", [ram, "rows", "pin", "offload"])):
+        for k in ("VECWORLD_KERNEL", "VECWORLD_FUSE", "VECWORLD_GRAPHS", "FLUX_WEIGHTS_SOURCE"):
             monkeypatch.delenv(k, raising=False)
         if kernel:
             monkeypatch.setenv("VECWORLD_KERNEL", kernel)
         if graphs:
             monkeypatch.setenv("VECWORLD_GRAPHS", graphs)
+        if source:
+            monkeypatch.setenv("FLUX_WEIGHTS_SOURCE", source)
         order.clear()
         with pytest.raises(Loaded):
             FluxPainter()
-        assert order == want, (kernel, graphs)
+        got = [o.split(" at 0x")[0] for o in order]
+        assert got == want, (kernel, graphs, source)
 
 
 def test_painter_releases_the_arena_if_construction_fails_after_the_streamer(monkeypatch):
@@ -872,10 +881,10 @@ def test_painter_releases_the_arena_if_construction_fails_after_the_streamer(mon
     done = []
     tr = SimpleNamespace(transformer_blocks=[], single_transformer_blocks=[], enable_group_offload=lambda **k: None)
     arena = SimpleNamespace(close=lambda: done.append("arena"))
-    slots = SimpleNamespace(arena=arena, close=lambda: done.append("slots"))
+    slots = SimpleNamespace(arena=arena, reader=arena, close=lambda: done.append("slots"))   # (either source)
     runner = SimpleNamespace(close=lambda: done.append("runner"))
     monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
-    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path, unread=None: {})
     monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: tr)
     monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
     monkeypatch.setattr(swap_mod, "swap_linears", lambda *a, **k: 1)
@@ -887,7 +896,7 @@ def test_painter_releases_the_arena_if_construction_fails_after_the_streamer(mon
         raise Boom("CUDA out of memory (moving the VAE)")
 
     monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", oom_on_vae)
-    for k in ("VECWORLD_FUSE", "VECWORLD_GRAPHS", "VECWORLD_KERNEL"):
+    for k in ("VECWORLD_FUSE", "VECWORLD_GRAPHS", "VECWORLD_KERNEL", "FLUX_WEIGHTS_SOURCE"):
         monkeypatch.delenv(k, raising=False)
     with pytest.raises(Boom) as ei:         # held: the traceback keeps the half-built painter alive, as pytest's does
         FluxPainter()

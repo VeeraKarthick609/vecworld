@@ -34,24 +34,28 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 
-from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE,
+from vecworld.config import (FLUX_BACK_FEATHER, FLUX_BACK_FROM, FLUX_BACK_STRENGTH, FLUX_BASE, FLUX_SSD_AHEAD,
+                             FLUX_SSD_BUFFERS, FLUX_SSD_CHUNK, FLUX_SSD_QUEUE_DEPTH,
                              FLUX_GGUF, FLUX_GRAPH_MAX, FLUX_SLOT_RING, FLUX_STEP_RECIPE, FLUX_STEPS, FLUX_STRIDE, check_recipe,
                              FLUX_STYLE, FLUX_TEXT_LEN, FLUX_WIN, FOCUS_HALF, PANO_H, PANO_W, PREDREAM_HEADINGS, VAE_TILE)
 from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
 from vecworld.engine import (engine_batch, engine_cache_threshold, engine_fuse, engine_graphs, engine_kernel,
-                             keep_for, load_engine_ext)
+                             engine_weights_source, keep_for, load_engine_ext)
 from vecworld.engine.cache import BlockCache, cached_forward
 
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
 
 
-def _read_gguf(path) -> dict:
+def _read_gguf(path, unread: Callable[[str, object], bool] | None = None) -> dict:
     """The GGUF's tensors as diffusers' load_gguf_checkpoint returns them, read with plain reads.
 
     diffusers copies each tensor out of a memmap of the whole file, so while it loads, the 6.8 GB of mapped file
     pages and the 6.8 GB of copies are both resident (a 12+ GB peak that pushed the game into swap).
+    unread(name, quant type) -> True leaves that tensor unread: allocated, never written (its pages are never touched,
+    so it costs no RAM), for weights that will be read from the file later (the blocks' Q4_K weights under
+    FLUX_WEIGHTS_SOURCE=ssd, Task 10b).
     """
     import gguf
     import torch
@@ -65,11 +69,19 @@ def _read_gguf(path) -> dict:
     with open(path, "rb", buffering=0) as f:
         for name, qt, shape, dtype, off, n in meta:
             a = np.empty(shape, dtype)
-            f.seek(off)
-            assert f.readinto(memoryview(a).cast("B")) == n == a.nbytes, name
+            if unread is None or not unread(name, qt):
+                f.seek(off)
+                assert f.readinto(memoryview(a).cast("B")) == n == a.nbytes, name
             w = torch.from_numpy(a)
             out[name] = w if qt in plain else GGUFParameter(w, quant_type=qt)
     return out
+
+
+def _block_q4k(name: str, qt) -> bool:
+    """A transformer block's Q4_K weight (read from the SSD per pass under FLUX_WEIGHTS_SOURCE=ssd: never in RAM)."""
+    import gguf
+
+    return qt == gguf.GGMLQuantizationType.Q4_K and name.startswith(("double_blocks.", "single_blocks."))
 
 
 def _pin_in_place(modules) -> list[int]:
@@ -246,11 +258,14 @@ class FluxPainter(Painter):
         self.kernel = engine_kernel()           # a typo or a broken extension build fails here, before the
         self.fused = engine_fuse(self.kernel)   # minute-long model load, with a hint to set VECWORLD_KERNEL=off
         self.batch = engine_batch(self.kernel)  # 1 under "off": the reference paints a window a pass
+        self.weights_source = engine_weights_source(self.kernel)   # "ssd" | "ram" (FLUX_WEIGHTS_SOURCE)
         if self.kernel is not None or self.fused:
             load_engine_ext()
         dev, bf16 = torch.device("cuda"), torch.bfloat16
+        # From the SSD the blocks' Q4_K weights are read from the file pass by pass, so the load leaves them unread
+        unread = _block_q4k if self.weights_source == "ssd" else None
         tr = FluxTransformer2DModel.from_single_file(
-            _read_gguf(str(FLUX_GGUF)), quantization_config=GGUFQuantizationConfig(compute_dtype=bf16),
+            _read_gguf(str(FLUX_GGUF), unread), quantization_config=GGUFQuantizationConfig(compute_dtype=bf16),
             torch_dtype=bf16, config=FLUX_BASE, subfolder="transformer")
         if self.kernel is not None:
             # Before pinning and group offload: the Q4KLinears' parameters share the GGUF parameters' storage, so
@@ -275,9 +290,14 @@ class FluxPainter(Painter):
             # which the runner wraps.
             from vecworld.engine import graphs as graphs_mod
 
-            self._slots, self._runner = graphs_mod.stream_blocks(tr, dev, graphs=self.graphs, ring=FLUX_SLOT_RING,
-                                                                 max_graphs=FLUX_GRAPH_MAX, pack=True)
-            self._arena = self._slots.arena
+            # From the SSD (FLUX_WEIGHTS_SOURCE=ssd, Task 10b, docs/engine/11-io-uring.md) each block is read from
+            # the GGUF with O_DIRECT through io_uring into a few page-locked staging buffers instead.
+            ssd = str(FLUX_GGUF) if self.weights_source == "ssd" else None
+            self._slots, self._runner = graphs_mod.stream_blocks(
+                tr, dev, graphs=self.graphs, ring=FLUX_SLOT_RING, max_graphs=FLUX_GRAPH_MAX, pack=ssd is None,
+                ssd=ssd, reader=dict(buffers=FLUX_SSD_BUFFERS, ahead=FLUX_SSD_AHEAD,
+                                     queue_depth=FLUX_SSD_QUEUE_DEPTH, chunk=FLUX_SSD_CHUNK))
+            self._arena = self._slots.arena if ssd is None else self._slots.reader
         else:
             tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"),
                                     offload_type="block_level", num_blocks_per_group=1, use_stream=True)
@@ -313,7 +333,7 @@ class FluxPainter(Painter):
         self.fused: bool = getattr(self, "fused", False)                # blocks run fused glue (engine_fuse)
         self.graphs: bool = getattr(self, "graphs", False)              # blocks replay as graphs (engine_graphs)
         self._slots = getattr(self, "_slots", None)                     # engine.stream.BlockStreamer (engine kernels)
-        self._arena = getattr(self, "_arena", None)                     # its engine.stream.HostArena
+        self._arena = getattr(self, "_arena", None)                     # its HostArena, or its SSD reader (SsdSource)
         self._runner = getattr(self, "_runner", None)                   # engine.graphs.GraphRunner
         self.cache_threshold: float = getattr(self, "cache_threshold", 0.0)
         self.batch: int = getattr(self, "batch", None) or engine_batch()   # windows per pass, at most

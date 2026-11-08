@@ -38,9 +38,13 @@ def make_painter(name: str):
 
 
 def make_dreamer(setting: str, painter_name: str):
-    """VECWORLD_DREAMER: on, off, or auto (default): off beside FLUX, whose ~9 GB leaves no room for Qwen's ~6 GB
-    in 14 GB of RAM until the engine's SSD loader lands; on beside Turbo."""
-    on = {"on": True, "off": False, "auto": painter_name != "flux"}.get(setting)
+    """VECWORLD_DREAMER: on, off, or auto (default): on, except beside FLUX with its blocks' weights in RAM
+    (FLUX_WEIGHTS_SOURCE=ram, or VECWORLD_KERNEL=off), whose ~9 GB leaves no room for Qwen's ~6 GB in 14 GB of RAM.
+    From the SSD (the default since Task 10b) the painter holds ~2 GB and the dreamer fits beside it."""
+    from vecworld.engine import engine_kernel, engine_weights_source
+
+    flux_in_ram = painter_name == "flux" and engine_weights_source(engine_kernel()) == "ram"
+    on = {"on": True, "off": False, "auto": not flux_in_ram}.get(setting)
     if on is None:
         raise SystemExit(f"VECWORLD_DREAMER must be on, off or auto, not {setting!r}")
     if not on:
