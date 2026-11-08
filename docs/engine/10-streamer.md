@@ -150,7 +150,7 @@ streamed 166.6 ms (1.028x; bar 1.1x).
 
 **Under GIL contention** (2 spinning threads, batch-1 pass, min / median / max s; quiet: 0.85 s):
 
-| sequencing | eager (`VECWORLD_GRAPHS=0`) | graphs (default since 10a-g) |
+| sequencing | eager (default) | graphs (opt-in) |
 |---|---|---|
 | BASE (fcbfe73: per-tensor `copy_` + torch events in Python) | 20.2 / 23.7 / 30.2 | 7.07 / 7.23 / 9.86 |
 | per-tensor `copy_` from Python, on the arena (`pytensors`) | 22.9 / 64.2 / 166.8 | 7.15 / 8.25 / 12.0 |
@@ -170,7 +170,7 @@ What it says:
   block (reshapes, views, `.to`, `new_empty`, chunk, the attention dispatch, a Q4KLinear's own reshapes), each a GIL
   hand-off (~20 s over 57 blocks at 5-10 ms each is ~40-70 hand-offs a block). Removing the hooks' ~25 leaves the
   forward's. Under contention that cost belongs to eager execution itself, and graphs are the
-  remedy that exists (opt-in at Task 7; the default since Task 10a-g).
+  remedy that exists (opt-in since Task 7, "revisit after Task 10").
 - The spread is wide (a pass of 0.9 s next to one of 10 s in the same run): which thread gets the GIL after a
   switch interval is up to the OS scheduler. Read medians; the probe is a stress case (the game's other threads mostly
   wait on I/O).
@@ -178,7 +178,7 @@ What it says:
 **The other threads' side** (fix round 1, review I3): the hooks and `graph_launch` keep the GIL, so a CUDA call that
 blocked would hold every other Python thread. Measured with a 1 ms ticker thread during a painted panorama: its worst
 wake-up is 2.5 ms with graphs (0.4 ms at BASE), and 45 ms eager, as at BASE (42 ms); no wake-up over 50 ms in any
-run (`bench/ticker.py`: `VECWORLD_GRAPHS=0 uv run python bench/ticker.py` for eager, unset for graphs; game server stopped). Eager's tens of milliseconds come from eager execution itself, not from the streamer.
+run (`bench/ticker.py`: `VECWORLD_GRAPHS=1 uv run python bench/ticker.py` for graphs, unset for eager; game server stopped). Eager's tens of milliseconds come from eager execution itself, not from the streamer.
 
 **Batch 4 vs 8 under the streamer** (Task 9 ruling b):
 
@@ -196,6 +196,25 @@ pass also reads 6.66 GB from the SSD and halving the passes should matter more.
 pass's 6.66 GB take 2.2-3.3 s, longer than a batch-1 pass (0.85 s) and about half a batch-8 one (7.4 s). Batch 8 and
 read-ahead are what keep the SSD hidden. The server baseline before 10b: painter RSS 7.52 GB after setup, 8.54 GB in
 a walk step, of which 6.66 GB is the arena that 10b removes.
+
+## Why graphs stay opt-in (Task 10a-g)
+
+Making graphs the default was tried and reverted. Same session, AC, 76605bd (`bench/t10a-g-*.json`):
+
+| | graphs | eager (default) |
+|---|---|---|
+| tile512 s / pass | 0.874-0.881 | 0.880-0.888 |
+| walk step s | 38.6 | 38.8 |
+| first panorama, cold process | **38.0** (capture pass 15.1 s vs 7.05 s) | 29.6 (**+8.4 s**) |
+| device peak, batch 1 / 8 (own process) | 1.249 / 2.235 GB | 1.225 / 2.045 GB |
+
+Quiet speed is a tie, and the first panorama costs +8.4 s. Worse, the pools are kept: `bench_flux --what peak` run
+over batches 1, 2, 4, 6, 8 in one process died of CUDA OOM at the fifth shape (3.35 GiB allocated, **904 MiB in graph
+private pools**), because `FLUX_GRAPH_MAX` = 4 caps the shape count, not the bytes, and a new capture needs its
+memory while the four old pools are still resident. A long-lived server that meets several window shapes could run the
+4 GB card out of memory that way. (`BENCH_PEAK_BATCHES=8` runs one batch per process.) Graphs are the answer to GIL
+contention (above), so opt in (`VECWORLD_GRAPHS=1`) where other threads must keep their latency.
+Follow-ups: evict pools by bytes rather than by shape count, and capture the known shapes at server startup.
 
 ## What to read next
 

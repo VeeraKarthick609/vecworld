@@ -17,7 +17,7 @@ crossfade. The differences:
   blocks run their norm / modulate / residual and q / k norm + RoPE glue fused (VECWORLD_FUSE, default on with an
   engine kernel), bit-identical to diffusers', and they stream block by block from one page-locked host arena
   (vecworld.engine.stream, Task 10a) through fixed-address weight slots,
-  optionally replayed as CUDA graphs (VECWORLD_GRAPHS, default on; =0 runs eagerly on the same slots). A
+  optionally replayed as CUDA graphs (VECWORLD_GRAPHS=1; default off: eager on the same slots, as fast). A
   first-block cache (vecworld.engine.cache, FLUX_CACHE_THRESHOLD / VECWORLD_CACHE_THRESHOLD; 0 = off) may skip
   blocks 1..56 of a pass when block 0's output barely changed since the window batch's previous step.
 - Batching (Task 9, docs/engine/09-batching.md): every active window of a step goes through each transformer pass
@@ -221,7 +221,7 @@ class FluxPainter(Painter):
     VECWORLD_FUSE (vecworld.engine.engine_fuse; unset: on with an engine kernel, off under "off") patches the blocks to
     run their glue fused (vecworld.engine.blocks, bit-identical to diffusers'); self.fused records it.
     Under an engine kernel the blocks stream through FLUX_SLOT_RING fixed-address weight slots (vecworld.engine.slots)
-    instead of diffusers' group offload, and VECWORLD_GRAPHS (vecworld.engine.engine_graphs; unset: on, 0 = eager) replays
+    instead of diffusers' group offload, and VECWORLD_GRAPHS=1 (vecworld.engine.engine_graphs; unset: off) replays
     each as a CUDA graph per input shape (vecworld.engine.graphs, bit-identical to eager); self.graphs records it.
     VECWORLD_CACHE_THRESHOLD (vecworld.engine.engine_cache_threshold; unset: config.FLUX_CACHE_THRESHOLD; 0 off,
     always off under "off") is the first-block cache's threshold (vecworld.engine.cache; self.cache_threshold,

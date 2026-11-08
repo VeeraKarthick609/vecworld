@@ -1,5 +1,5 @@
 """Task 10a fix round, I3 (committed at 10a-g so the explainer's numbers can be reproduced; run it with the game server
-stopped, from the repo: `VECWORLD_GRAPHS=0 uv run python bench/ticker.py`, then without VECWORLD_GRAPHS (graphs, the default)):
+stopped, from the repo: `VECWORLD_GRAPHS=1 uv run python bench/ticker.py` (graphs), then without VECWORLD_GRAPHS (eager, the default)):
  how late does a 1 ms ticker thread wake while the painter paints? One process per run.
 A painter panorama (4 batch-8 passes + VAE) is painted once to warm up (graphs capture there), then once with the
 ticker running; the ticker sleeps 1 ms in a loop and records how late each wake-up was (a stall of the GIL holder

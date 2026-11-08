@@ -128,9 +128,8 @@ class GraphRunner:
     The transformer consumes each output before then; a caller that keeps a block output (a residual cache, a debug
     hook) must clone it. Eager calls return fresh tensors. All calls must come from one thread (the first caller's).
 
-    On by default in the painter since Task 10a-g (VECWORLD_GRAPHS=0 for eager): eager is no faster when quiet, but a
-    replayed pass keeps running while other threads hold the GIL, for captures on each new shape and some memory
-    (docs/engine/07-cuda-graphs.md, 10-streamer.md)."""
+    Off by default in the painter since the Task 7 review (VECWORLD_GRAPHS=1 to opt in): eager on the slots is as fast
+    and the graphs cost captures on each new shape and memory (docs/engine/07-cuda-graphs.md)."""
 
     def __init__(self, blocks: list[torch.nn.Module], slots: BlockSlots | None, max_graphs: int = FLUX_GRAPH_MAX,
                  enabled: bool = True):
