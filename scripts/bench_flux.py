@@ -149,7 +149,13 @@ def load_painter(R, mon):
     R["weights_source"] = getattr(p, "weights_source", None)
     prompt = [(f"{PROMPT}, {FLUX_STYLE}", 1.0)]
     mon.reset()
+    # cold: the T5 GGUF evicted from the page cache first (the pread path reads through it; the engine path, Task 10c,
+    # reads with O_DIRECT), so both paths read the file from the SSD
+    from vecworld.config import FLUX_T5_GGUF
+    fd = os.open(os.path.realpath(FLUX_T5_GGUF), os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
     t = time.time(); p.t5.encode(prompt[0][0]); R["t5_encode_cold_s"] = round(time.time() - t, 2)
+    R["t5_path"] = getattr(p.t5, "engine", "pread")
+    R["t5_parts"] = dict(getattr(p.t5, "last", {}) or {})
     R["mon_t5"] = mon.report()
     return p, prompt, passes
 
