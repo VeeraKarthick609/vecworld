@@ -9,7 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
-| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08; Task 9 (window batching) added 2026-11-08; Task 10a (block streamer) added 2026-11-08, with a Task 10a-g addendum (graphs by default, reverted); Task 10b (io_uring SSD reader) added 2026-11-09 |  2b, 3, 4, 5, 5b, 5c, 6, 7, 8, 9, 10a, 10b |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08; Task 9 (window batching) added 2026-11-08; Task 10a (block streamer) added 2026-11-08, with a Task 10a-g addendum (graphs by default, reverted); Task 10b (io_uring SSD reader) added 2026-11-09; Task 10c (T5 on the engine, end to end) added 2026-11-09 |  2b, 3, 4, 5, 5b, 5c, 6, 7, 8, 9, 10a, 10b, 10c |
 
 ---
 
@@ -1892,6 +1892,156 @@ Deferred minors: M5 (`res % 512`: correct for this device; querying `STATX_DIOAL
 
 ---
 
+### Task 10c: T5 on the engine, cleanup and end to end
+
+`Must` for the plain version, why T5 got faster without a new kernel (the SSD read, not the math, was the cost), the M8 attribution (the in-game gap was mostly T5 inside the step), and why the CPU cross-check is not the bar. `Understand` for the extents / `one_pass` options, the graphs A/B, N1 and N4, the leak-on-failed-close guard and the end-to-end results. `Skip` the layout-table internals and the TiledVae move's code.
+
+> **Plain version.** T5-XXL, the text encoder, was the last big piece still running the old way: it read its 3.4 GB GGUF into RAM with `pread`, then dequantized and ran it on the GPU, and took **6.68 s** cold per new prompt. 10c streams its 24 blocks from the SSD through the same `BlockStreamer` + `O_DIRECT` reader as FLUX. Cold encode is now **2.30–2.42 s** and **bit-identical to Task 1's output** (cosine 1.000000, max diff 0), so every picture is byte-identical to 10b's. No new kernel was needed: the dequant (~0.67 s of GPU time) hides under the 1.78 s the drive needs. The task also settled a question left open in 10b: why a walk step in the game takes 43–50 s against 38 s in the bench. Mostly it was T5 running *inside* the step, which the bench never timed. The rest is a small tidy-up (two review minors, `TurboPainter` out of the default path, a guard against freeing memory with reads in flight) and the end-to-end run.
+
+**T5 streamed from the SSD: 6.68 → 2.30–2.42 s** (`Must`). The T5 GGUF (`t5-v1_1-xxl-encoder-Q5_K_M`) has no Q4_K tensor: its linears are Q5_K and Q6_K, which the engine's kernels don't cover. Ruling C1 said not to write a Q5_K kernel unless the 5 s bar needed one, so every linear stays **dequantize-then-matmul on the GPU**, with Task 1's own `dequantize_functions` and `_block`, only now the blocks arrive through the ring. A lazy mapping dequantizes each linear when the block asks for it, so the card holds one linear's bf16 copy at a time (peak 0.64 GB allocated, Task 1: 0.66).
+
+| | Task 1 path (`pread`) | engine |
+|---|---|---|
+| cold encode (file evicted), bench | **6.68 s** (test: 7.45 / 6.02 s) | **2.56 s** first in a process; **2.30–2.42 s** after (test 2.32 / 2.30; game, 28 misses: 2.32–2.57 s) |
+| breakdown | table parse 2.8–3.2 s per encode + `pread` 2.24 s + copy/dequant ~1.2 s | blocks 2.18–2.34 s (3.28 GB at ~1.8 GB/s; SSD wait 0.44 s), setup 0.1 s, prep 0.01–0.08 s |
+| cosine vs Task 1 (3 prompts) | | **1.000000, worst token 1.000000, max diff 0: bit-identical** |
+| GGUF pages left in the page cache | 3,387 MB | **0.0 MB** |
+| peak allocated during an encode | 0.66 GB | 0.64 GB |
+| pinned host / VRAM between encodes | 0 / 0 | 0 / 0 (0.28 GB pinned + 0.28 GB slots only during an encode) |
+
+The floor is the same arithmetic as 10b: 3.28 GB read ÷ 1.84 GB/s = 1.78 s, and 2.3 s is that plus setup. Where the old path lost time: the tensor-table parse (2.8–3.2 s) was redone every encode, so it is now parsed **once when `T5Text` is built**. The price is the painter's load: **7.3 → 10.4 s** (+3 s), parked as a minor (a minimal header reader would remove it).
+
+**The extents / `one_pass` / `wrap` options, for a name-ordered GGUF** (`Understand`). FLUX's GGUF lays each block out contiguously; T5's orders tensors **by name**, so `enc.blk.10` comes before `enc.blk.5.ffn_down`, and blocks 5 and 12 are split in two runs (block 5 spans **550 MB** of the file end to end). Three out-of-plan additions, accepted as necessary after the review confirmed the FLUX path is unchanged:
+- **`BlockFile.extents`**: a block can be several runs of the file. `SsdSource` submits one read per run into the same staging buffer and waits for **all** of them (if one fails the others are still waited for, so no read lands in a reused buffer: 10b's I1 lesson, kept). Single-run FLUX blocks take the old path.
+- **`one_pass`**: FLUX's streamer is cyclic (the last block prefetches the next pass's first). An encode runs 24 blocks once, so without it every encode read **0.69 GB too much** (3.97 GB, 2.54 s). `one_pass` stops both the slot prefetch and the reader's read-ahead at the last block.
+- **`wrap`** (`SsdSource(wrap=False)`): the reader-side half of the same switch.
+
+Other settings measured (all T5, cold, ring/staging counts as slots / staging buffers):
+
+| setting | time | bytes read | note |
+|---|---|---|---|
+| **2 slots, 2 staging buffers, ahead 1 (chosen, with `one_pass`)** | **2.30 s** | **3.28 GB** | exact |
+| 3 staging buffers, 2 ahead (FLUX's setting) | 2.43 s | 3.42 GB | +141 MB pinned, slower |
+| 4 buffers, 3 ahead (before `one_pass`) | 2.72 s | 4.24 GB | re-reads |
+| ring of 3 slots | 3.09 s | 4.64 GB, peak 0.78 GB | read-ahead evicts blocks before use |
+| cyclic streaming (no `one_pass`) | 2.54 s | 3.97 GB | 0.69 GB read for nothing |
+
+Only the token-embedding rows a prompt uses are read (one `O_DIRECT` read per distinct token, ~20, instead of the 108 MB table).
+
+**The CPU cross-check: cosine 0.9938, and why the `pread` GPU path is the bar** (`Must`). The brief asked for cosine ≥ 0.999 "against the Task 1 CPU path". Task 1's `T5Text` never had a pure-CPU path: it already did its math on the GPU (`pread` into host memory, then dequantize and run each block on the card). So ruling: "the Task 1 path" is the `pread` path, kept as `FLUX_T5=pread` (and always under `VECWORLD_KERNEL=off`). Against it the engine is **bit-identical**, so the bar is met with room to spare. The reviewer still asked for a real CPU run (`T5Text(engine="pread", device="cpu")`), measured once: **74.0 s for one encode** (1.47 GB RSS, 8 threads), too slow for the suite's ~60 s budget, so recorded but **not added to the suite**:
+
+| measure (CPU run vs engine) | value |
+|---|---|
+| cosine, whole sequence | **0.9938** |
+| relative L2 | 0.111 |
+| the 10 real tokens | **≥ 0.9983** |
+| pad positions, median | 0.9986 |
+| trailing pad positions below 0.99 | 10 (worst **0.35**, index 246) |
+
+Reading it: both GPU paths are bf16 on cuBLAS and agree bit for bit. The CPU run accumulates in a different order, and T5's **unmasked pad positions** at the end (the encoder attends to pads) amplify that, so the drift sits at the pads while the real-prompt tokens agree to ≥ 0.998. Neither run is an fp32 reference, so this doesn't say which is closer to exact; an fp32 check is a parked follow-up. Ruling: accepted, since the bar is against Task 1's output, and the engine matches it exactly. Cost if wrong: the fp32 check shows both GPU paths drift at pads. The test was renamed from `test_t5_engine_matches_cpu` to `test_t5_streamed_blocks_match_pread`, because its name claimed a CPU comparison it doesn't make.
+
+**The M8 attribution: where the in-game step time went** (`Must`). 10b left an unexplained gap: a walk step in the game takes 43–50 s with the dreamer (Qwen) on, against 38 s in the bench. Ruling: attribute it with numbers before changing anything. In-game 5-pass, 8-window steps against the bench (38.6 s wall, 37.22 s of pass GPU time):
+
+| condition | n | wall | T5 | passes GPU | rest | ticker worst |
+|---|---|---|---|---|---|---|
+| bench, server stopped | 1 | 38.6 | (encoded before timing) | 37.22 | 1.4 | |
+| game, `VECWORLD_DREAMER=off` | 5 | 41.5 | 3.3 | 36.05 | 2.13 | 42–44 ms |
+| game, dreamer idle during the step | 11 | 41.6 | 3.0 | 36.47 | 2.14 | 42–47 ms |
+| game, dreamer generating > 50% of the step | 4 | 43.8 | 4.1 | 37.54 | 2.17 | 72–101 ms |
+| game, `VECWORLD_GRAPHS=1`, idle / busy | 3 / 2 | 42.5 / 45.9 | 3.1 / 4.7 | 37.26 / 39.06 | 2.13 / 2.15 | 42 / 73–78 ms |
+
+| cause | evidence | size |
+|---|---|---|
+| **T5 inside the step** (the bench encodes before timing) | 1–2 new texts per step, **2.3 s each now (6.7 s each at 10b)** | **largest: 3–4 s now; 6.7–13.4 s at 10b, which covers most of 10b's 43–50 s** |
+| dreamer CPU / GIL contention | passes +1.07 s (+2.9%) busy vs idle; ticker worst 72–101 vs 42–47 ms | **~1 s**, only while it generates (6 calls of 11–29 s) |
+| GPU sharing | per-pass GPU time (CUDA events) 7.46 s in game vs 7.44 s bench | **none** (the dreamer runs on the CPU; depth and T5 share the queue serially) |
+| SSD contention | disk read per step 39.9 GB = FLUX reader 33.3 + T5 2 × 3.28; reader waits 8.2 / 16.4 s vs 8.23 / 15.72 s bench | **none** (no swap-in, no other readers) |
+| the rest (CLIP for new texts, VAE, glue) | 2.14 s vs 1.4 s | ~0.7 s |
+
+So 10b's gap was mostly **T5 hiding in the step**: at the Task 1 path 6.7 s a text, 1–2 new texts a step; now 2.3 s. The remaining ~3 s over the bench is T5 (~3 s), the dreamer (~1 s while generating) and ~0.7 s of rest; no other cost showed up. Ruling: accepted; an unexplained ~3 s per step stays parked. Lesson: the bench timed a different job from the game (it encodes before the clock starts), so compare what's inside the clock before blaming contention.
+
+**The graphs A/B: no faster, +0.8–0.9 GB VRAM with a single shape, +8.8 s on the first panorama** (`Understand`). 10b ruled that if M8 turned out to be GIL contention, graphs-by-default would reopen. It wasn't mainly the GIL, so one A/B in the real game (`VECWORLD_GRAPHS=1`): passes **no faster** (37.26 vs 37.3 s idle; 39.06 vs 37.54 s busy, n = 2), first panorama **42.0 vs 33.2 s** (+8.8 s of captures), peak allocated 2.38 vs 2.15 GB, nvidia-smi 3742 vs 2552 MiB. The first report said +1.2 GB; the follow-up question was whether that run kept one shape per process, as the 10a-g five-shape OOM warned. It mixed **two**: the panorama and steps share the batch-8 shape, and step 4 had a 5-window pass. nvidia-smi per job:
+
+| graph shapes held | nvidia-smi max | peak allocated |
+|---|---|---|
+| batch 8 only (panorama + 3 steps) | 3332–3464 MiB | 2.18–2.34 GB |
+| after the batch-5 pass | 3524–3742 MiB | 2.38 GB |
+| eager run, same journey | 2552 MiB | 2.15 GB |
+
+So one shape costs **+0.8–0.9 GB**; the 3742 MiB figure included the second shape. No OOM occurred, but this is the multi-shape case 10a-g feared, partly exercised. M13 (SSD with graphs on) is answered: it runs, and the bench walk step with graphs on the SSD paints a **byte-identical** image to eager (39.0 vs 38.6 s). Graphs stay opt-in; defaults unchanged. The byte-budgeted eviction follow-up still stands.
+
+**N1 and N4, folded in from 10b** (`Understand`, each red first):
+- **N1: a hard `io_uring_enter` error must mark the reader broken.** Red: after an injected `EFAULT` on the *reaping* `io_uring_enter`, a later submit succeeded, and so did `SsdSource`'s next `source(i)` ("DID NOT RAISE OSError"), with reads possibly still in flight. Fix: set `broken_` before throwing in `reap` (the submit side was 10b's M4). The brief said "hard `io_uring_enter` **or completion** error"; the ruling limited it to the enter calls, because a failed completion already fails its request cleanly after all its chunks finish (10b I1), and marking the reader broken there would break M1's recovery (a failed read forgets its buffer and the next `source(i)` reads again).
+- **N4: the Gather coverage check compared byte totals.** Red: a copy moved 16 bytes into its tensor's padding was accepted ("DID NOT RAISE ValueError"), because the totals still matched. Fix: compare the copies' *merged spans* with the block's merged tensor spans from `block_layout`, cached per block.
+
+**The leak-on-failed-close guard** (`Understand`; review minor 4, promoted to fix round 1). If `SsdSource.close()` can't drain (a chunk is in the kernel and the drain fails), the garbage collector would free the staging buffers and their pinned registration **while the drive may still DMA into them**: silent memory corruption. It is reachable now because T5 builds an `SsdSource` per encode. The fix: such a source keeps its staging buffers, registrations and reader in a module list (`uring._LEAKED`), logs the reason code `ssd_source_leaked: reader_close_failed (<exception type>)` with a byte count and no data, and raises the error. Test (`test_ssd_source_that_cannot_drain_keeps_its_buffers`): red first ("the staging buffer was freed with reads in the kernel": the weakref was dead after GC), green with the buffer alive in `_LEAKED`. The cost is a deliberate leak of ~0.28 GB in a case that is already an error, instead of corruption. A small gap remains: the leak test uses `pin=False`. Fix round 1's other two: the speed test now builds `T5Text(engine="engine")` explicitly (red: with `FLUX_T5=pread` in the environment it timed the `pread` path, 7.46 / 6.09 s, and failed; green: 3.77 / 2.32 s, the first encode slower because no painter had imported diffusers yet in that process), and the rename above.
+
+**C5, `TurboPainter` out of the default path** (`Understand`). The FLUX painter used to borrow `TurboPainter._decode` / `_encode` (the tiled VAE). Those now live in `dream/vae.py` `TiledVae`, which both painters use, and `flux/painter.py` no longer imports `TurboPainter` (red first). **The class is kept**, because these still need it: `VECWORLD_PAINTER=turbo` (opt-in), its tests (`test_painter_gpu`, `test_spot_gpu`, `test_depth_gpu`, `test_painter_tiles`, the roam service's headings test) and the SD-Turbo comparison sheets. The CPU fallback does not need it. Ruling: C5 asked for it out of the default path, not deleted; cost if wrong: a rarely used class lingers.
+
+**End-to-end results** (`Must`). The real server (`python -m vecworld`, through a launcher that only wraps methods with timers), dreamer **on**, SSD, every default, AC. Each journey: start, then 5 moves; each move walks 7.8 s and asks for the next spot; **fog** is how long that request blocks.
+
+| journey | start (first spot) | panorama job | walk steps (server) | fog at the rim | T5 per step |
+|---|---|---|---|---|---|
+| haunted forest + night | **34.1 s** | 33.2 s | 39.1–45.9 s | 32.3–39.4 s (mean 36.0) | 2.3–4.7 s |
+| desert oasis | 74.5 s (~40 s queued behind the previous session's pre-dream) | 33.5 s | 39.1–44.8 s | 34.8–38.3 s (mean 36.3) | 2.3–4.7 s |
+| snowy mountains | 77.2 s (same) | 33.6 s | 40.0–44.5 s | 33.3–38.1 s (mean 36.1) | 2.3–4.8 s |
+
+- **Bench** (server stopped): tile512 **3.81 s/pass, 4.64 TFLOP/s** (SSD-bound at batch 1); batch-8 pass **7.04 s = 0.88 s per window, 20.1 TFLOP/s** (bf16-equivalent); walk step **38.6 s**; panorama **30.9 s**; T5 cold 2.56 s. In the game a batch-8 pass is 7.2–7.5 s GPU time (7.8 s while the dreamer generates).
+- **Memory:** server RSS **9.75 GB max** in play, VmHWM **11.18 GB** at load (about 0.8 GB under the 12 GB bar), **VmSwap 0**, MemAvailable ≥ 4.54 GB. Peak VRAM **2.15 GB allocated, 2552 MiB** by nvidia-smi.
+- **Walk gate** against 10b: **PASS, per-spot worst Δ +0.000, min PSNR inf, all 18 spots and 15 `prev` images byte-identical**, as expected from bit-identical T5. The walk's own exit is 1 for coast spot 5's seam 1.192 > 1.1, the same picture as Tasks 9, 10a and 10b.
+- **Against SD-Turbo** (same driver, `VECWORLD_PAINTER=turbo`): start 2.9–3.7 s, steps 4.0–4.2 s, fogs 0.1–8.1 s. FLUX is coherent and clearly the more beautiful in all three journeys; SD-Turbo shows tile blocks in forest spots 2 and 4. By eye, FLUX's night forest paints several moons a panorama (each window paints its own) and the desert journey drifts into waterfalls at spot 5.
+- **Full suite: 879 passed in 2011 s**, after the fixes 579 default + 51 in the touched modules.
+- **Parked as product follow-ups, not engine defects:** the fog (32–39 s a move against 7.8 s of walking; batch-1 work is SSD-bound at 3.8 s a pass), second and third session starts queueing behind the previous pre-dream (74–77 s), the +3 s load, the 11.18 GB load peak, and `empty_cache` per encode.
+
+**Every piece, Task 0 → 10c** (`Understand`). The engine's window pass **2.74 → 0.88 s (3.1×)**, 6.45 → 20.1 bf16-equivalent TFLOP/s (105% of the measured bf16 matmul peak, by running 75% of the token FLOPs in INT8), the walk step **61.4 → 38.6 s**, and the painter's RAM **9.6 GB (spike) → 1.6 GB**, with the dreamer on beside it and no swap. The per-task table is in `docs/engine/speed.md`.
+
+**In an interview.** "I finished by moving T5, the text encoder, onto the same SSD streamer. Cold encode went from 6.7 to 2.3 s and stayed bit-identical, so no new kernel was needed: the dequant hides under the drive's 1.8 GB/s. The file was ordered by name, so a block was in two runs; I added extents and a one-pass mode and measured each setting, including the cyclic one that read 0.69 GB too much. The game was 4–12 s a step slower than my bench, so I attributed it: T5 was inside the step, which the bench never timed; the dreamer added about a second; GPU sharing and SSD contention measured zero. I A/B'd graphs, which weren't faster and cost 0.8–0.9 GB with one shape, so they stay off. A CPU cross-check gave cosine 0.9938, but the drift was at unmasked pad positions and the real tokens agreed to 0.998; I didn't treat it as the bar because the engine matches the previous GPU path exactly."
+
+**Tried and not chosen** (`Understand`):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **The Task 1 `pread` path** (kept as `FLUX_T5=pread`) | 6.68 s cold; 3.39 GB of the file left cached | 2.9× slower and fills the page cache | The reference and fallback; `VECWORLD_KERNEL=off` |
+| **A Q5_K / Q6_K engine kernel** | Not built; the dequant is ~0.67 s GPU time (24 × 28 ms) per encode, hidden under the 1.78 s SSD read | C1: only if 5 s were missed (2.3 s) | If the SSD got much faster |
+| **Single-run BlockFiles (FLUX's layout) for T5** | Block 5 spans 550 MB of the file | Would read 0.4 GB+ of other tensors per encode; `extents` instead | A re-sorted GGUF |
+| **3 staging buffers, 2 ahead** (FLUX's setting) | 2.43 s, 3.42 GB read, +141 MB pinned | Slower than 2 / 1 (2.30 s, 3.28 GB) | — |
+| **4 buffers, 3 ahead** (before `one_pass`) | 2.72 s, 4.24 GB | Re-reads | — |
+| **A ring of 3 slots** | 3.09 s, 4.64 GB read, peak 0.78 GB | Read-ahead evicts blocks before use | — |
+| **Cyclic streaming** (no `one_pass`) | 2.54 s, 3.97 GB read | 0.69 GB read for nothing | — |
+| **Table parse per encode** (Task 1) | +2.8–3.2 s per encode | Parsed once at construction (+3 s at load) | A minimal header reader would remove the load cost too |
+| **Keeping T5 slots and staging buffers between encodes** | Would save ~0.1 s an encode | Holds 282 MB VRAM + 282 MB pinned all the time | A server with spare memory |
+| **A true-CPU T5 cross-check in the suite** | 74.0 s per encode; cosine 0.9938 (real tokens ≥ 0.9983, trailing pads to 0.35) | Over the ~60 s test budget; neither run is an fp32 reference, so it can't say which is closer; the bar is against Task 1's output | An fp32 reference check (parked) |
+| **`VECWORLD_GRAPHS=1` in the game** | Passes no faster; first panorama +8.8 s; +0.8–0.9 GB with one shape (+1.2 GB with two); byte-identical image | No gain at the dreamer's contention level; costs memory | After byte-budgeted pool eviction and startup capture |
+| **Marking the reader broken on a failed completion** (N1 as written) | A failed CQE already fails its request after all chunks finish (10b I1) | It would break M1's recovery (the next `source(i)` re-reads) | — |
+| **Freeing staging buffers when `close()` can't drain** | Red: freed with reads in the kernel | Silent corruption; they are kept in `_LEAKED` and the error raised | — |
+| **Checking Gather coverage by byte totals** (10b) | A copy shifted 16 bytes into padding was accepted | Replaced by merged tensor spans | — |
+| **Deleting `TurboPainter`** | Opt-in painter, five test modules and the comparison sheets still use it | C5 asked for it off the default path, not deleted | When nothing uses `VECWORLD_PAINTER=turbo` |
+| **A test named for a CPU comparison it doesn't make** | `test_t5_engine_matches_cpu` compared against `pread` | Renamed `test_t5_streamed_blocks_match_pread` | — |
+
+<details><summary>Check yourself (Task 10c)</summary>
+
+**Q1.** T5's linears are Q5_K and Q6_K and the engine has only a Q4_K kernel. Why did T5 still get 2.9× faster with no new kernel?
+
+**A1.** The cost was reading and parsing, not the math: Task 1 re-parsed the tensor table every encode (2.8–3.2 s) and read the 3.4 GB through the page cache. Streaming the 24 blocks from the SSD with `O_DIRECT`, and parsing the table once, leaves the 3.28 GB read (1.78 s at 1.84 GB/s) as the floor; the ~0.67 s dequant hides under it. Cold encode: 2.30–2.42 s.
+
+**Q2.** A CPU run of T5 gave cosine 0.9938 against the engine. Why isn't that a failure?
+
+**A2.** The engine matches Task 1's GPU path bit for bit, which is the bar. The CPU run accumulates in a different order than cuBLAS bf16, and T5's unmasked pad positions amplify the difference (trailing pads down to 0.35) while the 10 real tokens agree to ≥ 0.9983. Neither is an fp32 reference.
+
+**Q3.** The in-game step was 4–12 s slower than the bench, and the dreamer was the obvious suspect. What did the attribution show?
+
+**A3.** The largest part was T5 running inside the step (1–2 new texts, 6.7 s each at 10b, 2.3 s now), which the bench encodes before timing. The dreamer added about 1 s while generating; per-pass GPU time (7.46 vs 7.44 s) and SSD waits showed no GPU sharing or disk contention.
+
+**Q4.** Why keep staging buffers alive if `close()` can't drain the reader?
+
+**A4.** A chunk may still be in the kernel, and the drive would DMA into memory that was freed and reused: silent corruption. Leaking ~0.28 GB in a case that is already an error is safer.
+
+</details>
+
+> **Remember this:** when a real system is slower than its benchmark, first compare what is inside the clock. The bench didn't time T5, and T5 explained most of the gap. And when the cost isn't compute (here, a read and a parse), a new kernel is the wrong tool.
+
+---
+
 ### Patterns so far
 
 `Must`
@@ -1907,6 +2057,7 @@ Deferred minors: M5 (`res % 512`: correct for this device; querying `STATX_DIOAL
 > 9. **Make results independent of incidental choices** (Task 9). cuBLAS's algorithm depends on M, so batch size changed the picture until those layers ran per window. When a lossless change fails a gate, check whether the *base* depended on something arbitrary.
 > 10. **Memory PyTorch doesn't track is still memory** (Task 10a). CUDA's libraries, glibc's freed heap and a loader's double copy each caused an OOM that looked like a leak. Measure the whole process, and when you can't make a hand-off cheap, remove it.
 > 11. **Evidence must be able to fail** (Task 10b). A flat `Cached` figure couldn't tell `O_DIRECT` from a buffered read, and a truncated-file test passed against the buggy reader. Show each assertion red against the wrong code, and when a request fans out, don't report failure until every part has finished.
+> 12. **Compare what's inside the clock** (Task 10c). The in-game step was slower than the bench mostly because T5 ran inside the step and the bench encoded before timing. Attribute a gap with numbers per cause before changing a default.
 
 ---
 
