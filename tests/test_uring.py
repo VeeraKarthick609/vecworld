@@ -327,3 +327,19 @@ def test_dreamer_auto_is_on_unless_flux_holds_its_weights_in_ram(monkeypatch):
     assert isinstance(main.make_dreamer("auto", "flux"), main.NoDreamer)
     monkeypatch.delenv("VECWORLD_KERNEL")
     assert isinstance(main.make_dreamer("off", "flux"), main.NoDreamer)
+
+
+def test_drop_file_cache_advises_every_regular_file_once(ssd_dir):
+    """drop_file_cache(root) asks the kernel to drop the clean page cache of every regular file under root
+    (posix_fadvise DONTNEED; no sudo, nothing is deleted): the server calls it on the model cache once its models are
+    loaded, so the pages its loads left cached don\x27t crowd the dreamer into swap. Symlinks (the HF hub\x27s snapshots
+    point at its blobs) are skipped, so nothing is counted twice; files keep their bytes."""
+    from vecworld.engine.uring import drop_file_cache
+
+    a, da = _file(ssd_dir, 10_000, seed=1)
+    (ssd_dir / "sub").mkdir()
+    b, db = _file(ssd_dir / "sub", 30_000, seed=2)
+    (ssd_dir / "link").symlink_to(a)
+    assert drop_file_cache(ssd_dir) == 40_000
+    assert a.read_bytes() == da and b.read_bytes() == db
+    assert drop_file_cache(ssd_dir / "missing") == 0

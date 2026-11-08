@@ -60,6 +60,12 @@ def main() -> None:
     painter = make_painter(painter_name)
     dreamer = make_dreamer(os.environ.get("VECWORLD_DREAMER", "auto"), painter_name)
     service = RoamService(painter, AnythingDepth(), dreamer, SCENE_DIR)
+    # The models are loaded: their files' pages left in the page cache (~4.5 GB) only crowd the painter and the
+    # dreamer toward swap (Task 10b, docs/engine/11-io-uring.md); the FLUX blocks are read with O_DIRECT anyway.
+    from vecworld.config import _HF_HUB
+    from vecworld.engine.uring import drop_file_cache
+
+    log.info("dropped %.1f GB of model files from the page cache", drop_file_cache(_HF_HUB) / 1e9)
     uvicorn.run(create_app(service, WEB_DIR), host="0.0.0.0", port=8080)
 
 

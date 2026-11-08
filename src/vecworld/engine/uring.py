@@ -375,3 +375,31 @@ def ssd_source(gguf_path, layout: list[BlockFile], **kw) -> SsdSource:
     """The BlockStreamer source reading `layout`'s blocks from gguf_path (SsdSource; kw: buffers, ahead, queue_depth,
     chunk). Bind it to the streamer (source.bind(streamer)) before the first block runs."""
     return SsdSource(str(gguf_path), layout, **kw)
+
+
+def drop_file_cache(root) -> int:
+    """Ask the kernel to drop the clean page cache of every regular file under root (posix_fadvise DONTNEED; symlinks
+    skipped; no sudo, nothing deleted). Returns the bytes advised. The game calls it on the model cache once its models
+    are loaded: the loads leave ~4.5 GB of model files cached, and with that much clean cache beside the painter and
+    the dreamer the kernel was seen swapping 0.48 GB of the server out at the first walk step (MemAvailable 5.3 GB);
+    started without it, a walk swapped nothing (docs/engine/11-io-uring.md)."""
+    import os
+    from pathlib import Path
+
+    total = 0
+    root = Path(root)
+    if not root.exists():
+        return 0
+    for p in root.rglob("*"):
+        try:
+            if p.is_symlink() or not p.is_file():
+                continue
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+            total += p.stat().st_size
+        except OSError:
+            continue
+    return total
