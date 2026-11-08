@@ -52,7 +52,7 @@ def test_t5_engine_matches_cpu():
 
 
 def test_t5_encode_fast():
-    """A cold encode (the GGUF evicted from the page cache, nothing cached in the encoder) on the default path takes
+    """A cold encode (the GGUF evicted from the page cache, nothing cached in the encoder) on the engine path takes
     <= 5 s on AC, and reads the file with O_DIRECT: its pages stay out of the page cache (no resident weights)."""
     if not _on_ac():
         pytest.skip("speed counts only on AC power")
@@ -63,7 +63,7 @@ def test_t5_encode_fast():
 
     load_ext(), load_uring()                    # built and loaded at the painter's start, not per encode
     torch.zeros(1, device="cuda")
-    t5 = T5Text(cache=0)
+    t5 = T5Text(cache=0, engine="engine")      # explicit: FLUX_T5=pread in the environment must not time the wrong path
     times = []
     for text in TEXTS[:2]:
         _evict(FLUX_T5_GGUF)
