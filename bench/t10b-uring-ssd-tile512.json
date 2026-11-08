@@ -1,0 +1,62 @@
+{
+ "power": "ac",
+ "git": "e226147",
+ "results": {
+  "what": "tile512",
+  "painter": "engine",
+  "kernel": "w4a8",
+  "fused": true,
+  "batch": 8,
+  "graphs": false,
+  "cache_threshold": 0.0,
+  "gpu_power": "80.00 4 8",
+  "load_s": 6.8,
+  "rss_after_setup_gb": 1.58,
+  "pinned_gb": 0.58,
+  "weights_source": "ssd",
+  "t5_encode_cold_s": 4.99,
+  "mon_t5": {
+   "rss_gb": 2.12,
+   "smi_mib": 1926
+  },
+  "tile512": {
+   "ssd": {
+    "reads": 229,
+    "gb": 26.85,
+    "hits": 228,
+    "read_wait_s": 3.02,
+    "buffer_wait_s": 0.0,
+    "gb_per_s_wall": 1.85
+   },
+   "cached_gb": [
+    7.91,
+    7.91
+   ],
+   "s": 14.5,
+   "passes": 4,
+   "s_per_pass_median": 3.64,
+   "s_per_pass_mean": 3.633,
+   "s_per_pass_min": 3.616,
+   "s_per_pass_max": 3.641,
+   "s_per_pass": [
+    3.616,
+    3.637,
+    3.64,
+    3.641
+   ],
+   "peak_alloc_gb": 1.22,
+   "rss_gb": 2.25,
+   "smi_mib": 1348,
+   "cache": {
+    "passes": 4,
+    "skips": 0,
+    "rel": []
+   },
+   "flop_per_step": 17672448245760,
+   "achieved_tflops": 4.86,
+   "pct_bf16_peak": 25.4
+  },
+  "wall_s": 30.6,
+  "gpu_power_end": "80.00 4 8"
+ }
+}

@@ -1,0 +1,36 @@
+{
+ "power": "ac",
+ "git": "e226147",
+ "results": {
+  "what": "peak",
+  "painter": "engine",
+  "kernel": "w4a8",
+  "fused": true,
+  "batch": 8,
+  "graphs": false,
+  "cache_threshold": 0.0,
+  "gpu_power": "80.00 4 8",
+  "load_s": 7.4,
+  "rss_after_setup_gb": 1.58,
+  "pinned_gb": 0.58,
+  "weights_source": "ssd",
+  "t5_encode_cold_s": 5.1,
+  "mon_t5": {
+   "rss_gb": 2.12,
+   "smi_mib": 1926
+  },
+  "batch8": {
+   "peak_alloc_gb": 2.045,
+   "first_pass_s": 7.588,
+   "s_per_pass": 7.182,
+   "s_per_window": 0.898,
+   "passes_s": [
+    7.032,
+    7.182,
+    7.27
+   ]
+  },
+  "wall_s": 41.6,
+  "gpu_power_end": "80.00 4 8"
+ }
+}
