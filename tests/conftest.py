@@ -1,11 +1,31 @@
 import os
 
+import pytest
+
 from PIL import Image
 
 # The allocator the painter runs (FluxPainter.__init__ sets it before CUDA starts): GPU tests that build the
 # transformer without the painter (test_graphs, test_cache) must see the same fragmentation behaviour, or batch-8 graph
 # pools that fit the game run out of memory in the tests. Set before anything touches CUDA.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _hand_host_memory_back():
+    """After each test module: collect, and hand glibc's freed heap back to the OS (malloc_trim). Model loads leave
+    gigabytes of freed but still mapped heap (each tensor under glibc's 32 MB mmap threshold), and some GPU tests peak
+    at ~12.8 GB of this 14 GB laptop on their own (test_glue's patched-block test): leftovers from the modules before
+    them got the suite OOM-killed."""
+    yield
+    import gc
+
+    gc.collect()
+    try:
+        from vecworld.engine.stream import _trim
+
+        _trim()
+    except Exception:  # noqa: BLE001 - best effort (no torch / no glibc)
+        pass
 
 
 def pytest_collection_modifyitems(config, items):
