@@ -175,6 +175,11 @@ What it says:
   switch interval is up to the OS scheduler. Read medians; the probe is a stress case (the game's other threads mostly
   wait on I/O).
 
+**The other threads' side** (fix round 1, review I3): the hooks and `graph_launch` keep the GIL, so a CUDA call that
+blocked would hold every other Python thread. Measured with a 1 ms ticker thread during a painted panorama: its worst
+wake-up is 2.5 ms with graphs (0.4 ms at BASE), and 45 ms eager, as at BASE (42 ms); no wake-up over 50 ms in any
+run (`~/t10a/ticker.py`). Eager's tens of milliseconds come from eager execution itself, not from the streamer.
+
 **Batch 4 vs 8 under the streamer** (Task 9 ruling b):
 
 | | batch 4 | **batch 8** |
