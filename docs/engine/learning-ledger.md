@@ -9,7 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
-| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08 | 2b, 3, 4, 5, 5b, 5c, 6, 7, 8 |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08; Task 9 (window batching) added 2026-11-08 | 2b, 3, 4, 5, 5b, 5c, 6, 7, 8, 9 |
 
 ---
 
@@ -63,6 +63,11 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
   - Thresholds 0.3 and 0.25 failed the seam gate (up to +0.166); 0.2 passed vacuously, with 0 skips.
   - The cache would buy 1.32× (tile, panorama) and 1.63× (walk step) at 0.3, and still ships off.
   - On a chained walk, PSNR measures trajectory divergence, so the gate decides on seams.
+- Entry 2, Task 9:
+  - When compute-bound, batching is a speed tie (~0.9 s per window-step at batch 1–8).
+  - It halves passes and per-block Python (panorama 456 → 228), which matters for SSD streaming.
+  - cuBLAS picks its algorithm by M: one ulp became a new picture under W4A8 (25.7 dB); `rowwise` makes windows bit-identical for +0.16%.
+  - The reference is pinned to batch 1.
 - Entry 2, Patterns so far: roofline first; data in registers; overlap loads with math; gate on the real output; measure before trusting estimates.
 
 **Understand.** The exact Q4_K bytes, `mma` tile shapes, the min-term algebra, CUDA graphs, block caching and glue fusion.
@@ -782,10 +787,11 @@ One 512 px window, one transformer pass (1024 image + 256 text tokens, 17.67 TFL
 | **Task 7: fixed weight slots, eager by default (graphs opt-in)** | **0.85** (Task 6 re-run in the same session: 0.92) | 20.79 (bf16-equivalent) | 108.8% (bf16-equivalent, see Task 6) | **38.3** (Task 6 same session: 39.0) |
 | **Task 8: first-block cache, off by default; step unchanged** | **0.86** (Task 7 in its own session: 0.85) | 20.55 | 107.6% | unchanged (39.2 s wall in Task 8's bench session) |
 | *Task 8, would-be at threshold 0.3 (fails the quality gate, not shipped)* | *0.650 mean (1.32×)* | *27.19 nominal: work skipped, not done faster* | — | *24.6 s wall (1.59×; 1.63× per pass)* |
+| **Task 9: window batching, 8 windows a pass (bit-identical to batch 1)** | **0.87** (1 window: batching can't change it) | 20.31 | 106.3% | **39.3** in 5 passes (was 10); panorama **29.8 s** in 4 passes (was 8); peak 2.05 GB |
 
 From Task 5b on, "TFLOP/s" counts the same 17.67 TFLOP even though 75% of it runs as INT8, so it is **bf16-equivalent**: how fast a bf16 engine would need to be to match. It can pass the bf16 roof without breaking physics.
 
-Through Task 5c the step was 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step only 1.29× (61.4 → 47.6 s). After Task 6: step 2.95× (0.93 s), walk step 1.55× (39.5 s). After Task 7: step 3.2× (0.85 s), walk step 1.6× (38.3 s). Task 8 added no speed: its cache ships off. Why the walk gains less is the first lesson of Task 5.
+Through Task 5c the step was 2.45× faster than the baseline (2.74 → 1.12 s), but the walk step only 1.29× (61.4 → 47.6 s). After Task 6: step 2.95× (0.93 s), walk step 1.55× (39.5 s). After Task 7: step 3.2× (0.85 s), walk step 1.6× (38.3 s). Task 8 added no speed: its cache ships off. Task 9 added no speed either: it halves the passes, which pays off in Task 10. (The walk step drifts 38.3–39.3 s between sessions with heat.) Why the walk gains less is the first lesson of Task 5.
 
 **How the Entry 1 estimates did.**
 
@@ -1443,6 +1449,90 @@ The review's follow-ups for it: check that base and candidate are the same scene
 
 ---
 
+### Task 9: window batching
+
+`Must` for the plain version, why batching ties when compute-bound, the cuBLAS-by-M rounding and `rowwise`, and why the reference is pinned to batch 1. `Understand` for the gate story, the gate hardening, activation memory and stop latency. `Skip` the `_Rows` wrapper internals and the graph-pool OOM details.
+
+> **Plain version.** A panorama is 8 windows. Until now the painter put 4 through each transformer pass; now all 8 go together, so a panorama takes 4 passes instead of 8 and a walk step 5 instead of 10. **Speed didn't change:** a window costs ~0.9 s per step in a batch of 1 or of 8, because the engine is compute-bound. Batching only spreads costs paid *once per pass*: weight copies, the per-block Python and the modulation weight read. Those are small today, but large once weights stream from the SSD (Task 10). The surprise: batching wasn't lossless. One cuBLAS layer rounds differently depending on the batch size, and W4A8 turned that one-bit difference into a different picture (25.7 dB). A small fix, `rowwise`, makes every window **bit-identical to painting it alone**, for +0.16%.
+
+**When you're compute-bound, batching is a speed tie** (`Must`). Measured sweep, one process per cell:
+
+| Batch | Panorama s (passes) | s per window-step | Walk step s (passes) | Peak GB (one pass) |
+|---|---|---|---|---|
+| 1 | 30.3 (32) | 0.891 | 40.3 (40) | 1.225 |
+| 2 | 30.6 (16) | 0.907 | 39.9 (20) | 1.342 |
+| 4 (before) | 30.3 (8) | 0.897 | 39.4 (10) | 1.576 |
+| 6 | 30.4 (8 = 6 + 2) | 0.902 | 39.5 (10) | 1.810 |
+| **8 (chosen)** | **30.2 (4)** | **0.896** | **39.3 (5)** | **2.045** |
+
+Each window's 1,280 tokens meet every weight anyway (17.67 TFLOP a window), so more windows per pass is more work in proportion. What batching saves is what's paid once per pass:
+
+```
+ batch 4:  [copy blk i+1 | GEMMs for 4 x 1280 rows]  x 57 blocks  x 2 passes a step
+ batch 8:  [copy blk i+1 | GEMMs for 8 x 1280 rows]  x 57 blocks  x 1 pass  a step
+           per pass: 6.66 GB of weight copies, 57 Python block calls, a 1.8 GB modulation weight read
+```
+
+Today those are hidden or small: a block's copy (~14 ms) hides under its compute (~15 ms per window). But the **per-block Python iterations halve** (panorama 456 → 228, walk step 570 → 285), and that's what Task 10 starts from. Once weights stream from the SSD at 2.0–2.96 GB/s, a pass costs 2.3–3.3 s of reads: that's **2.3–3.3 s per window-step at batch 1**, and 0.3–0.4 s at batch 8, under the ~0.9 s of compute. (This is Entry 1 Technique 3's point, now with a measured floor.) Batching also overlaps with Task 5: the reference's per-pass dequant was what batch 4 used to amortize (2.74 → 1.76 s per window), and the fused kernel had already removed it.
+
+**cuBLAS picks its algorithm by M, so the batch size changed the picture** (`Must`). The brief's check (batched panorama within 35 dB of batch 1) **failed: 25.7 dB**, visibly another sample. Bisecting with forward hooks:
+- the engine's own kernels (all token-facing GEMMs, the GEMV, fused glue, attention) give a row the **same bits at any M**: all 57 blocks were bit-identical at batch 1, 2 and 8;
+- but `timestep_embedder.linear_1` and `text_embedder.linear_2` are diffusers' bf16 `nn.Linear`s, i.e. **cuBLAS, which picks its GEMM algorithm (tile shape, split-K, summation order) by problem size**. M here is the batch. At M = 2 against M = 1 they rounded **one bf16 ulp** (~2e-3) apart. `proj_out` (M = 1024 × batch) did the same.
+
+That one ulp in the conditioning reaches every block's modulation. Under W4A8 it flips per-token INT8 roundings, and four Euler steps later the panorama is another sample. It's the same amplifier as Task 5c's one-ulp modulation change (25.78 dB) and Task 6's two-pass LayerNorm (25.17 dB).
+
+**`rowwise`: per-window bit-exactness for +0.16%** (`Must`). `rowwise(transformer)` runs the five layers outside the blocks (`x_embedder`, `context_embedder`, `time_text_embed`, `norm_out.linear`, `proj_out`) **one window at a time**, splitting every argument whose first dimension is the batch, then concatenating. They're a few MFLOP a window, so a same-session interleaved A/B at batch 8 measured **0.9543 vs 0.9528 s per window-step (+0.16%)**, inside the run-to-run spread. Now every window of a batch of 8, 5 or 2 is `torch.equal` to itself alone (under w4a8 and mma, eager and graphs), and the batch-8 panorama matches batch 1 at **PSNR inf**. Ruling (b): `FLUX_BATCH` no longer changes pictures under the engine kernels, so it's purely a speed/latency knob.
+
+**Why the old base "failed" the gate, and what the reference became** (`Understand`). Against Task 8's walks (batch 4, no `rowwise`), batch 8 + `rowwise` **failed 2 of 18 spots** (coast spot 5 +0.166, desert spot 4 +0.045) and improved 11. Even spot 0 differed (32–37 dB). The reason was that the *base* carried cuBLAS's M = 4 rounding in its conditioning; the candidate carries none. Against a base re-walked at batch 1: **18 of 18 spots byte-identical**. Ruling (a): the batch-invariant (batch-1) picture is the reference, and the old batch-4 pictures were one arbitrary rounding among several, the same class as Task 5c's. Later tasks gate against the Task 9 walks. Lesson: when a "lossless" change fails a gate, check whether the *base* depended on something arbitrary.
+
+**The reference path itself had to be pinned to batch 1 (review I1)** (`Must`). `rowwise` can only fix layers outside the blocks. On the diffusers reference (`VECWORLD_KERNEL=off`), the blocks' own GEMMs are cuBLAS bf16 after a GGUF dequant, so they round by M as well. A reviewer probe measured a window in a batch of 2 or 8 at 2.8e-3 to 7.6e-3 relative from itself alone, never bit-equal. So `engine_batch()` returns **1 under `off`**, whatever `FLUX_BATCH` says. The reference always paints the one-window-a-pass picture, which every engine batch now matches. A canonical reference is worth more than reference speed, which nothing ships on.
+
+**Gate hardening** (`Understand`). The Task 8 review's follow-ups, fixed first in their own commit:
+- **Same-route check:** `--relative` refuses a base and candidate whose `timings.json` differ in theme, seed, headings, recipe or walked distance, or lack any of them. A forest-vs-desert comparison is refused instead of "measured".
+- **VACUOUS verdict (exit 2):** a lossy setting under test (cache on, or `--expect-change`) that skipped nothing or left every spot byte-identical reads VACUOUS, not PASS. That was Task 8's 0.2 threshold.
+- **No walks from a dirty tree:** `walk_sheet` refuses to walk uncommitted code unless `--allow-dirty`, which saves the diff beside the walk. Every walk records its git sha, batch and passes.
+
+**Activation memory** (`Understand`). +0.117 GB per window over a ~1.11 GB floor (slots, non-block layers, inputs): batch 8 peaks at **2.05 GB**, well under 3.6 GB (room for ~20 windows; a panorama has 8). Entry 1 had estimated ~0.53 GB per window from the reference; fused glue and no dequant scratch cut that by ~4.5×. With opt-in graphs, four batch-8-ish keys peak at 2.23 GB. One environment lesson: without PyTorch's expandable-segments allocator, batch-8 graph pools fragmented and OOMed in the tests, so the tests now use the painter's allocator.
+
+**Stop latency and progress** (`Understand`). `check_stop()` runs between passes, so a stop now waits up to one **7.2 s** pass (was 3.6 s). At batch 8 every pass boundary is a step boundary. Progress ticks halve (panorama 4, walk step 5), with the same average rate. Ruling (b)'s cost: slower stop response for no speed gain today. Task 10 re-measures batch 4 against 8 with streaming and drops back to 4 if streaming doesn't benefit.
+
+**Results.** tile512 **0.87 s** (20.31 TFLOP/s; a single window, so batching can't move it), panorama **29.8 s** in 4 passes, walk step **39.3 s** in 5 passes, peak **2.05 GB**, every picture bit-identical to batch 1.
+
+**In an interview.** "Batching panorama windows was a speed tie because the engine was compute-bound: each window's tokens meet every weight anyway. It halved the per-pass work, which matters once weights stream from an SSD at ~3 s a pass. The interesting part was that it wasn't lossless. cuBLAS chooses its GEMM algorithm by M, so two small bf16 conditioning layers rounded one ulp differently at batch 8, and downstream INT8 quantization turned that into a different image. Running those five tiny layers per window made every window bit-identical to batch 1 for 0.16%, and I pinned the reference path to batch 1 so the reference is canonical."
+
+**Tried and not chosen** (`Understand`):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **Keep batch 4** | Panorama 30.2 s, walk step 39.4 s, peak 1.76 GB (same session) | Ties batch 8 on time with 2× the passes, copies and Python; it doubles Task 10's SSD floor per window-step | If Task 10 shows streaming doesn't benefit from 8: halves stop latency (3.6 s) |
+| **Batch 6** | Panorama 30.4 s in 8 passes (6 + 2), walk step 39.5 s, peak 1.81 GB | Same pass count as 4 (ragged), no gain | Never for 8-window panoramas |
+| **Batch 1 / 2** | Panorama 30.3 / 30.6 s, walk step 40.3 / 39.9 s; interleaved A/B 0.943 s per window at 1 vs 0.915 at 8 | Slightly slower, 4–8× the passes | Lowest stop latency and memory (1.2 GB) |
+| **Batch 8 without `rowwise`** | Panorama **25.73 dB** against batch 1 | Not lossless: cuBLAS bf16 conditioning layers round by M, and W4A8 amplifies one ulp into a new sample | Under a lossless kernel with no INT8 stage downstream (the ulp would stay an ulp) |
+| **`rowwise` on `time_text_embed` + `norm_out.linear` only** | All 57 blocks bit-exact, output still 2.1e-3 off at batch 2 (`proj_out`) | Incomplete; `proj_out` and, defensively, both embedders were added (equal today, but cuBLAS can switch algorithms by M) | — |
+| **A 1e-2 relative-L2 tolerance** for batched vs single | Measured 3e-3 to 5.3e-2 on random inputs | Too loose to mean anything when real images moved 25.7 dB; replaced by bit equality | — |
+| **Gate against Task 8's batch-4 walks** (as dispatched) | Fail, 2 of 18 spots (+0.166, +0.045); 11 improved; spot 0 already 32–37 dB | The base carried arbitrary M = 4 rounding; against batch 1, 18 of 18 byte-identical | — |
+| **Restore Task 8's pictures** (batch 4, no `rowwise`) | Two lines of code | Would keep an arbitrary, batch-dependent picture as the reference | If the old pictures had to be reproduced exactly |
+| **Fix I1 by narrowing the docs to "engine kernels only"** (the review's option 2) | Reference at batch 8: 2.8e-3 to 7.6e-3 relative per window, never bit-equal | A canonical reference beats reference speed | — |
+| **Pin only the bench's reference to batch 1** | — | The game and walks can also run `off`; the rule belongs in `engine_batch`, which all three share | — |
+| **`_Rows` holding a bound method** (first version) | A module → wrapper → module reference cycle, freed only by the cyclic GC | Replaced by a weakref and a module marker (also safe after a hook rewraps the forward) | — |
+| **Graph keys without expandable segments** | Keys 8 and 5 fit (2.86 GB reserved); a third (7) OOM | The painter already uses expandable segments (2.37 GB for six keys); tests now match | — |
+
+<details><summary>Check yourself (Task 9)</summary>
+
+**Q1.** Batch 8 halves the passes, yet a panorama takes the same 30 s as at batch 1. Why, and when would batching pay?
+
+**A1.** The engine is compute-bound: each window's tokens meet every weight, so 8 windows are 8× the GEMM work whatever the grouping. Batching only shares per-pass costs (weight copies, per-block Python, the modulation read), which are hidden or small today. It pays when a per-pass cost dominates: the old per-pass dequant (Task 1), or SSD streaming at 2.3–3.3 s a pass (Task 10).
+
+**Q2.** All 57 blocks gave bit-identical rows at any batch size. How did batching still change the picture?
+
+**A2.** Two small bf16 layers outside the blocks (the time/text embedders) ran on cuBLAS, which picks its algorithm by M (the batch), so they rounded one ulp differently. That conditioning feeds every block's modulation; W4A8 turned the ulp into different INT8 roundings, and four denoising steps grew it into another sample (25.7 dB). Running those layers per window (`rowwise`) removed it.
+
+</details>
+
+> **Remember this:** when compute-bound, batching doesn't add speed; it divides per-pass costs, so batch for the cost that's coming (SSD streaming). Library GEMMs can round differently by batch size, so make each sample independent of its batch if anything downstream amplifies bits.
+
+---
+
 ### Patterns so far
 
 `Must`
@@ -1455,6 +1545,7 @@ The review's follow-ups for it: check that base and candidate are the same scene
 > 6. **Make lossless changes bit-identical** (Task 6). Then the gate proves Δ = 0 instead of arguing about noise, which matters most upstream of a lossy stage like W4A8.
 > 7. **Amdahl moves the target.** Each speedup makes the untouched parts a bigger share: glue went from small to 31% of GPU time by Task 5c, and after Task 6 the GEMMs are 85% again.
 > 8. **Never buy speed with an unapproved quality loss, and don't trust a vacuous pass** (Task 8). The cache measured 1.32–1.63× and shipped off; the threshold that "passed" had skipped nothing.
+> 9. **Make results independent of incidental choices** (Task 9). cuBLAS's algorithm depends on M, so batch size changed the picture until those layers ran per window. When a lossless change fails a gate, check whether the *base* depended on something arbitrary.
 
 ---
 
