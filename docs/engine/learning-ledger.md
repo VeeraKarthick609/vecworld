@@ -9,7 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
-| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08; Task 9 (window batching) added 2026-11-08; Task 10a (block streamer) added 2026-11-08, with a Task 10a-g addendum (graphs by default, reverted) |  2b, 3, 4, 5, 5b, 5c, 6, 7, 8, 9, 10a |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08; Task 9 (window batching) added 2026-11-08; Task 10a (block streamer) added 2026-11-08, with a Task 10a-g addendum (graphs by default, reverted); Task 10b (io_uring SSD reader) added 2026-11-09 |  2b, 3, 4, 5, 5b, 5c, 6, 7, 8, 9, 10a, 10b |
 
 ---
 
@@ -1746,6 +1746,152 @@ The gate with graphs on: **PASS, Δ +0.000, PSNR inf, 18 of 18 spots byte-identi
 
 ---
 
+### Task 10b: reading FLUX blocks from the SSD with io_uring
+
+`Must` for the plain version, page cache vs `O_DIRECT`, the SSD ceiling (1.84 GB/s), why batch 8 hides it and batch 1 can't, the SSD-vs-RAM numbers with Qwen on, and the two review lessons (a failed async read must fail the whole request; evidence has to be able to tell the two readers apart). `Understand` for io_uring's two rings, raw syscalls vs liburing, the `Gather`, the staging ring and `drop_file_cache`. `Skip` the chunk-resubmit details and the file-layout table.
+
+> **Plain version.** After Task 10a the painter held the 57 blocks' weights (6.66 GB) in pinned RAM, and Qwen, the "dreamer", didn't fit beside it on a 14 GB laptop. 10b stops keeping the weights in RAM. Every pass now **reads them from the GGUF file on the SSD**, block by block, into three small pinned staging buffers (575 MB), and the existing slot ring streams them to the GPU. The reads use `O_DIRECT` through **io_uring**, so the kernel doesn't cache the file. The result at the game's batch 8: **the same speed** (walk step 38.0 vs 38.9 s from RAM), the same pictures (bit for bit), and the whole game with Qwen on at **7.92 / 9.45 / 11.0 GB** (idle / play / load peak) with no swap. The price: a lone single-window pass is now bound by the drive, **3.64 s instead of 0.88 s**. The drive is the ceiling: 1.84 GB/s, whatever we tried.
+
+**Page cache vs `O_DIRECT`** (`Must`). An ordinary `read()` goes through the page cache: the kernel reads the file into its own memory, copies into your buffer, and keeps the file cached. Read 6.66 GB a pass that way and the kernel caches up to 6.66 GB. That is "free" memory on paper, but it pushes everything else out first, Qwen's pages included, and on this laptop that means swap. `O_DIRECT` skips the cache: the NVMe drive DMAs the bytes straight into your buffer and nothing is left behind. The price is alignment: offset, length and buffer address must be multiples of the device's logical block size (512 B here, 4096 used). A block's tensors start at arbitrary offsets in the GGUF (block 0 at byte 54,048), so a block is read as its aligned superset and the copies start at the right place inside it.
+
+```
+ page cache read:   SSD --DMA--> page cache --memcpy--> buffer        (and the cache keeps a copy)
+ O_DIRECT read:     SSD --DMA------------------------> buffer        (offset, length, address 4096-aligned)
+
+ three stages:  SSD --(io_uring, O_DIRECT)--> pinned staging buffer --(DMA, side stream)--> device slot --> compute
+                block i+2 reading   |   block i+1 copying   |   block i computing
+```
+
+**io_uring's two rings, and raw syscalls instead of liburing** (`Understand`). io_uring is the kernel's asynchronous I/O interface: two ring buffers shared with the kernel. You write submission entries (read fd, offset, length, destination, tag) into the SQ ring and call `io_uring_enter` once; the kernel starts the reads and returns at once; the drive DMAs into your buffers; the kernel posts completion entries (tag, bytes read or −errno) to the CQ ring, which you read **without a syscall**. A block's read is split into 1 MB chunks, up to `queue_depth` (64) in the kernel at once, the rest queued and topped up as completions arrive; `wait` blocks in `io_uring_enter` with the GIL released.
+
+Ruling R1 and the reason: **`liburing` headers aren't installed** (only the `liburing2` runtime), and installing them needs `sudo`. The kernel header `<linux/io_uring.h>` is present (kernel 7.0), so `csrc/uring.cpp` uses `io_uring_setup`, `io_uring_enter` and `mmap` directly: about 380 lines with bookkeeping, roughly 150 more than the wrapper would have needed. Cost if wrong: that code. It is built as its own C++-only extension (`vecworld_uring`) so it never rebuilds the CUDA kernels. The brief's fallback, `O_DIRECT` `pread` on a thread pool, wasn't needed: io_uring works here and is asynchronous without threads.
+
+**The SSD ceiling: 1.84 GB/s at every queue depth and chunk size** (`Must`). The drive is an Intel 670p 512 GB QLC (PCIe 3.0 x4). `DirectReader` over the 57 block extents (6.67 GB), two blocks in flight:
+
+| queue depth × chunk | GB/s |
+|---|---|
+| 4 / 8 / 16 / 32 / 64 / 128 × 1 MB | 1.82 / 1.80–1.83 / 1.84 / 1.84 / 1.84 / 1.84 |
+| 16 / 64 × 256 KB, 128 × 128 KB | 1.82 / 1.83 / 1.84 |
+| 16 / 32 × 4 MB, 8 × 16 MB | 1.84 / 1.84 / 1.84 |
+| synchronous `O_DIRECT` `pread`, 1 thread, 1 MB / **16 MB** | 1.50 / **1.82** |
+
+Nothing moved it: the drive saturates from queue depth 4, and a *single-threaded synchronous* `pread` with 16 MB chunks matches io_uring (1.82). So **io_uring didn't buy bandwidth here**; what it buys is asynchrony without a thread pool, so the staging pipeline can keep several blocks in flight and wait with the GIL released. Whatever the drive does, one pass of weights takes **≥ 3.6 s** (6.66 GB ÷ 1.84). Achieved in the painter: **1.85 GB/s** over tile512 (SSD-bound), and 0.88 GB/s over a batch-8 walk step, which only needs 0.92. Queue depth 64 stayed because it costs nothing and leaves headroom for a faster drive; tile512 at queue depth 4 / 8 / 64 was 3.65 / 3.66 / 3.64–3.66 s.
+
+**Why batch 8 hides the SSD and batch 1 can't** (`Must`). A pass needs 3.6 s of reads. A batch-8 pass computes for ~7.2 s, so the read of block i+2 finishes long before block i+2 is needed. A batch-1 pass computes 0.88 s and waits ~2.8 s for the drive (**GPU idle 2,769 ms a pass** at batch 1 against **1.68 ms** at batch 8). This is Task 9's prediction, now measured: batching divides the once-per-pass cost, here the SSD floor.
+
+**SSD vs RAM, with Qwen on** (`Must`). AC, one process per bench row. Painter alone:
+
+| | RAM arena (10a path) | **SSD (10b)** |
+|---|---|---|
+| tile512, batch 1: s / pass | 0.88 | **3.64** (4.1×; SSD-bound) |
+| panorama, batch 8: s (passes) / per window-step | 29.9 (4) / 0.887 | **30.6 (4) / 0.906** (+2.3%) |
+| walk step, batch 8: s (passes) / per window-step | 38.9 (5) / 0.936 | **38.0 (5) / 0.915** (−2.3%) |
+| painter load | 13.1 s | **6.8–7.1 s** |
+| painter RSS: load peak / after setup / in a walk step | 7.86 / 7.52 / 8.54 GB | **3.56 / 1.58 / 2.60 GB** |
+| page-locked host memory | 6.66 GB | **0.58 GB** |
+| peak allocated, batch 1 / 8 | 1.22 / 2.05 GB | 1.22 / 2.05 GB |
+
+The panorama is 2.3% slower and the walk step 2.3% faster: both noise-sized, so call batch 8 a tie. Load is twice as fast because under `ssd` the painter leaves the blocks' Q4_K tensors unread (allocated, never touched). The full game server (painter + Qwen dreamer + depth), driven over HTTP through a session start and 3 walk steps (`/proc` sampled every 0.5 s):
+
+| | RAM + Qwen | **SSD + Qwen (final code, default config)** |
+|---|---|---|
+| load peak (VmHWM) | 12.70 GB | **11.0 GB** |
+| RSS idle | 10.19 GB, **3.53 GB swapped out** | **7.92 GB, VmSwap 0** |
+| RSS during play (max) | **13.67 GB**, MemAvailable 0.40 GB: the watchdog stopped it after 1 step | **9.45 GB**, VmSwap 0, MemAvailable ≥ 5.0 GB |
+| start / steps | 37.9 s / 61.9 s (swapping) | 37.7 s / 50.4, 48.8, 43.4 s |
+
+That is why the ruling made **`FLUX_WEIGHTS_SOURCE=ssd` the default**: it is the only source under 12 GB with no swap with the dreamer on, and a tie at the game's batch 8. Cost if wrong: batch-1 passes are I/O-floored at ~3.6 s. `ram` stays for a dreamer-off setup that wants batch-1 speed (it turns the dreamer off by itself).
+
+**Staging ring: 2, 3 or 4 buffers, and the read-ahead claim that was retracted** (`Understand`). Measured, tile512 / walk step:
+
+| buffers, read-ahead | tile512 s / pass | walk step s |
+|---|---|---|
+| 2, ahead 1 | 3.69 | 38.1 |
+| **3, ahead 2 (chosen; the plan's i+2)** | 3.64–3.66 | **38.0** |
+| 4, ahead 3 | 3.66 | 38.7 |
+| 3, ahead 0 (read on demand) | 3.68 | **38.9** |
+| 3, ahead 1 | 3.65 | n/a |
+
+The first report said read-ahead was "worth 2.4% at batch 8" (38.9 vs 38.0 s). **Review M7 made the implementer retract it.** Counting how often the read-ahead actually had a block waiting: **19–21 hits out of 285 reads** in a walk step (panorama 14–16 of 232; tile512 227–228 of 229). At batch 8 a block's read finishes during the previous block's compute anyway, and at batch 1 the drive is the limit so nothing can be earlier. The 2.4% sits inside run-to-run spread. Lesson: a speedup you can't connect to a mechanism you counted is noise. The ring stays at 3 (the arithmetic is the plan's, the measurement doesn't argue against it), and 2 buffers would save 191 MB if RAM gets tighter, at ~1% at batch 1.
+
+**`Gather` instead of a CPU repack** (`Understand`). The GGUF's byte order isn't the slot's: diffusers splits `qkv` and `linear1` by rows and converts F32 biases and norms to bf16, so a block is one contiguous run of the file (191.5 MB double, 79.8 MB single, no gaps), but in file order. Each Q4_K `*.qweight` maps to its file byte range through a table checked against the file's types, shapes and sizes; the converted tensors (~6 MB) stay resident. Ruling: `source(i)` returns a **`Gather`**, flat `(slot offset, host address, bytes)` triples (one DMA per tensor, ~34 per double block), instead of the plan's single exact-layout tensor. The alternative, repacking each block into slot order on the CPU, measures **24.9 ms of memcpy per 191 MB block (7.7 GB/s) = 0.87 s of CPU a pass**, plus a second buffer set (575 MB). The `Gather` gets the right layout for free, since the DMA engine does the scatter. Cost if wrong: an interface the plan didn't name; the review confirmed the reader contract still holds. The hot path still never releases the GIL.
+
+**`drop_file_cache`** (`Understand`). Not in the plan. The first SSD run swapped **0.48 GB** of the server out once, at the first walk step, with MemAvailable still 5.3 GB (it then settled at 0.29 GB and never grew; no thrash). It had started beside a warm page cache (6.2 GB, mostly the model files its own loads had just read). So after the models load, `__main__` calls `posix_fadvise(DONTNEED)` on the Hugging Face cache. Re-run: VmSwap 0, and the final run above started from a deliberately warm 11.8 GB cache and swapped nothing. Cost if wrong: a slower second cold load. A firmer fix, `vm.swappiness=10`, needs sudo and is the user's call.
+
+**Batch 4 vs 8 on the SSD** (`Must`):
+
+| | batch 4 | **batch 8** |
+|---|---|---|
+| panorama s (passes) / per window-step / per pass | 34.4 (8) / 1.024 / 4.06 | **30.6 (4) / 0.906 / 7.23** |
+| walk step s (passes) / per window-step / per pass | 42.9 (10) / 1.038 / 4.09 | **38.0 (5) / 0.915 / 7.21** |
+| peak allocated | 1.76–1.77 GB | 2.05 GB |
+
+Batch 8 is **11–13% faster** on the SSD (it was 1.4–2.9% from RAM). A batch-4 pass computes ~3.7 s and the drive needs 3.6 s, so every pass waits for it. This answers Task 9's and 10a's "re-measure on the SSD": batch 8 stays.
+
+**Review lesson I1: a failed async multi-chunk read handed out a half-read buffer** (`Must`). A block's read is ~190 one-megabyte chunks. If one chunk failed (EIO, a torn read), the first version let `wait()` return normally while other chunks were still in the kernel, so DMA kept landing in a buffer the caller thought was finished and then reused. Silent weight corruption: the worst failure this task could have. The implementer's first test was a truncated file, which **passed against the buggy code** because it depended on how many completions one reap drained. The ruling asked for a deterministic test, so `DirectReader._inject_fault(nth, res)` reports the nth chunk completion as an error while the read itself still runs. Against the old code **4 of 5 cases were red ("DID NOT RAISE OSError")**. The fix: a failure drops the request's still-queued chunks, the request ends only when **every chunk in the kernel has its completion**, and the failure is then raised (sticky), naming the offset. The test also asserts nothing is in flight or queued afterwards and that no completion arrives later. Lesson: when a request fans out, "fail at the first error" is wrong if the rest can still write into memory you are about to reuse; and a test for a race has to remove the race. One case, an aligned 8 KB short read mid-file, wasn't a failure at all: O_DIRECT allows partial reads and the reader resubmits, so it moved to a positive test.
+
+**Review lesson I2: the page-cache evidence couldn't tell `O_DIRECT` from a buffered read** (`Must`). R6 asked to show the read doesn't fill the page cache, and the first evidence was system-wide `Cached` from `/proc/meminfo`: 7.91 → 7.91 GB over four passes. The reviewer's point: the GGUF was *already cached* after the RAM rows, so a buffered reader would also show a flat `Cached`. The evidence would pass against the wrong code. The method that can fail: evict the file first (`posix_fadvise DONTNEED`, no sudo), then measure **the file's own resident pages with `mincore`** (a `mmap` of the file, then `mincore`) before and after the passes. A `direct=False` / `FLUX_SSD_BUFFERED_TEST=1` switch opens without `O_DIRECT` as the deliberate red:
+
+| | GGUF resident, before → after | Cached |
+|---|---|---|
+| **buffered (red, test fails)** | **0.0 → 6,668.6 MB** | 5.16 → 11.62 GB |
+| **`O_DIRECT` (green)** | **0.0 → 0.0 MB** | 5.31 → 5.32 GB |
+
+Over real bench rows, 26.9 / 33.3 / 27.4 GB read (tile512, walk step, panorama): **0.0 → 0.0 MB** each. Lesson: evidence that can't distinguish the right code from the wrong code isn't evidence; show your assertion red against the wrong implementation.
+
+**Bit-exactness gate** (`Must`). `torch.equal` on the batch-1 tile512 latent and image and on the batch-8 panorama, SSD vs RAM; all 57 blocks' bytes in the slots equal the RAM-loaded tensors over two passes (every staging buffer reused; red when `to_k` / `to_v` rows were swapped in the table). Walk gate: **PASS, Δ +0.000, PSNR inf, all 18 spots and 15 `prev` images byte-identical** to Task 9. Full suite **872 passed in 1960 s** after the fix round (863 before). Default suite 565 passed.
+
+**The open item for 10c: M8, a walk step in game takes 43–50 s against 38 s in the bench** (`Must`). With the dreamer on, in-game steps were 50.4 / 48.8 / 43.4 s, against the bench's 38.0 s. That is ~20% slower than the bench says, and **nobody knows why yet**. The candidates: GIL contention from the dreamer thread, GPU sharing with the dreamer, or I/O. The ruling carries it into 10c's end-to-end as a measured item: attribute it first (dreamer off, on, generating mid-step) before any fix. If it is the GIL, it **reopens graphs-by-default**, with the byte-budgeted pool eviction follow-up from 10a-g. Cost if wrong: the game is ~20% slower than the bench.
+
+**Results.** Quiet batch-8 speed unchanged (walk step 38.0 s, panorama 30.6 s); batch-1 3.64 s/pass (was 0.88); painter RSS after setup **1.58 GB** (was 7.52); the game with Qwen on **7.92 idle / 9.45 play / 11.0 load peak GB, no swap** (was 13.67 GB with 3.53 GB swapped); page cache untouched (GGUF resident 0.0 → 0.0 MB); pictures byte-identical.
+
+**In an interview.** "I moved FLUX's weights from pinned RAM to the SSD to fit a second model beside it on a 14 GB laptop. I read each block with `O_DIRECT` through raw io_uring syscalls into three pinned staging buffers, and streamed them to the GPU through the existing ring. At the game's batch 8 the speed is the same, 38.0 against 38.9 s, because the pass computes 7 s and needs only 3.6 s of reads. At batch 1 it is four times slower, because the QLC drive tops out at 1.84 GB/s at every queue depth and chunk size, and a single-thread 16 MB `pread` matches io_uring, so the ceiling is the drive. Two review findings taught me the most. A multi-chunk async read must not return success while chunks are still in flight, or DMA lands in a reused buffer. And my page-cache evidence couldn't have failed: system `Cached` was flat for a buffered reader too, so I switched to `mincore` on the file after evicting it, and showed it red (6,669 MB) with `O_DIRECT` off."
+
+**Tried and not chosen** (`Understand`):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **Raw io_uring syscalls** (chosen) | Works; async without threads | — | — |
+| **liburing** | Headers absent; needs `sudo apt install liburing-dev` | Ruling R1: avoid a sudo stop; cost ~150 more lines | With the dev package installed |
+| **Synchronous `O_DIRECT` `pread`** (R1's fallback) | 1 thread: 1.50 GB/s at 1 MB, **1.82 at 16 MB** | io_uring works, so the fallback wasn't needed; `pread` blocks a thread per read | A simpler build where 16 MB chunks and one thread are enough |
+| **Queue depth 4 / 8 / 16 / 32 / 128** (vs 64), 1 MB chunks | Raw 1.82 / 1.80–1.83 / 1.84 / 1.84 / 1.84 GB/s; tile512 qd 4: 3.65, qd 8: 3.66 s/pass | No difference; the drive saturates from qd 4. 64 kept, costs nothing | A faster NVMe drive |
+| **Chunks 128 KB / 256 KB / 4 MB / 16 MB** (vs 1 MB) | Raw 1.84 / 1.82–1.83 / 1.84 / 1.84; tile512 256 KB: 3.66, 4 MB: 3.69 s/pass | No gain | — |
+| **2 staging buffers, ahead 1** | tile512 3.69 s/pass, walk step 38.1 s; saves 191 MB | ~1% slower at batch 1, a tie at batch 8; speed first, RSS has ~2.5 GB of room | If RAM gets tighter |
+| **4 staging buffers, ahead 3** | tile512 3.66, walk step 38.7 s; +191 MB | No gain | — |
+| **3 buffers, ahead 0** (read on demand) | tile512 3.68, walk step 38.9 s | "Read-ahead is worth 2.4%" was retracted (M7): it fires 19–21 times in 285 reads at batch 8; the difference is noise. Kept ahead 2 as the plan's i+2 | — |
+| **3 buffers, ahead 1** | tile512 3.65 | Same as ahead 2 at batch 1 | — |
+| **CPU repack of each block into slot order** | 24.9 ms per 191 MB block (7.7 GB/s) = **0.87 s of CPU a pass**, + a second 575 MB buffer set | The `Gather` (per-tensor DMA from staging) does the scatter for free | If DMA call count ever matters more than CPU time |
+| **`FLUX_BATCH` 4 on the SSD** | Pano 34.4 s, step 42.9 s (vs 30.6 / 38.0) | 11–13% slower: every batch-4 pass waits for the drive | Lowest stop latency, if the drive were faster |
+| **`FLUX_WEIGHTS_SOURCE=ram` with Qwen on** | 12.7 GB load peak, 3.5 GB swapped idle, 13.67 GB in play, watchdog stop | Doesn't fit 14 GB | Dreamer off, batch-1 speed wanted |
+| **SSD default without `drop_file_cache`** | 0.48 GB swapped out once at the first walk step | Swap; fixed by dropping the model files' cache after load | A machine with more RAM |
+| **A truncated file as the only I1 test** | Passed against the buggy code (depends on how many completions one reap drains) | Not deterministic; the fault hook is | As an extra check |
+| **Failing the request at the first bad completion** (the old behaviour) | Chunks in flight still wrote into a handed-out buffer | The request now ends only when all chunks have completed | — |
+| **System-wide `Cached` as the R6 measure** | Flat for a buffered reader too when the file is already cached | Replaced by the file's own `mincore` residency after eviction | — |
+| **Raising in `_usable` for an unbound source** | Raised even when another buffer was free | The raise is now in `_claim`, only when the source would have to wait | — |
+| **Partial residency** (hold ~2.5 GB, ~15 double blocks, in RAM; read the rest) | Not built; estimate ~2.3 s per-pass floor | Parked after 10c: RSS margin at load is only 1 GB, so it must be measured against that | If batch-1 latency starts to matter |
+
+Deferred minors: M5 (`res % 512`: correct for this device; querying `STATX_DIOALIGN` is more than a one-liner, and a misaligned resubmit on a 4K-native device fails loudly), M8 (above), M10 (a CPU test for same-shaped row swaps needs ~270 MB of the GGUF through diffusers), M12's cosmetic part, M13 (SSD with graphs on is untested). Folded into 10c: N1 (a hard `io_uring_enter` error must mark the reader broken so `SsdSource` never reuses a buffer with reads in flight) and N4 (the `Gather` check compares tensor ranges, not byte totals). R5 (ticket events on the base `BlockSlots` path) stays deferred: 10b didn't touch that seam.
+
+<details><summary>Check yourself (Task 10b)</summary>
+
+**Q1.** Why is the walk step the same speed from the SSD as from RAM at batch 8, but a single-window pass is four times slower?
+
+**A1.** A pass needs 6.66 GB of reads, which at the drive's 1.84 GB/s takes 3.6 s. A batch-8 pass computes ~7.2 s, so the reads hide under compute (GPU idle 1.7 ms). A batch-1 pass computes 0.88 s, so it waits ~2.8 s (idle 2,769 ms) and takes 3.64 s.
+
+**Q2.** A reviewer showed `Cached` flat at 7.91 GB proves nothing about `O_DIRECT`. Why, and what does?
+
+**A2.** The GGUF was already in the page cache from earlier runs, so a buffered reader would also leave `Cached` flat. Evict the file first, then measure the file's own resident pages with `mincore` before and after. `O_DIRECT` gives 0.0 → 0.0 MB, and a buffered reader (the deliberate red) gives 0.0 → 6,668.6 MB.
+
+**Q3.** What was wrong with a `wait()` that returned success after a chunk failed, and how was it tested?
+
+**A3.** Other chunks of the same request were still in the kernel, so DMA could land in a buffer the caller had finished with and reused: silent corrupt weights. A fault hook that reports the nth completion as an error made it deterministic (4 of 5 cases red at the old code), and the fix waits for every chunk before raising.
+
+</details>
+
+> **Remember this:** the ceiling here is the drive, not the API: 1.84 GB/s from every queue depth, chunk size and even a blocking `pread`. Hide it under compute with batching. And evidence is only worth something if it would have failed against the wrong code.
+
+---
+
 ### Patterns so far
 
 `Must`
@@ -1760,6 +1906,7 @@ The gate with graphs on: **PASS, Δ +0.000, PSNR inf, 18 of 18 spots byte-identi
 > 8. **Never buy speed with an unapproved quality loss, and don't trust a vacuous pass** (Task 8). The cache measured 1.32–1.63× and shipped off; the threshold that "passed" had skipped nothing.
 > 9. **Make results independent of incidental choices** (Task 9). cuBLAS's algorithm depends on M, so batch size changed the picture until those layers ran per window. When a lossless change fails a gate, check whether the *base* depended on something arbitrary.
 > 10. **Memory PyTorch doesn't track is still memory** (Task 10a). CUDA's libraries, glibc's freed heap and a loader's double copy each caused an OOM that looked like a leak. Measure the whole process, and when you can't make a hand-off cheap, remove it.
+> 11. **Evidence must be able to fail** (Task 10b). A flat `Cached` figure couldn't tell `O_DIRECT` from a buffered read, and a truncated-file test passed against the buggy reader. Show each assertion red against the wrong code, and when a request fans out, don't report failure until every part has finished.
 
 ---
 
