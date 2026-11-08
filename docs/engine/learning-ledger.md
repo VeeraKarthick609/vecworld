@@ -9,7 +9,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
 | # | Date | Entry | Related plan tasks |
 |---|---|---|---|
 | 1 | 2026-10-24 | [Making FLUX faster: ops/sec on a 4 GB GPU](#entry-1-making-flux-faster-opssec-on-a-4-gb-gpu) | 3, 4, 5, 6, 7, 8 |
-| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08; Task 9 (window batching) added 2026-11-08 | 2b, 3, 4, 5, 5b, 5c, 6, 7, 8, 9 |
+| 2 | 2026-10-25 | [Techniques from Tasks 5, 5b and 5c](#entry-2-techniques-from-tasks-5-5b-and-5c-tensor-cores-w4a8-the-modulation-gemv), with "Tried and not chosen" tables for every task; Task 6 (glue fusion) added 2026-11-06; Task 7 (slots and graphs) added 2026-11-08; Task 8 (first-block cache) added 2026-11-08; Task 9 (window batching) added 2026-11-08; Task 10a (block streamer) added 2026-11-08 | 2b, 3, 4, 5, 5b, 5c, 6, 7, 8, 9, 10a |
 
 ---
 
@@ -1533,6 +1533,176 @@ That one ulp in the conditioning reaches every block's modulation. Under W4A8 it
 
 ---
 
+### Task 10a: streaming FLUX blocks through a pinned ring
+
+`Must` for the plain version, pinned vs pageable memory, why a busy Python thread slowed the GPU 25×, why the fix is "keep the GIL" rather than "release it", why eager can't be fixed but graphs can, and the two OOM root causes. `Understand` for the reader contract (tickets), the RNG guard, the ticker measurement, batch 4 vs 8 and the `card_limit` ordering. `Skip` the `SlotRing` event free-list, the `_info` weak-reference detail and the nsys gap listing.
+
+> **Plain version.** Task 7 already copied each block's weights to the GPU while the previous block computed. Task 10a re-plumbs that so the *weights live in one big page-locked buffer* (a "pinned arena", 6.66 GB) and each block moves in **one** copy instead of ~20. The sequencing (wait, copy, record) moves into a small C++ object that **keeps the GIL**. **Speed in a quiet process didn't change** (tile512 0.86 s, panorama 29.3 s), because the copies were already hidden under compute; the pictures are bit-identical (18 of 18 gate-walk spots byte-identical to Task 9). What changed is two things for later. First, with graphs on, a pass holds its quiet speed (**0.86 s**) while two other Python threads spin, where it used to take 7.2 s. Second, there is now a seam, `source(i)`, where Task 10b's SSD reader plugs in. It also cost two out-of-memory hunts, and the lesson in both is that memory outside PyTorch's allocator is real.
+
+**Pinned vs pageable memory** (`Must`). The GPU's copy engines read host memory by DMA, so they need physical pages the OS won't move or swap. Ordinary (pageable) memory makes no such promise, so `cudaMemcpyAsync` from it first stages through a pinned buffer *on the CPU* and returns only when that is done. It isn't asynchronous at all. Pinned memory is the promise, so the copy engine reads it directly while the SMs do other work, at PCIe speed (**13.4 GB/s** measured). Two events per slot order everything on two streams: a copy into slot *s* waits for "freed" (its last block ended), and a block waits for "copied".
+
+```
+ host arena (one buffer, cudaHostRegister'ed once, 6.66 GB)
+ [ block 0 | block 1 | block 2 | ............................................ | block 56 ]
+     |  block i laid out exactly as its slot: each tensor at its slot offset (256-aligned)
+     v  ONE cudaMemcpyAsync per block, on the side stream
+ device ring   [ slot 0 ]  [ slot 1 ]  [ slot 2 ]      block i in slot i % 3, 191 MB each, fixed addresses
+
+ compute  | blk 0 | blk 1 | blk 2 | blk 3 | blk 4 | ...
+ side     |c3|      |c4|    |c5|    |c6|    ...           c(i+3) waits "freed" of blk i, then copies;
+                                                         each block waits "copied" of its own slot first
+```
+
+**Why a busy Python thread slowed the GPU 25×** (`Must`). Every PyTorch call from Python releases the GIL around its work and takes it back after. Alone that is free. With another thread wanting the GIL, taking it back means waiting until that thread gives it up, which a busy thread does only when the 5 ms switch interval runs out. So **every torch call costs up to a switch interval**. Measured per call (`gilprobe.py`, alone / under 2 spinning threads):
+
+| call | alone | under contention |
+|---|---|---|
+| `x.view(-1)` | 0.6 µs | 3,457 µs |
+| `x.add_(1)` | 3.9 µs | 4,977 µs |
+| `dst.copy_(pinned_src, non_blocking=True)` | 3.2 µs | **44,295 µs** |
+| `event.record()` / `stream.wait_event(e)` | 3.8 / 3.7 µs | 431 / 529 µs |
+| an extension (pybind) call | 3.8 µs | **11 µs** |
+
+Task 7's hooks made ~25 such calls per block (a `copy_` per tensor, a stream wait, two records): 57 blocks × 25 calls × milliseconds is the ~20 s a pass took. The GPU sat idle waiting for the CPU to enqueue the next block. A plain pybind call that *doesn't* release the GIL costs 11 µs even under contention, because it never gives the GIL up, so there is nothing to wait for. That is the whole design: **don't make the hand-off cheaper, don't have one.**
+
+**The GIL stress table** (`Must`). Two spinning Python threads in the painter's process, batch-1 tile512 passes timed by CUDA events; min / median / max seconds, quiet = 0.85 s. One process per row.
+
+| sequencing | eager (default) | graphs (opt-in) |
+|---|---|---|
+| BASE fcbfe73 (per-tensor `copy_` + torch events in Python) | 20.2 / 23.7 / 30.2 | 7.07 / 7.23 / 9.86 |
+| arena + per-tensor `copy_` from Python | 22.9 / **64.2** / 166.8 | 7.15 / 8.25 / 12.0 |
+| arena + one `copy_` per block from Python | 14.3 / 26.7 / 88.1 | 2.16 / 11.9 / 34.7 |
+| arena + C++ `SlotRing` | 13.1 / 22.9 / 40.8 | 0.92 / 1.35 / 10.1 |
+| **+ `graph_launch`** | (n/a: eager has no graphs) | **0.85 / 0.86 / 10.5** (5 runs, medians 0.885 / 3.76 / 0.858 / 0.862 / 0.860) |
+| `sys.setswitchinterval(0.5 ms)`, SlotRing, eager | 10.5 / **45.3** / 58.4 | n/a |
+| quiet (no spinning threads) | 0.853 (BASE 0.854) | 0.86 |
+
+Reading it:
+- **Graphs hold quiet speed once going** (median 7.2 → 0.86 s). A replayed block's Python is now the hooks and one launch, neither of which releases the GIL. `CUDAGraph.replay()` released it once a block, which left medians of 0.95–2.37 s over five runs. `graph_launch` calls `cudaGraphLaunch` on the graph's `raw_cuda_graph_exec()` itself: **0.86 s**.
+- **Eager barely moves** (median 23.7 → 22.9 s). The eager block forward makes tens of PyTorch calls per block (reshapes, views, `.to`, `chunk`, the attention dispatch), each a hand-off. 20 s over 57 blocks at 5–10 ms a hand-off is ~40–70 hand-offs a block. Removing the hooks' ~25 leaves the forward's own. Under contention that cost belongs to eager execution itself.
+- **The spread is wide** (0.9 s next to 10 s in the same run): who gets the GIL after a switch interval is up to the OS scheduler, so read medians. The slow graph passes come early in a run, from the per-pass Python outside the blocks (embedders, the `rowwise` layers, the Euler step), which still calls PyTorch.
+- It is a stress case: the game's other threads mostly wait on I/O.
+
+**A reader contract for Task 10b** (`Understand`). `source(i)` hands the streamer block i's bytes; the copy that reads them runs *later*, on the GPU. An SSD reader that reuses buffers must know when the copy has finished. The first version had two bugs, found by review (I1):
+- **A race.** `copied(slot)` was answered from the slot's *previous* copy's event. In the window between `source(i)` returning and the copy being enqueued, a reader thread asking "is it done?" got True, overwrote the buffer, and the block computed on the next block's bytes. Silent, nondeterministic, no assertion catches it.
+- **A lifetime bug.** The streamer kept only the latest source per slot. A reader handing fresh pinned buffers could see its buffer go back to torch's pinned pool while the DMA still read it (a raw `cudaMemcpyAsync` records no torch event).
+
+The fix is per-copy **tickets**: `SlotRing.load` returns a number (1, 2, 3, ...) and records a per-ticket event, under the GIL, in the same call that records the copy. `done(ticket)` is exact however the slots have been reused since. `copy_done(i)` is **False from the moment `source(i)` is called**. Every source object is kept alive until its copy is done. Making the lifetime assertion fail also found that the per-object cache held every source strongly (up to 4 × 57, i.e. 228 page-locked block buffers for a fresh-buffer reader), so it now holds weak references. Cost: one event per copy.
+
+**Why graph replays must not draw random numbers** (`Understand`). `graph_launch` skips `CUDAGraph.replay()`'s RNG prologue (the philox seed and offset update). A graph that drew random numbers would draw the same ones every replay, and nothing would fail except the output. FLUX's blocks draw none (`dropout_p = 0`), and review I2 made the code say so: the eager warm-up before each capture runs under a dispatch mode that raises, naming the block, on any op tagged `nondeterministic_seeded` (attention and dropout with p = 0 are exempt). A custom cuRAND kernel would not be seen. Ruling: guard it, don't drop `graph_launch`, because that fast replay is what makes graphs hold 0.86 s under contention.
+
+**Does holding the GIL stall the server's other threads?** (`Understand`). Review I3: before 10a, blocking CUDA calls were torch ops, which release the GIL, so other threads ran. Now `graph_launch` and the ring hold it, and if a launch blocked on a full queue it could freeze everything for a block's GPU time. The ruling was to measure first and add mitigation only for a stall over 50 ms. A 1 ms ticker thread (sleep 1 ms, record how late it woke) ran in the painter's process during a real panorama (4 batch-8 passes + VAE, one process per row, AC). Lateness in ms:
+
+| | eager: max / p99 / p99.9 / >10 ms / >50 ms | graphs: max / p99 / p99.9 / >10 ms / >50 ms | panorama s (eager / graphs) |
+|---|---|---|---|
+| BASE fcbfe73 | 42.1 / 0.10 / 23.8 / 55 / **0** | 0.39 / 0.064 / 0.09 / 0 / **0** | 29.8 / 30.2 |
+| fe9e0a2 (10a) | 44.9 / 0.10 / 24.3 / 58 / **0** | 1.61 / 0.063 / 0.09 / 0 / **0** | 29.6 / 30.2 |
+| 017b712 (fixes) | 45.3 / 0.10 / 24.2 / 65 / **0** | 2.49 / 0.064 / 0.09 / 0 / **0** | 30.1 / 30.2 |
+| idle (no paint) | max 0.08–1.24 | | |
+
+No wake-up passed 50 ms, so neither bounded run-ahead nor releasing the GIL around blocking calls was added. With graphs other threads see at most **2.5 ms**. Eager's 24–45 ms worst wake-ups are the same at BASE (42.1 ms): they come from eager execution, not from the streamer. One eager run made while the laptop slipped onto battery (61.5 ms, 42.9 s wall) was discarded and re-run on AC. Caveats: painter only, server stopped, one run per row.
+
+**The ruling: make graphs the default next** (`Must`). The Task 7 ruling said "revisit graphs after Task 10", and the data now exist. Graphs tie eager when quiet (0.86 s, 38.6 s walk step), hold quiet speed under contention (0.86 s against 22.9 s eager), give other threads 2.5 ms worst against 45 ms, and the RNG guard is in. The cost is Task 7's capture: **+3.9 s on the first panorama**. The reviewer's first answer was "not yet" (the stress was synthetic, I3 unmeasured, the guard missing); the last two are now closed. Ruling: a small follow-up step (10a-g) before 10b flips the default. Cost if wrong: one environment default to flip back. Open until then: the stress is still synthetic.
+
+**Batch 4 vs 8 under the streamer** (`Understand`). Task 9 left this open. Same session, a1d78dc:
+
+| | batch 4 | batch 8 |
+|---|---|---|
+| panorama s (passes) / s per window-step | 29.9 (8) / 0.887 | **29.3 (4) / 0.861** |
+| walk step s (passes) / s per window-step | 39.1 (10) / 0.942 | **38.6 (5) / 0.929** |
+| stop latency (longest pass, pano / step) | **3.63 / 4.37 s** | 7.07 / 7.91 s |
+| peak allocated (pano / step) | 1.76 / 1.77 GB | 2.05 / 2.05 GB |
+
+Batch 8 is 1.4% (step) to 2.9% (panorama) faster per window-step, so it isn't a tie and **8 stays**. The price is a stop waiting up to 7.9 s instead of 4.4 s. Final call after 10b, where each pass also reads 6.66 GB from the SSD.
+
+**Two out-of-memory hunts** (`Must`). Both came from running the full GPU suite on a 14 GB laptop with a 4 GB card. They look like leaks, and neither was.
+
+1. **The GPU walk test ran out of device memory: the CUDA libraries live outside PyTorch's allocator.** `test_six_spot_walk_at_the_walk_limit` died in the suite, 5 MB short (asked 264 MiB, 259 MiB free), and passed alone. A per-test tracker showed PyTorch's allocated memory falling back to 0.009 GB after every module, so nothing was held. What grew was device memory **outside PyTorch's allocator**: CUDA libraries' code and handles in the process's context, **0.142 GB** when the module runs alone, **0.199 GB** after the first GPU module, **0.239 GB** by the walk test. It can't be given back without ending the process. The walk peaks at 3.32 GiB on a card with 3.68 GiB usable. The same numbers hold at fcbfe73, so it wasn't 10a. (The box's driver had also moved to 595.99.02 after the outage, which may have shifted the margin.) Fix: a `card_limit` marker, and `conftest` runs marked tests *first* in the session, before other modules load their libraries.
+2. **The host ran out of memory: the bench loader held two copies of the model (13.2 → 7.75 GB).** With the walk test moved first, the suite was OOM-killed on the host (pytest at 13.8 GB anon) inside `test_glue.py`. A per-test RSS tracker showed that test alone peaks at **12.75–13.17 GB**, at fcbfe73 too. It loads the transformer through `bench_flux.load_transformer`, which is diffusers' loader: it copies each tensor out of a memory map of the whole file and **holds both**. The painter avoids this with `_read_gguf`. Fix: `load_transformer` reads like the painter does (that test's peak **13.17 → 7.75 GB**), and a module-scoped fixture collects and `malloc_trim`s after each test module.
+
+Related and found earlier (`Must`): **`malloc_trim` in the arena pack.** Packing freed each GGUF tensor after copying it into the arena, but glibc kept the freed heap (each tensor is under its 32 MB mmap threshold), so a painter process held both copies: **9.10 GB** alone, OOM-killed at 13.8 GB in the suite. `malloc_trim(0)` after each block: **7.87 GB** peak, then 7.52 GB after setup, the same as Task 9. The test that guards it went red at 9.10 GB with the trim off. The cost is model load, **12.2–12.8 s → 15.1–16.1 s (+3 s)**, mostly the pack.
+
+**The `card_limit` ordering, and what it cost** (`Understand`). Running marked tests first is an *ordering* fix, because the cause can't be removed in-process. It has a price: one flaky timing failure in a `card_limit` test can now OOM the rest of the GPU suite (N3). A failed test's traceback also pins its allocations. The walk's 3.29 GB stayed on the card, and the RSS test's painter subprocess couldn't get the ~1 GB it needs. So the RSS test moved into its own module (`test_stream_rss.py`) and calls `empty_cache()` before spawning. The next run (8410754) showed `test_three_spots_in_a_row_timing` (the same walk, also 3.32 GiB) needed the marker too; it got it (9884b2d).
+
+**The tests that couldn't fail** (`Understand`). The review's I5: "pinned memory unchanged after a stop" was asserted by construction (`pinned_bytes` is the arena's size, a constant), and the mid-pass-stop test couldn't catch a missing `always_call`, because the damage lands on a pass that is discarded. The fixes measure real counters (torch's pinned-pool `active_bytes` and the driver's `host_pinned(arena)`), and a toy block that queues a matmul from its slot, then raises, checks the output against the block's own product. Each new assertion was then shown **red against deliberately broken code** (a source that leaks a pinned MB per copy: 419,430,400 ≠ 361,758,720 bytes; no `always_call`; the per-slot `copied`: True inside `source()` 5 times). Lesson: an assertion you haven't seen fail is a guess about what it covers. The original red run for `test_stream.py` was also shown only after the implementation (4 failed, 3 errors against a BASE worktree), reported honestly.
+
+**Exception paths** (`Understand`). I4: `packed()` registered the 6.66 GB arena and then called `install()`. If `install()` raised (a `cudaMalloc` OOM for the slots), nothing owned the arena, so it was freed later while still registered: the "Copy is larger than memobj size" hazard that `test_flux_close_gpu` exists for. And `install()` repointed block tensors at slots *before* creating the stream and ring, so a failure left blocks viewing uninitialised memory with no hooks. Now everything is built first, the blocks are repointed last, and any failure rolls back. A follow-up (N2, folded into 10a-g): the arena can still be left registered if something *after* `packed()` raises.
+
+**Bit-exactness gate** (`Must`). `walk_sheet.py --scenes forest,desert,coast`, then `--relative t9-b8 t10a`: verdict **PASS, worst delta +0.000, min PSNR inf**, 18 of 18 spots byte-identical (`cmp`) to Task 9's batch-8 walk. After the fix round the same walk gives Δ 0 at 9884b2d, with the full suite at **846 passed in 31:22**. (The walk's own exit is 1 for coast spot 5's seam 1.19 > 1.1, exactly as at Task 9: same picture.) `graph_launch` wasn't walked, since graphs are opt-in and the walk default is eager. `test_graph_matches_eager` and `test_stream_matches_resident` (graphs) hold its bit-equality.
+
+**Copy and compute overlap** (`Understand`). nsys, 3 tile512 passes, eager. The change is 20× fewer copy calls, not a faster pipeline:
+
+| | BASE fcbfe73 | 10a |
+|---|---|---|
+| H2D copies a pass | 1,140 | **57** |
+| copy-engine busy a pass | 499.7 ms (13.3 GB/s) | 495.3 ms (13.5 GB/s) |
+| copy time overlapped with a kernel | 98.82% | 98.84% |
+| SM idle between kernels | 1.58 ms (0.19%) | 1.67 ms (0.20%) |
+
+`test_stream_overlaps` (12 single blocks, one window, the least compute per copied byte): resident 162.1 ms, streamed 166.6 ms, **1.028×** against a 1.1× bar.
+
+**Results.** Quiet process, AC, against Task 9: tile512 **0.86 s** (was 0.87; 20.55 TFLOP/s), panorama **29.3 s** (was 29.8), walk step **38.6 s** (was 39.3). The 1–2% is noise-sized, so call it a tie. Peak allocated unchanged (1.225 / 1.576 / 2.045 GB at batch 1 / 4 / 8). Page-locked host memory **6.66 GB in one range** (was ~1,100 registered ranges). Painter RSS 7.52 GB after setup, 8.54 GB in a walk step, of which the arena is 6.66 GB (what an SSD source can drop). The server at idle after startup: **7.53 GB VmRSS**, the baseline for 10b's under-12 GB target. Model load +3 s.
+
+**What this sets up for 10b** (`Understand`). Copies already take **58%** of a batch-1 pass (495 of 854 ms at 13.4 GB/s). From an SSD at 2–3 GB/s a pass's 6.66 GB is **2.2–3.3 s**, longer than a batch-1 pass (0.85 s) and about half a batch-8 one (7.4 s). So 10b is I/O-bound at batch 1 and needs batch 8 plus read-ahead. `source(i)` is called when the copy is issued (ring − 1 blocks ahead), so the reader must read further ahead itself, and must not reuse a buffer before `copy_done`.
+
+**Operations lesson** (`Understand`). The box went offline mid-suite. Wi-Fi dropped and NetworkManager stopped retrying, and a kernel update had arrived without its NVIDIA module. So after a reboot, check the network manager first, then that the driver module matches the running kernel. It wasn't the suite.
+
+**In an interview.** "I moved FLUX's weights into one pinned host arena and streamed them through a three-slot device ring, one copy per block, with the stream and event sequencing in a C++ object that keeps the GIL. Quiet speed didn't change, because the copies were already hidden under compute, and I checked that with nsys: 98.8% of copy time overlapped a kernel. The point was two things downstream. One was a clean seam for an SSD reader, with a per-copy ticket so a reader can't reuse a buffer early. The other was GIL robustness: PyTorch calls release the GIL, so under a busy second thread each call can cost a 5 ms switch interval, and a pass took 23 s instead of 0.85. With graphs launched through the extension it stays at 0.86 s, and a 1 ms ticker showed the other threads never wait more than 2.5 ms. I measured that before deciding whether to add mitigation. The full GPU suite also taught me that memory outside PyTorch's allocator is real. CUDA's own libraries took 0.24 GB of a 3.68 GB card, and a test loader held two copies of the model."
+
+**Tried and not chosen** (`Understand`):
+
+| What it was | What we measured | Why we didn't pick it | When it might win instead |
+|---|---|---|---|
+| **C++ `SlotRing`** (chosen) | Eager 13.1 / 22.9 / 40.8 s; graphs 0.92 / 1.35 / 10.1 s (min / median / max); quiet 0.86 s | — | — |
+| **Per-tensor `copy_` from Python on the arena** (Task 7's way) | Quiet 0.859 s; contention eager median **64.2 s**, graphs 8.25 s | ~20 GIL hand-offs per block | When nothing else runs in the process |
+| **One `copy_` per block from Python** (packed arena, torch events) | Quiet 0.856 s; contention eager 26.7 s, graphs 11.9 s median (2.2–34.7 spread) | Still 4–5 hand-offs per block (copy, waits, records); the C++ ring has none | — |
+| **`sys.setswitchinterval(0.5 ms)`** | Eager under contention median **45.3 s** (was 22.9) | Worse: more switches, and it is process-wide | Never for this; it adds switches where the goal is fewer hand-offs |
+| **`CUDAGraph.replay()` with the C++ ring** | Graphs under contention medians 0.95–2.37 s (5 runs) | One hand-off per block left; `graph_launch` gives 0.86 s | If graph replays ever needed the RNG prologue |
+| **`graph_launch`** (chosen; its own commit 470a036) | Graphs 0.85 / 0.86 / 10.5 s; ticker max 2.5 ms; `test_graph_launch_keeps_the_gil` 212 µs (replay(): 5,071 µs) | Deviation worth naming: it touches the graphs path, skips `replay()`'s RNG prologue, and is easy to drop. Guarded by the RNG check | A graph that draws random numbers |
+| **Fall back to `replay()` for seeded graphs** (I2) | Not run | The ruling asked for a loud failure; a fallback would silently bring back a hand-off per block for the graphs that need care | — |
+| **Check the RNG tag during the capture itself** | Not run | The warm-up runs the same ops eagerly just before; checking there keeps Python dispatch work out of the capture stream | — |
+| **`torch.empty(pin_memory=True)` for the arena** | Not run: torch's pinned allocator rounds up to a power of two (6.66 → 8.6 GB) | 2 GB of locked RAM for nothing; `cudaHostRegister` on exact-size memory instead | A smaller or power-of-two buffer |
+| **Enqueue several blocks' copies ahead** | Not run | A copy into a slot must wait for that slot's last block, whose "freed" event isn't recorded yet when enqueued ahead (`cudaStreamWaitEvent` takes the *last* record); would need `cuStreamWaitValue32` counters. The ring already makes each enqueue ~5 µs | Much faster compute per copy |
+| **Whole per-block loop in C++** | Not run | The loop's Python is the block forward itself (eager) or one launch (graphs); the hooks were the only sequencing, now C++ | — |
+| **Bound CPU run-ahead / release the GIL in `graph_launch`** (I3) | Ticker: no wake-up over 50 ms (graphs max 2.5 ms, eager 45.3 ms, same as BASE) | The ruling's 50 ms bar wasn't reached; a per-pass sync would add a stall for nothing | If a stall over 50 ms ever shows in the ticker (e.g. under 10b's reads) |
+| **Batch 4 under the streamer** | Pano 29.9 vs 29.3 s, step 39.1 vs 38.6 s; stop latency 4.4 vs 7.9 s | 1.4–2.9% slower; the ruling keeps 8 unless 4 ties | Lowest stop latency; revisit after 10b |
+| **Keep `copied(slot)` and add a lock** (I1) | Red: True inside `source()` | A slot's event says nothing about a copy not yet issued, or one since overwritten; tickets answer per copy | — |
+| **`_info` cache holding sources strongly** (bounded 4 × 57) | The lifetime assertion couldn't fail; up to 228 block buffers alive for a fresh-buffer reader | Hid the lifetime contract and cost memory for 10b; now weak references | — |
+| **No `malloc_trim` after each block** | 9.10 GB peak in a fresh process; suite OOM-killed at 13.8 GB | glibc keeps the freed heap (tensors under the 32 MB mmap threshold), so both copies stayed resident; trim gives 7.87 GB | musl or another allocator that returns memory itself (the trim then warns once and does nothing) |
+| **`ru_maxrss` to measure the RSS test's subprocess** | It carried the parent's peak over fork + exec | Replaced by VmHWM, which is the process's own (includes file-backed pages, so an upper bound on anon) | — |
+| **Six-spot walk in a fresh subprocess** (34319bc, reverted by 1466b4f) | Child died: `cuDevicePrimaryCtxRetain` CUDA_ERROR_OUT_OF_MEMORY | The suite's own CUDA context (0.24 GB) stays on the card, so there is no room for a second context | — |
+| **`card_limit` ordering** (chosen) | Walk passes alone at peak 3.32 GiB; fails 5 MB short late in the suite | An ordering fix: the cause (0.24 GB of CUDA library memory) can't be removed in-process. Cost: one flaky `card_limit` test can OOM later modules | — |
+| **`card_limit` first, no host-memory changes** | Suite host-OOM-killed at 17% (anon 13.8 GB) | The walk's leftover heap plus a 13.2 GB test; fixed at the source (loader and trim) instead of reshuffling more tests | — |
+| **Keep diffusers' loader in `bench_flux.load_transformer`** | 12.75–13.17 GB peak for one test; 13.2 GB at fcbfe73 too | It holds the memory map and the copies at once; the painter's `_read_gguf` peaks at 7.75 GB | — |
+| **Make graphs the default inside 10a** | Reviewer: "not yet" (stress synthetic, I3 unmeasured, RNG guard missing) | I3 and the RNG guard are now closed (the stress is still synthetic, the capture cost remains); ruling: a separate step (10a-g) before 10b, one default to flip back | — |
+| **`host_pinned` check on BlockSlots' per-tensor sources** (M6) | Breaks Task 7's toy tests (pageable host copies) | Deferred; fold BlockSlots into BlockStreamer over a `HostArena` when 10b touches the seam (N1 is one more reason) | — |
+
+Deferred minors: M2, M4 (cost of the 57 trims in the +3 s load not measured), M6, the rest of M7, N1 (the base `BlockSlots` path never retires ticket events, so one CUDA event per load accumulates), N4–N8 (a `close()` racing a reader raises `AttributeError`; tickets restart at 1 after a re-install; the `copy_done` docstring over-promises across threads; the pinned-stats assertion goes silent if its key is missing; CUDA error paths in `SlotRing::load`; `native_dropout(train=None)` read as eval). Folded into 10a-g: N2, N3 and N9 (commit `ticker.py`, which the explainer cites but the repo lacks).
+
+<details><summary>Check yourself (Task 10a)</summary>
+
+**Q1.** Streaming didn't change the speed of a quiet pass. Why build it, and what did the GIL stress show?
+
+**A1.** The copies were already hidden under compute (98.8% of copy time overlapped a kernel), so nothing was left to gain when quiet. It was built for a seam (`source(i)`) for the SSD reader, and to cut per-block Python hand-offs. With two spinning threads, every torch call can cost a 5 ms switch interval, and a pass took 23 s eager and 7 s with graphs. A C++ ring plus `graph_launch`, which keep the GIL, put graphs back at 0.86 s. Eager stayed at 22.9 s, because the block forward's own torch calls remain.
+
+**Q2.** Why did a test that passes alone OOM inside the suite, and why isn't it a leak?
+
+**A2.** PyTorch's allocated memory fell back to 0.009 GB after each module. What grew was device memory outside PyTorch's allocator (CUDA libraries' code and handles in the context: 0.142 → 0.239 GB) on a card with 3.68 GiB usable and a 3.32 GiB peak. It can't be freed in-process, so the test runs first (`card_limit`).
+
+**Q3.** A test peaked at 13.2 GB of host RAM and later at 7.75 GB without any model change. What was it?
+
+**A3.** The bench loader was diffusers' loader, which copies each tensor out of a memory map and holds both. Reading as the painter does (`_read_gguf`) removed the double copy.
+
+**Q4.** What race could a threaded SSD reader hit with a per-slot `copied(slot)`?
+
+**A4.** Between `source(i)` returning and the copy being enqueued, the slot's event still belongs to the previous copy and reads as done. The reader reuses the buffer, and the block computes on the wrong bytes. Per-copy tickets close the window.
+
+</details>
+
+> **Remember this:** when you can't make a hand-off cheap, make it disappear. Pinned memory plus a C++ ring that keeps the GIL gave graphs quiet speed under contention, and a ticker showed it didn't starve other threads. Memory that PyTorch doesn't track (CUDA libraries, glibc's freed heap, a loader's double copy) is still memory, so measure the whole process.
+
+---
+
 ### Patterns so far
 
 `Must`
@@ -1546,6 +1716,7 @@ That one ulp in the conditioning reaches every block's modulation. Under W4A8 it
 > 7. **Amdahl moves the target.** Each speedup makes the untouched parts a bigger share: glue went from small to 31% of GPU time by Task 5c, and after Task 6 the GEMMs are 85% again.
 > 8. **Never buy speed with an unapproved quality loss, and don't trust a vacuous pass** (Task 8). The cache measured 1.32–1.63× and shipped off; the threshold that "passed" had skipped nothing.
 > 9. **Make results independent of incidental choices** (Task 9). cuBLAS's algorithm depends on M, so batch size changed the picture until those layers ran per window. When a lossless change fails a gate, check whether the *base* depended on something arbitrary.
+> 10. **Memory PyTorch doesn't track is still memory** (Task 10a). CUDA's libraries, glibc's freed heap and a loader's double copy each caused an OOM that looked like a leak. Measure the whole process, and when you can't make a hand-off cheap, remove it.
 
 ---
 
