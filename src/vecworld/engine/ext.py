@@ -21,3 +21,12 @@ def load_ext():
     sources = [str(CSRC / f) for f in ("bindings.cpp", "q4k.cu", "glue.cu", "stream.cpp")]   # + w4a8_quant.cuh, included
     return cpp.load(name="vecworld_engine", sources=sources, extra_cflags=["-O3"], extra_cuda_cflags=["-O3"],
                     verbose=False)
+
+
+@functools.cache
+def load_uring():
+    """The SSD reader's module (DirectReader: O_DIRECT reads through io_uring on the raw syscalls; csrc/uring.cpp,
+    Task 10b). C++ only, built apart from load_ext() so that neither rebuilds the other."""
+    import torch.utils.cpp_extension as cpp
+
+    return cpp.load(name="vecworld_uring", sources=[str(CSRC / "uring.cpp")], extra_cflags=["-O3"], verbose=False)

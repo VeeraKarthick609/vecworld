@@ -8,7 +8,8 @@ streamer changes is where a block's bytes come from:
   all blocks in one host buffer registered with the driver once (cudaHostRegister), so the DMA engine reads it
   directly. The blocks' host tensors become views of the arena (their old copies are freed as they are moved).
 - BlockStreamer(blocks, source, ring) copies source(i), block i's bytes, into slot i % ring with ONE copy (BlockSlots
-  made one per tensor, ~20 a block). source is the seam Task 10b plugs the SSD reader into; here it is the arena.
+  made one per tensor, ~20 a block). source is the seam the SSD reader plugs into (Task 10b, engine.uring:
+  BlockStreamer.from_ssd), whose source(i) is a Gather: a block's bytes as they lie in the file, one copy per tensor.
 
 Copies and events go through the extension's SlotRing, which keeps the GIL (csrc/stream.cpp): the per-block
 sequencing costs a few microseconds of Python whatever other threads do.
@@ -112,13 +113,26 @@ class HostArena:
 _ISSUING = -1      # BlockStreamer._ticket[i] while block i's copy is being issued (source(i) called, no ticket yet)
 
 
+class Gather:
+    """What source(i) returns when block i's bytes don't lie in its slot layout (engine.uring.SsdSource: the block as
+    read from the file, plus its resident tensors): `copies`, flat (slot offset, host address, bytes) triples, one DMA
+    copy each, every host range page-locked and kept valid by `keep` (the reader). The reader's contract is a tensor
+    source's: the bytes must not change until copy_done(i). A Gather is worked out (checked, its slot addresses added)
+    once per object and block, so a reader hands out the same object each time it hands out the same bytes."""
+
+    __slots__ = ("copies", "keep", "__weakref__")
+
+    def __init__(self, copies: list[int], keep=None):
+        self.copies, self.keep = copies, keep
+
+
 class BlockStreamer(BlockSlots):
     """The blocks streamed from source(i) through `ring` device slots of fixed address (BlockSlots).
 
     source(i) returns block i's bytes, laid out as block_layout(block i) (HostArena.block, or a reader's buffer: a
-    tensor or anything with the buffer protocol), exactly that block's size and page-locked; it is called when block
-    i's copy is issued (ring - 1 blocks ahead of its use, or on demand). A wrong size or pageable memory raises
-    ValueError there. A source object's address must not change while the streamer may see it again (what an object
+    tensor or anything with the buffer protocol), exactly that block's size and page-locked, or a Gather of copies
+    that put them there (the SSD reader); it is called when block i's copy is issued (ring - 1 blocks ahead of its
+    use, or on demand). A wrong size, a copy outside the block or pageable memory raises ValueError there. A source object's address must not change while the streamer may see it again (what an object
     is, is worked out once per object).
 
     The reader's contract (Task 10b): the bytes source(i) returned must not be changed until copy_done(i) is True.
@@ -129,13 +143,16 @@ class BlockStreamer(BlockSlots):
 
     Nothing changes in the blocks until install(): then their tensors become views into the slots and hooks sequence
     the copies, as BlockSlots does. close() syncs, unhooks, frees the slots and gives every tensor back what it was
-    before install(); install() again starts afresh. For the arena the streamer owns (packed()), self.arena."""
+    before install(); install() again starts afresh. For the arena the streamer owns (packed()), self.arena; for the
+    SSD reader (from_ssd()), self.reader, and the blocks keep no weights in RAM: close() gives them placeholder tensors
+    (the right shapes, no bytes), as install() dropped what they held."""
 
     def __init__(self, blocks: list[torch.nn.Module], source: Callable[[int], object], ring: int = 2,
                  device="cuda"):
         self._init(blocks, ring, device)
         self.source = source
         self.arena: HostArena | None = None
+        self.reader = None                                  # engine.uring.SsdSource (from_ssd)
         self._orig: list[dict[str, torch.Tensor]] = []
         self._ticket: list[int | None] = [None] * self.n    # block i's latest copy (_ISSUING while source(i) runs)
         self._pending: deque = deque()                      # (ticket, source object) of copies maybe still running
@@ -155,13 +172,44 @@ class BlockStreamer(BlockSlots):
             raise
         return st
 
+    @classmethod
+    def from_ssd(cls, blocks: list[torch.nn.Module], gguf_path, ring: int = 2, device="cuda",
+                 **reader) -> "BlockStreamer":
+        """Stream the FLUX blocks from their GGUF file on the SSD (engine.uring: O_DIRECT reads through io_uring into a
+        few page-locked staging buffers; reader: SsdSource's buffers, ahead, queue_depth, chunk), installed. The
+        blocks' weights in RAM are dropped (only the resident biases and norms are kept, copied into the reader): they
+        are not read from them, so a loader may leave them unread (FluxPainter does). The reader is self.reader:
+        close() it after the streamer."""
+        from vecworld.engine.uring import SsdSource, flux_file_layout
+
+        layout = flux_file_layout(blocks, gguf_path)
+        src = SsdSource(str(gguf_path), layout, **reader)
+        del layout                                          # its resident tensors are the blocks'; src copied them
+        try:
+            st = cls(blocks, src, ring=ring, device=device)
+            st.reader = src
+            src.bind(st)
+            st.install()
+        except BaseException:
+            src.close()
+            raise
+        _trim()                                             # the blocks' host weights are gone: give the heap back
+        return st
+
     @property
     def pinned_bytes(self) -> int:
-        """The page-locked host memory the streamer holds (its arena's)."""
+        """The page-locked host memory the streamer holds (its arena's, or its SSD reader's staging buffers)."""
+        if self.reader is not None:
+            return self.reader.pinned_bytes
         return self.arena.nbytes if self.arena is not None and self.arena.registered else 0
 
     def _prepare_copies(self) -> None:
-        self._orig = [{name: t.data for name, t in _tensors(b).items()} for b in self.blocks]
+        if self.reader is not None:
+            # nothing kept: the weights come from the file, and keeping the blocks' host tensors would keep them in RAM
+            self._orig = [{name: torch.zeros((), dtype=t.dtype).expand(t.shape) for name, t in _tensors(b).items()}
+                          for b in self.blocks]
+        else:
+            self._orig = [{name: t.data for name, t in _tensors(b).items()} for b in self.blocks]
         self._slot_ptr = [t.data_ptr() for t in self.slots]
         self._ticket = [None] * self.n
         self._pending.clear()
@@ -174,15 +222,34 @@ class BlockStreamer(BlockSlots):
         # per object; a PyTorch call here (a slice, numel()) would release the GIL (see the module docstring).
         src = self.source(i)
         e = self._info.get(id(src))
-        if e is None or e[0]() is not src:
+        if e is None or e[0]() is not src or (e[2] is None and e[3] != i):
             e = self._inspect(i, src)
-        _, ptr, n = e
+        if e[2] is None:                                    # a Gather: its copies, slot addresses in
+            self._src = src
+            return e[1]
+        _, ptr, n, _ = e
         if n != self.nbytes[i]:
             raise ValueError(f"block {i}: source gave {n} bytes; the block's layout is {self.nbytes[i]} bytes")
         self._src = src
         return [self._slot_ptr[i % self.ring], ptr, n]
 
     def _inspect(self, i: int, src) -> tuple:
+        if isinstance(src, Gather):
+            c, base, flat = src.copies, self._slot_ptr[i % self.ring], []
+            if len(c) % 3:
+                raise ValueError(f"block {i}: a Gather's copies must be (slot offset, host address, bytes) triples")
+            for k in range(0, len(c), 3):
+                so, hp, n = c[k], c[k + 1], c[k + 2]
+                if so < 0 or n < 0 or so + n > self.nbytes[i]:
+                    raise ValueError(f"block {i}: a copy of {n} bytes to slot offset {so} runs outside the block's "
+                                     f"{self.nbytes[i]} bytes")
+                if n and not self._ext.host_pinned(hp, n):
+                    raise ValueError(f"block {i}: a Gather copy's bytes at {hp:#x} are not page-locked")
+                flat += [base + so, hp, n]
+            if len(self._info) > 4 * self.n:
+                self._info = {k: v for k, v in self._info.items() if v[0]() is not None}
+            e = self._info[id(src)] = (weakref.ref(src), flat, None, i)
+            return e
         if isinstance(src, torch.Tensor):
             if src.device.type != "cpu" or not src.is_contiguous():
                 raise ValueError(f"block {i}: source gave a {src.device} tensor, contiguous {src.is_contiguous()}; "
@@ -197,10 +264,10 @@ class BlockStreamer(BlockSlots):
         try:
             ref = weakref.ref(src)                          # never keeps a source alive (a reader's buffers)
         except TypeError:                                   # (a memoryview: worked out again each time, numpy only)
-            return (lambda: src), ptr, n
+            return (lambda: src), ptr, n, i
         if len(self._info) > 4 * self.n:                    # sources that come and go
             self._info = {k: v for k, v in self._info.items() if v[0]() is not None}
-        e = self._info[id(src)] = (ref, ptr, n)
+        e = self._info[id(src)] = (ref, ptr, n, i)
         return e
 
     def load(self, i: int) -> int:
