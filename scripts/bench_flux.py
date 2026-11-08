@@ -181,6 +181,12 @@ def timed(fn, passes, mon, p=None):
     import torch
     torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats(); mon.reset(); passes.clear()
     s0, c0 = _ssd(p), _cached_gb()
+    if s0 is not None:              # R6: evict the GGUF, then count its own resident pages (mincore) before and after
+        from vecworld.config import FLUX_GGUF
+        from vecworld.engine.uring import resident_bytes
+        gguf = os.path.realpath(FLUX_GGUF)
+        fd = os.open(gguf, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
+        r0 = resident_bytes(gguf)
     t = time.time(); t0 = _event(); out = fn(); torch.cuda.synchronize(); dt = time.time() - t
     gaps = [a.elapsed_time(b) / 1000 for a, b in zip([t0] + passes[:-1], passes)]
     extra = {}
@@ -190,6 +196,7 @@ def timed(fn, passes, mon, p=None):
         extra["ssd"] = dict(reads=d["reads"], gb=round(d["bytes"] / 1e9, 2), hits=d["hits"],
                             read_wait_s=round(d["read_wait_s"], 2), buffer_wait_s=round(d["buffer_wait_s"], 2),
                             gb_per_s_wall=round(d["bytes"] / 1e9 / dt, 2))
+        extra["gguf_resident_mb"] = [round(r0 / 1e6, 1), round(resident_bytes(gguf) / 1e6, 1)]
     extra["cached_gb"] = [round(c0, 2), round(_cached_gb(), 2)]
     return out, dict(**extra, s=round(dt, 1), passes=len(passes), s_per_pass_median=round(sorted(gaps)[len(gaps) // 2], 2),
                      s_per_pass_mean=round(sum(gaps) / len(gaps), 3),

@@ -159,9 +159,20 @@ with those files' cache dropped, the same walk swapped nothing; so the game now 
 (`uring.drop_file_cache`, `posix_fadvise(DONTNEED)` on the HF model cache, no sudo), and from an 11.8 GB warm cache it
 swapped nothing (the row above).
 
-**The page cache (R6).** `/proc/meminfo` Cached before and after: tile512 (4 passes, 26.9 GB read) 7.91 -> 7.91 GB;
-walk step (33.3 GB read) 6.57 -> 6.57 GB; panorama 6.09 -> 6.10 GB; two passes in a fresh painter 8.03 -> 8.03 GB.
-O_DIRECT reads leave nothing behind (a buffered read would have cached up to the whole 6.66 GB a pass).
+**The page cache (R6).** What matters is the GGUF's own pages in the cache, so that is what is measured: the file is
+evicted first (`posix_fadvise(DONTNEED)`, no sudo), then its resident pages are counted with `mmap` + `mincore`
+(`uring.resident_bytes`) before and after (fix round 1; the first version compared system-wide `Cached`, which stays
+flat for a buffered reader too when the file is already cached, as it was after the RAM rows):
+
+| run (bench rows `bench/t10b-r6-ssd-*.json`, test `test_painter_from_ssd_holds_no_weights`) | read from the GGUF | GGUF resident before -> after |
+|---|---|---|
+| tile512, 4 passes | 26.9 GB | **0.0 -> 0.0 MB** |
+| walk step, 5 passes | 33.3 GB | **0.0 -> 0.0 MB** |
+| panorama, 4 passes | 27.4 GB | **0.0 -> 0.0 MB** |
+| two passes in a fresh painter (the test) | 13.3 GB | **0.0 -> 0.0 MB** (Cached 5.31 -> 5.32 GB) |
+| the same test with O_DIRECT turned off (`FLUX_SSD_BUFFERED_TEST=1`, red check) | 13.3 GB | 0.0 -> **6,668.6 MB** (Cached 5.16 -> 11.62 GB): fails |
+
+O_DIRECT reads leave nothing of the file behind; the same reads buffered would cache all 6.66 GB of it.
 
 **The reader's knobs** (tile512 batch 1 is the SSD-bound case, the walk step at batch 8 the compute-bound one):
 
@@ -175,9 +186,14 @@ O_DIRECT reads leave nothing behind (a buffered read would have cached up to the
 | queue depth 8 / 4 | 3.66 / 3.65 | | |
 | chunk 256 KB / 4 MB | 3.66 / 3.69 | | |
 
-Batch 1 can't go faster than the drive, and every setting reaches it within 1%; at batch 8, read-ahead is worth 2.4%
-(38.9 -> 38.0 s). Two buffers are within noise at batch 8 and save 191 MB; three keep the batch-1 edge (speed first;
-RSS has 2.5 GB of room).
+Batch 1 can't go faster than the drive, and every setting reaches it within 1%. At batch 8 read-ahead barely fires:
+the CPU runs ahead of the GPU, so by the time `source(i)` is called the three buffers are all handed out with their
+copies pending, and the read starts on demand, three blocks ahead of use through the slot ring (walk step: 285 reads,
+19-21 hits; panorama: 232 reads, 14-16 hits; tile512: 229 reads, 227-228 hits). The 38.9 vs 38.0 s between ahead 0
+and ahead 2 is the size of run-to-run noise (the RAM row is also 38.9 s), not a read-ahead gain. The reads still hide:
+a batch-8 block computes longer than its read takes. Two buffers are within noise at batch 8 and save 191 MB; three
+keep the ~1% batch-1 edge (speed first; RSS has 2.5 GB of room). For read-ahead to matter at batch 8 it would need a
+fourth buffer, or a queue (64 x 1 MB) that covers a whole block; neither is needed while the GPU idles 1.7 ms a pass.
 
 
 ## What to read next
