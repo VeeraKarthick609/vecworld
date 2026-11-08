@@ -66,7 +66,10 @@ def test_load_transformer_resolves_the_kernel_as_the_painter_does(monkeypatch):
 
     import vecworld.engine.swap as swap_mod
 
+    import vecworld.flux.painter as painter_mod
+
     swapped = []
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
     monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: "transformer")
     monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
     monkeypatch.setattr(swap_mod, "swap_linears",

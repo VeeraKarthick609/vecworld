@@ -114,9 +114,13 @@ def load_transformer():
     from diffusers import FluxTransformer2DModel, GGUFQuantizationConfig
     from vecworld.config import FLUX_BASE, FLUX_GGUF
     from vecworld.engine import engine_kernel
+    from vecworld.flux.painter import _read_gguf
     kernel = engine_kernel()
+    # read as the painter reads it: diffusers' own loader copies each tensor out of a memory map of the whole file, so
+    # its peak holds the file's pages and the copies both (~12.8 GB; the GPU tests that load this way got the suite
+    # OOM-killed on the 14 GB laptop)
     tr = FluxTransformer2DModel.from_single_file(
-        str(FLUX_GGUF), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+        _read_gguf(str(FLUX_GGUF)), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
         torch_dtype=torch.bfloat16, config=FLUX_BASE, subfolder="transformer")
     if kernel is not None:
         from vecworld.engine import keep_for
