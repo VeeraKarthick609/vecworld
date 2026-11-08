@@ -220,4 +220,4 @@ Follow-ups: evict pools by bytes rather than by shape count, and capture the kno
 
 - `engine/stream.py`, `engine/csrc/stream.cpp`, `engine/slots.py`, `engine/graphs.py` (`graph_launch`).
 - `docs/engine/07-cuda-graphs.md` (the slots and the GIL probe this answers).
-- Task 10b replaces `source` with an io_uring reader of the SSD; Task 10c moves T5 onto the engine.
+- Task 10b replaces `source` with an io_uring reader of the SSD (docs/engine/11-io-uring.md); Task 10c moves T5 onto the engine.
