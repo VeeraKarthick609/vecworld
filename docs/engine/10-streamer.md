@@ -150,7 +150,7 @@ streamed 166.6 ms (1.028x; bar 1.1x).
 
 **Under GIL contention** (2 spinning threads, batch-1 pass, min / median / max s; quiet: 0.85 s):
 
-| sequencing | eager (default) | graphs (opt-in) |
+| sequencing | eager (`VECWORLD_GRAPHS=0`) | graphs (default since 10a-g) |
 |---|---|---|
 | BASE (fcbfe73: per-tensor `copy_` + torch events in Python) | 20.2 / 23.7 / 30.2 | 7.07 / 7.23 / 9.86 |
 | per-tensor `copy_` from Python, on the arena (`pytensors`) | 22.9 / 64.2 / 166.8 | 7.15 / 8.25 / 12.0 |
@@ -170,7 +170,7 @@ What it says:
   block (reshapes, views, `.to`, `new_empty`, chunk, the attention dispatch, a Q4KLinear's own reshapes), each a GIL
   hand-off (~20 s over 57 blocks at 5-10 ms each is ~40-70 hand-offs a block). Removing the hooks' ~25 leaves the
   forward's. Under contention that cost belongs to eager execution itself, and graphs are the
-  remedy that exists (opt-in since Task 7, "revisit after Task 10").
+  remedy that exists (opt-in at Task 7; the default since Task 10a-g).
 - The spread is wide (a pass of 0.9 s next to one of 10 s in the same run): which thread gets the GIL after a
   switch interval is up to the OS scheduler. Read medians; the probe is a stress case (the game's other threads mostly
   wait on I/O).

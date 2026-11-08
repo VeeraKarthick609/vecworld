@@ -781,18 +781,19 @@ def test_painter_patches_blocks_when_fused(monkeypatch):
         assert order == want, (kernel, fuse)
 
 
-def test_graphs_default_off_opt_in(monkeypatch):
-    """VECWORLD_GRAPHS (vecworld.engine.engine_graphs, one rule for the painter and the bench): unset, empty, "0" or
-    "off", the blocks run eagerly on the fixed weight slots (the default since the Task 7 review: graphs tie with
-    eager and cost first-use captures and memory); "1" / "on" replays them as CUDA graphs under an engine kernel. Under VECWORLD_KERNEL=off there are no slots (diffusers' group offload), so never
-    graphs. Anything else is refused."""
+def test_graphs_default_on_opt_out(monkeypatch):
+    """VECWORLD_GRAPHS (vecworld.engine.engine_graphs, one rule for the painter and the bench): unset, empty, "1" or
+    "on", the blocks replay as CUDA graphs under an engine kernel (the default since Task 10a-g: the GIL and
+    other-thread latency wins, for about 3.9 s on the first panorama); "0" / "off" runs them eagerly on the fixed weight
+    slots. Under VECWORLD_KERNEL=off there are no slots (diffusers' group offload), so never graphs. Anything else is
+    refused."""
     from vecworld.engine import engine_graphs
 
     monkeypatch.delenv("VECWORLD_GRAPHS", raising=False)
     for kernel in ("w4a8", "mma", "tiled", "naive"):
-        assert engine_graphs(kernel) is False
+        assert engine_graphs(kernel) is True
     assert engine_graphs(None) is False
-    for value, want in (("", False), ("0", False), ("off", False), ("1", True), ("on", True)):
+    for value, want in (("", True), ("0", False), ("off", False), ("1", True), ("on", True)):
         monkeypatch.setenv("VECWORLD_GRAPHS", value)
         assert engine_graphs("w4a8") is want, value
         assert engine_graphs(None) is False, value
@@ -837,8 +838,8 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
         raise Loaded
 
     monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", stop_at_vae)
-    for kernel, graphs, want in ((None, None, ["swap", "patch", "rows", "slots graphs=False pack=True"]),
-                                 ("mma", "1", ["swap", "patch", "rows", "slots graphs=True pack=True"]),
+    for kernel, graphs, want in ((None, None, ["swap", "patch", "rows", "slots graphs=True pack=True"]),
+                                 ("mma", "0", ["swap", "patch", "rows", "slots graphs=False pack=True"]),
                                  ("off", None, ["rows", "pin", "offload"]), ("off", "1", ["rows", "pin", "offload"])):
         for k in ("VECWORLD_KERNEL", "VECWORLD_FUSE", "VECWORLD_GRAPHS"):
             monkeypatch.delenv(k, raising=False)

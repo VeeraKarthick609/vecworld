@@ -41,10 +41,10 @@ or not that step was skipped, so two small moves that add up past the threshold 
 
 ## Where the decision lives: one pass loop for both block paths
 
-Graphs are off by default since the Task 7 review, so the decision is not inside `engine/graphs.py` (the brief's
+Graphs were off by default from the Task 7 review until Task 10a-g, so the decision is not inside `engine/graphs.py` (the brief's
 place) but in `engine.cache.cached_forward`, the transformer's forward written out (diffusers 0.41's, without
 controlnet, IP-adapter and gradient checkpointing). It calls each block as a module, so whatever forward the
-`GraphRunner` installed runs: eager blocks on the weight slots by default, graph replays with `VECWORLD_GRAPHS=1`.
+`GraphRunner` installed runs: graph replays by default (since 10a-g), eager blocks on the weight slots with `VECWORLD_GRAPHS=0`.
 Computing, it equals diffusers' forward bit for bit, under both (`test_cached_forward_matches_diffusers`). The
 painter calls it only while the cache is active; at threshold 0 it calls the transformer as before.
 

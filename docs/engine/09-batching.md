@@ -70,7 +70,7 @@ What is left per pass is small on today's machine and big tomorrow. In Task 10 t
 | peak allocated GB | 1.225 | 1.342 | 1.576 | 1.810 | 2.045 |
 
 That is +0.117 GB a window over a ~1.11 GB floor (the 574 MB of slots, the non-block layers, the inputs). With
-graphs (opt-in), batch 8 peaks at 1.82 GB for one key and 2.23 GB with the four largest keys a walk can meet
+graphs (opt-in at the time), batch 8 peaks at 1.82 GB for one key and 2.23 GB with the four largest keys a walk can meet
 (8, 7, 6, 5) all kept (`test_graph_peak_memory_at_flux_batch`). The painter's panorama, with the VAE decode, peaks at
 2.05 GB (bench) / 2.15 GiB (gpu test). The 3.6 GB limit would allow ~20 windows. A panorama only has 8.
 
@@ -173,7 +173,7 @@ At the batching commit (48e19c1, AC, `bench/t9-b8-*.json` and `bench/t9-b4-*.jso
 | walk step s / window-step | - | 0.950 | **0.946** |
 | peak allocated GB (panorama / step) | 1.76 / 1.77 | 1.76 / 1.77 | **2.05 / 2.05** |
 | per-block Python iterations (panorama / step) | 456 / 570 | 456 / 570 | **228 / 285** |
-| graphs (opt-in) walk step | - | - | 39.6 s, 2.08 GB |
+| graphs (opt-in at Task 9) walk step | - | - | 39.6 s, 2.08 GB |
 
 The gate walks agree: per spot, the batch-8 walks paint within -2.3 to +2.0 s of the batch-4 BASE walks (same
 machine, same session day). Speed is unchanged, as the sweep said it would be.

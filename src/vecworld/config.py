@@ -115,7 +115,7 @@ FLUX_BATCH = 8
 # the 57 blocks (odd) put the last block and the next pass's first in the same slot, so every pass waited ~13.5 ms
 # for block 0's copy (measured; 3 divides 57: tile512 pass 0.869 -> 0.859 s, +191 MB; docs/engine/07-cuda-graphs.md).
 # FLUX_GRAPH_MAX shapes (batch, image tokens, text tokens) keep their graphs, the least recently used dropped beyond
-# it: a walk uses up to FLUX_BATCH (1..8 windows a pass; graphs are opt-in).
+# it: a walk uses up to FLUX_BATCH (1..8 windows a pass; graphs are on by default).
 FLUX_SLOT_RING = 3
 FLUX_GRAPH_MAX = 4
 # First-block cache (Task 8, docs/engine/08-block-cache.md): a pass skips blocks 1..56 while block 0's residual has

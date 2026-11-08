@@ -3,8 +3,10 @@
 **What this is:** the transformer's 57 blocks no longer stream their weights through diffusers' group offload. They
 stream through three device buffers of fixed address ("slots", `engine/slots.py`). Each block can also be replayed
 as a CUDA graph, one per block and input shape (`engine/graphs.py`); the CPU still runs between blocks, to sequence
-the weight copies. **The default is eager on the slots**; `VECWORLD_GRAPHS=1` turns the graphs on (ruling after the
-Task 7 review: they tie with eager on speed and cost first-use captures and memory, see "What graphs cost" below).
+the weight copies. **The default is graphs on** (since Task 10a-g; `VECWORLD_GRAPHS=0` runs eagerly on the slots). At Task 7 they were
+opt-in, because they tie with eager on speed and cost first-use captures and memory (see "What graphs cost" below);
+the Task 10a streamer measurements (docs/engine/10-streamer.md) changed the ruling: under GIL contention a replayed
+pass keeps its speed and other threads keep their latency.
 `VECWORLD_KERNEL=off` keeps the diffusers reference with group offload.
 
 **The result is bit-identical** (graph replay = eager on slots = group offload, `torch.equal` on whole transformer
@@ -163,7 +165,7 @@ measure the same within noise.
 
 tile512 (`bench_flux.py --what tile512`, 4 passes, each timed by CUDA events on the compute stream):
 
-| | Task 6 (`ee3baae`) | **slots, eager (default)** | slots + graphs (`VECWORLD_GRAPHS=1`) |
+| | Task 6 (`ee3baae`) | **slots, eager (`VECWORLD_GRAPHS=0`)** | slots + graphs (default since 10a-g) |
 |---|---|---|---|
 | pass min / median / max s | 0.918 / 0.922 / 0.924 | 0.844 / 0.850 / 0.852 | 0.848 / 0.854 / 0.857 |
 | **step s** (median, 2 d.p.) | 0.92 | **0.85** | 0.85 |
@@ -211,9 +213,9 @@ busy server could cause), a batch-1 pass took 19.6 / 28.9 / 64.9 s (min / median
 Graphs remove most of the Python per block but not all of it. The game's GPU work runs on one worker thread and its
 other threads mostly wait on I/O, so this is a stress case, not today's game, but it says where the next CPU cost is.
 
-## What graphs cost (why they are off by default)
+## What graphs cost (why they were opt-in until Task 10a-g)
 
-| | eager on slots (default) | slots + graphs | source |
+| | eager on slots (`VECWORLD_GRAPHS=0`) | slots + graphs (default since 10a-g) | source |
 |---|---|---|---|
 | steady-state tile512 pass | 0.850 s | 0.854 s | same session |
 | steady-state batch-4 pass, 5 alternating pairs | 3.538 s (mean of medians) | 3.565 s (+0.8%, inside the run-order effect) | `alt.py` |
@@ -249,7 +251,7 @@ GIL contention shrinks, and a free CPU may be worth the captures.
 | `test_graph_input_written_in_place_is_copied_again` | same inference tensors written in place: replay = eager on the new values (review I1) | `torch.equal` |
 | `test_glue.py`: `test_gated_residual_into_out`, `test_double_block_out_buffers_with_an_ip_adapter_output` | `out=` = no `out`; a wrong-shape `out` raises; the IP-adapter add lands in `out` | `torch.equal` |
 | CPU: `test_close_frees_slots_and_unpins_even_if_the_runner_fails` | `FluxPainter.close()` frees slots and unpins host memory when the runner's close raises | pass |
-| CPU: `test_graphs_default_off_opt_in`, `test_painter_streams_blocks_from_slots_under_an_engine_kernel` | the `VECWORLD_GRAPHS` rule; slots instead of group offload under engine kernels, group offload under `off` | pass |
+| CPU: `test_graphs_default_on_opt_out`, `test_painter_streams_blocks_from_slots_under_an_engine_kernel` | the `VECWORLD_GRAPHS` rule; slots instead of group offload under engine kernels, group offload under `off` | pass |
 
 ## The gate
 

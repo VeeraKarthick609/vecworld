@@ -55,7 +55,7 @@ A running study log for the FLUX engine work. Each entry explains one idea with 
   - Profile first: launch overhead was 0.34% of a pass, while the real 10.9% idle was group-offload syncs.
   - Fixed weight slots took the pass from 0.92 to 0.85 s; graphs tied with eager because the GPU was already saturated.
   - Ring 3, not 2: with 57 (odd) blocks, ring 2 wraps block 0 onto block 56's slot.
-  - Graphs are opt-in: no speed gain, but capture latency and extra memory.
+  - Graphs were opt-in at Task 7 (no speed gain, but capture latency and extra memory); the default since Task 10a-g.
   - Time async GPU work with CUDA events, not CPU clocks.
 - Entry 2, Task 8:
   - Residual reuse skips blocks whose input barely moved.
