@@ -18,6 +18,7 @@ O_DIRECT reads through io_uring, so they never stay resident in RAM (Task 10b, d
   behind it), and hands out a Gather; a staging buffer whose block was handed out is read into again only once the
   streamer says that block's copy has run (copy_done, the reader's contract in docs/engine/10-streamer.md).
 """
+import logging
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -25,6 +26,11 @@ from dataclasses import dataclass, field
 import torch
 
 from vecworld.engine.slots import ALIGN as SLOT_ALIGN   # resident tensors keep the slots' alignment in the residue
+
+# (reader, pinned addresses, buffers) of SsdSources whose reader could not be closed with reads still in the kernel:
+# kept for the life of the process rather than freed under those reads (see SsdSource._release)
+_LEAKED: list = []
+log = logging.getLogger(__name__)
 
 ALIGN = 4096            # O_DIRECT: offsets, lengths and addresses in multiples of this (the NVMe's block is 512)
 
@@ -445,9 +451,17 @@ class SsdSource:
     @staticmethod
     def _release(reader, pinned: list[int], buffers) -> None:
         """Close the reader (it waits for the reads in flight), then unpin; `buffers` are held until then. If the
-        reader can't be closed, the buffers stay pinned rather than be freed under a read."""
+        reader can't be closed (a hard io_uring_enter error while draining: reads may still be in the kernel), the
+        reader (its rings), the pinned registrations and the buffers go to _LEAKED for the life of the process, so
+        nothing is freed under a read; a reason code is logged and the error raised."""
         if reader is not None:
-            reader.close()
+            try:
+                reader.close()
+            except BaseException as e:
+                _LEAKED.append((reader, pinned, buffers))
+                log.warning("ssd_source_leaked: reader_close_failed (%s); %d staging bytes kept", type(e).__name__,
+                            sum(b.numel() * b.element_size() for b in buffers))
+                raise
         SsdSource._unpin_all(pinned)
 
     def close(self) -> None:

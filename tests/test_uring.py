@@ -518,3 +518,43 @@ def test_uring_hard_reap_error_breaks_the_reader(ssd_dir):
                 src(i)
     finally:
         src.close()
+
+
+def test_ssd_source_that_cannot_drain_keeps_its_buffers(ssd_dir, caplog):
+    """Fix round 1 (N2): if closing the reader fails with reads still in the kernel (a hard io_uring_enter error while
+    draining), the staging buffers, the pinned registrations and the reader (its rings) must not be freed under those
+    reads: they move to uring._LEAKED, a reason code is logged (no data), and the error is raised. T5 builds an
+    SsdSource every encode, so this path is reachable."""
+    import errno
+    import gc
+    import logging
+    import weakref
+
+    from vecworld.engine import uring
+    from vecworld.engine.uring import SsdSource
+
+    sizes = [300_000, 2_000_000, 500_001]
+    path, _ = _file(ssd_dir, 54048 + sum(sizes) + 999, seed=8)
+    src = SsdSource(str(path), _toy_layout(path, sizes), buffers=2, ahead=1, pin=False, queue_depth=1,
+                    chunk=64 << 10)
+    src.bind(_FakeStreamer())
+    n0 = len(uring._LEAKED)
+    try:
+        src(0)                                          # block 1's read-ahead: 31 chunks, one in the kernel at a time
+        src._reader.done(src._req[src.buffer_of(1)][0])  # (tops the kernel's queue up: a chunk is now in flight)
+        assert src._reader.inflight > 0
+        stage = weakref.ref(src._stage_raw)
+        reader = src._reader
+        reader._inject_enter_fault(errno.EFAULT)
+        with caplog.at_level(logging.WARNING, logger="vecworld.engine.uring"):
+            with pytest.raises(OSError, match="io_uring_enter"):
+                src.close()
+        del src
+        gc.collect()
+        assert stage() is not None, "the staging buffer was freed with reads in the kernel"
+        assert len(uring._LEAKED) == n0 + 1 and uring._LEAKED[-1][0] is reader
+        assert any("ssd_source_leaked" in r.getMessage() for r in caplog.records)
+    finally:
+        for r, _, _ in uring._LEAKED[n0:]:             # the fault was one-shot: these drain now
+            r.close()
+        del uring._LEAKED[n0:]
