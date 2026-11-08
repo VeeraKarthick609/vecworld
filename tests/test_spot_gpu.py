@@ -77,7 +77,22 @@ def test_three_spots_in_a_row_timing(tmp_path):
 @pytest.mark.gpu
 def test_six_spot_walk_at_the_walk_limit():
     """Heading 0, 0, 60, 60, -60, 0, each spot built for an exit at its parent's walk limit (as a pre-dream is):
-    the distances are what was walked, and the frames go to /tmp/roam_t8b (sheet.png) to be looked at."""
+    the distances are what was walked, and the frames go to /tmp/roam_t8b (sheet.png) to be looked at.
+
+    Runs in a fresh process: the walk peaks at 3.32 GiB allocated on a card with 3.68 GiB usable, and inside a full
+    GPU suite run the process has picked up more memory outside PyTorch's allocator (CUDA libraries' handles and
+    workspaces, the context's code: 0.20 -> 0.24 GB) and a fragmented cache from the modules before it, so it ran out of
+    memory there (at fcbfe73 too) while passing alone."""
+    import subprocess
+    import sys
+
+    out = subprocess.run([sys.executable, "-c", "import test_spot_gpu as t; t._six_spot_walk()"],
+                         cwd=Path(__file__).parent, capture_output=True, text=True, timeout=900)
+    print(out.stdout[-3000:])
+    assert out.returncode == 0, out.stderr[-4000:]
+
+
+def _six_spot_walk():
     import torch
 
     from vecworld.config import WALK_Z_MAX
