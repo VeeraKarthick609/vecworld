@@ -1,0 +1,53 @@
+{
+ "power": "ac",
+ "git": "a1d78dc",
+ "results": {
+  "what": "step",
+  "painter": "engine",
+  "kernel": "w4a8",
+  "fused": true,
+  "batch": 8,
+  "graphs": false,
+  "cache_threshold": 0.0,
+  "gpu_power": "90.00 4 8",
+  "load_s": 16.1,
+  "rss_after_setup_gb": 7.52,
+  "pinned_gb": 6.66,
+  "t5_encode_cold_s": 5.13,
+  "mon_t5": {
+   "rss_gb": 8.03,
+   "smi_mib": 1938
+  },
+  "step": {
+   "s": 38.6,
+   "passes": 5,
+   "s_per_pass_median": 7.32,
+   "s_per_pass_mean": 7.429,
+   "s_per_pass_min": 7.275,
+   "s_per_pass_max": 7.91,
+   "s_per_pass": [
+    7.91,
+    7.275,
+    7.286,
+    7.323,
+    7.349
+   ],
+   "peak_alloc_gb": 2.05,
+   "rss_gb": 8.54,
+   "smi_mib": 2248,
+   "window_passes": 40,
+   "s_per_window_step": 0.929,
+   "cache": {
+    "passes": 5,
+    "skips": 0,
+    "rel": []
+   },
+   "s_per_window_pass": 0.97,
+   "flop_per_step": 17672448245760,
+   "achieved_tflops": 18.22,
+   "pct_bf16_peak": 95.3
+  },
+  "wall_s": 89.8,
+  "gpu_power_end": "90.00 4 8"
+ }
+}
