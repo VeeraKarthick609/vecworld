@@ -155,3 +155,103 @@ def test_gather_must_cover_the_block_exactly():
         finally:
             st.close()
     a.close()
+
+
+def test_ssd_stop_then_reuse():
+    """Review Focus 3 on the shipped default (the blocks read from the SSD, FLUX_WEIGHTS_SOURCE=ssd; the RAM arena's
+    version is test_stream.py::test_stream_stop_then_reuse): a job Stopped between the passes of a step (check_stop)
+    and one Stopped inside a pass (block 20 raises it), then the same job again on the same streamer and reader: it
+    equals the job run uninterrupted, and the reader's page-locked staging buffers, the slots and allocated device
+    memory are what they were before (reused, not leaked or re-made)."""
+    import threading
+    from types import SimpleNamespace
+
+    from test_graphs import _bench as b
+    from vecworld.config import FLUX_SSD_AHEAD, FLUX_SSD_BUFFERS, FLUX_SSD_CHUNK, FLUX_SSD_QUEUE_DEPTH, FLUX_WIN
+    from vecworld.dream import gpu
+    from vecworld.dream.gpu import Stopped
+    from vecworld.engine.ext import load_ext
+    from vecworld.engine.graphs import stream_blocks
+    from vecworld.flux.painter import FluxPainter, rowwise
+
+    tr, path = b().load_transformer()
+    rowwise(tr)
+    st, runner = stream_blocks(tr, "cuda", graphs=False, ssd=path,
+                               reader=dict(buffers=FLUX_SSD_BUFFERS, ahead=FLUX_SSD_AHEAD,
+                                           queue_depth=FLUX_SSD_QUEUE_DEPTH, chunk=FLUX_SSD_CHUNK))
+    blocks = [*tr.transformer_blocks, *tr.single_transformer_blocks]
+    reader = st.reader
+    try:
+        passes = []
+        p = FluxPainter.__new__(FluxPainter)
+        p._setup(tr, SimpleNamespace(config=SimpleNamespace(scaling_factor=1.0, shift_factor=0.0)), None,
+                 lambda d, n: passes.append(d), dev="cuda", dtype=torch.bfloat16)
+        p.batch = 2                                     # 4 windows: 2 passes a step, so a stop can fall mid-step
+        p._slots = st
+        g = torch.Generator().manual_seed(5)
+        e = (torch.randn(1, 256, 4096, generator=g).to("cuda", torch.bfloat16),
+             torch.randn(1, 768, generator=g).to("cuda", torch.bfloat16))
+        grid = torch.randn(1, 64, FLUX_WIN, 2 * FLUX_WIN, generator=g).to("cuda")
+
+        def job():
+            with torch.inference_mode():
+                out = p._denoise(grid.clone(), p._sigmas(3), [e] * 4)
+            torch.cuda.synchronize()
+            return out
+
+        def pinned():
+            """The reader's page-locked bytes, whether its staging buffers are still registered (asked of the driver)
+            and torch's page-locked pool in use."""
+            return (reader.pinned_bytes, load_ext().host_pinned(reader._stage.data_ptr(), reader._stage.numel()),
+                    torch.cuda.host_memory_stats().get("active_bytes.current", 0))
+
+        want = job()
+        torch.cuda.synchronize()
+        mem0, pin0 = torch.cuda.memory_allocated(), pinned()
+        slots0 = [t.data_ptr() for t in st.slots]
+        assert pin0[0] > 0 and pin0[1]
+
+        # 1. Stopped at check_stop between the two passes of step 1 (after pass 3)
+        stop = threading.Event()
+        passes.clear()
+        p.progress = lambda d, n: (passes.append(d), d == 3 and stop.set())
+        gpu._job.stop = stop
+        with pytest.raises(Stopped):
+            try:
+                job()
+            finally:
+                gpu._job.stop = None
+        assert passes == [1, 2, 3]
+
+        # 2. Stopped inside a pass: block 20 raises it on the job's second pass (blocks 21.. never run)
+        blk, calls = blocks[20], []
+        inner = blk.forward
+
+        def boom(*a, **k):
+            calls.append(1)
+            if len(calls) == 2:
+                raise Stopped()
+            return inner(*a, **k)
+
+        blk.forward = boom
+        p.progress = None
+        with pytest.raises(Stopped):
+            try:
+                job()
+            finally:
+                blk.forward = inner
+        assert len(calls) == 2
+
+        got = job()
+        assert torch.equal(got, want)
+        del got
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == mem0
+        assert pinned() == pin0 and [t.data_ptr() for t in st.slots] == slots0
+    finally:
+        torch.cuda.synchronize()
+        runner.close()
+        st.close()
+        reader.close()
+        del st, runner, reader, tr, blocks
+        _free()
