@@ -115,32 +115,66 @@ ROWWISE = ("x_embedder", "context_embedder", "time_text_embed", "norm_out.linear
 
 
 class _Rows:
-    """A module's forward over each row of the batch alone (every argument split along dim 0), concatenated."""
+    """A module's forward over each row of the batch alone, concatenated.
 
-    def __init__(self, inner):
-        self.inner = inner
+    The batch n is dim 0 of the first tensor argument (positional, else keyword). Every tensor argument whose dim 0 is
+    n is split into rows; anything else (a tensor with another dim 0, a number, None) goes to every row whole. The
+    module is held weakly (no module -> wrapper -> module cycle); `inner` is the module's own instance forward if it
+    had one (a hook's), else None: the class's forward is called on the module."""
 
-    def __call__(self, *args):
+    def __init__(self, module, inner=None):
+        import weakref
+
+        self.module, self.inner = weakref.ref(module), inner
+
+    def _call(self, *args, **kwargs):
+        if self.inner is not None:
+            return self.inner(*args, **kwargs)
+        m = self.module()
+        return type(m).forward(m, *args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
         import torch
 
-        n = args[0].shape[0]
+        first = next((a for a in (*args, *kwargs.values()) if isinstance(a, torch.Tensor) and a.dim() > 0), None)
+        n = 1 if first is None else first.shape[0]
         if n == 1:
-            return self.inner(*args)
-        return torch.cat([self.inner(*(a[i:i + 1] for a in args)) for i in range(n)])
+            return self._call(*args, **kwargs)
+
+        def row(a, i):
+            return a[i:i + 1] if isinstance(a, torch.Tensor) and a.dim() > 0 and a.shape[0] == n else a
+
+        return torch.cat([self._call(*(row(a, i) for a in args), **{k: row(v, i) for k, v in kwargs.items()})
+                          for i in range(n)])
 
 
-def rowwise(transformer) -> None:
+def rowwise(transformer, enable: bool = True) -> None:
     """Make a batched pass give each window exactly what it gets alone (Task 9, docs/engine/09-batching.md).
 
-    The blocks already do: every token-facing GEMM is the engine's (its sums per row don't depend on M), the
-    modulation GEMV reads its rows apart and attention is per window (measured: all 57 blocks bit-identical given the
-    same inputs). The layers outside them run cuBLAS bf16 GEMMs, which pick their algorithm by M, so a window's
-    time-text embedding rounded one ulp apart in a batch, and under w4a8 that grew into a different sample (25.7 dB
-    against batch 1). These layers are a few MFLOP a window: ROWWISE runs them a window at a time. Safe twice."""
+    Under an engine kernel the blocks already do: every token-facing GEMM is the engine's (its sums per row don't depend
+    on M), the modulation GEMV reads its rows apart and attention is per window (measured: all 57 blocks bit-identical
+    given the same inputs, under w4a8 and mma). The layers outside them run cuBLAS bf16 GEMMs, which pick their
+    algorithm by M, so a window's time-text embedding rounded one ulp apart in a batch, and under w4a8 that grew into a
+    different sample (25.7 dB against batch 1). These layers are a few MFLOP a window: ROWWISE runs them a window at a
+    time. (Under VECWORLD_KERNEL=off the blocks' own GEMMs are cuBLAS too, so this can't help there; the reference runs
+    a window a pass instead, engine.engine_batch.)
+
+    The module is marked (_vw_rowwise), so a second call wraps nothing even after a hook rewrapped the forward.
+    enable=False puts the original forward back (for the overhead A/B)."""
     for name in ROWWISE:
         m = transformer.get_submodule(name)
-        if not isinstance(m.__dict__.get("forward"), _Rows):
-            m.forward = _Rows(m.forward)
+        state = m.__dict__.get("_vw_rowwise")
+        if enable and state is None:
+            inner = m.__dict__.get("forward")               # an instance forward (a hook's), kept; else the class's
+            m.forward = _Rows(m, inner)
+            m._vw_rowwise = ("own", inner) if inner is not None else ("class", None)
+        elif not enable and state is not None:
+            kind, inner = state
+            if kind == "own":
+                m.forward = inner
+            else:
+                m.__dict__.pop("forward", None)
+            del m._vw_rowwise
 
 
 def _wrap_dist(w: int, at: float) -> np.ndarray:
@@ -192,8 +226,9 @@ class FluxPainter(Painter):
     always off under "off") is the first-block cache's threshold (vecworld.engine.cache; self.cache_threshold,
     self.cache): each job (a panorama or a step) keys its window batches by (job, window ids), and after a job
     self.last_cache holds its passes and skipped passes.
-    VECWORLD_BATCH (vecworld.engine.engine_batch; unset: config.FLUX_BATCH) is self.batch, the most windows a
-    transformer pass carries: each step's active windows run as ceil(active / batch) passes.
+    VECWORLD_BATCH (vecworld.engine.engine_batch; unset: config.FLUX_BATCH; always 1 under VECWORLD_KERNEL=off) is
+    self.batch, the most windows a transformer pass carries: each step's active windows run as ceil(active / batch)
+    passes. Under an engine kernel the batch changes speed and progress granularity only, never the picture (rowwise).
     """
 
     style = FLUX_STYLE
@@ -209,7 +244,7 @@ class FluxPainter(Painter):
 
         self.kernel = engine_kernel()           # a typo or a broken extension build fails here, before the
         self.fused = engine_fuse(self.kernel)   # minute-long model load, with a hint to set VECWORLD_KERNEL=off
-        self.batch = engine_batch()
+        self.batch = engine_batch(self.kernel)  # 1 under "off": the reference paints a window a pass
         if self.kernel is not None or self.fused:
             load_engine_ext()
         dev, bf16 = torch.device("cuda"), torch.bfloat16

@@ -169,6 +169,30 @@ def test_every_active_window_of_a_step_in_as_few_passes_as_the_batch_allows():
             assert sizes == [b] * (n // b) + ([n % b] if n % b else []), (b, s, sizes)
 
 
+class _RecLayer(torch.nn.Module):
+    """A layer that records each call's batch and adds its y (per row) and its bias (shared, not batched)."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def forward(self, x, y=None, bias=None, scale=1.0):
+        self.seen.append(x.shape[0])
+        out = x * 2 + (0 if y is None else y.sum(-1, keepdim=True))
+        return out * scale + (0 if bias is None else bias)
+
+
+def _outer_layers():
+    from vecworld.flux.painter import ROWWISE
+
+    tr = torch.nn.Module()
+    tr.norm_out = torch.nn.Module()
+    for name in ROWWISE:
+        parent, _, leaf = name.rpartition(".")
+        setattr(tr.get_submodule(parent), leaf, _RecLayer())
+    return tr
+
+
 def test_rowwise_runs_the_outer_layers_a_window_at_a_time():
     """Task 9: cuBLAS picks its bf16 GEMM by M, so the transformer's layers outside the blocks (x / context embedders,
     the time-text embedder, the output norm's linear and the projection out, M = batch or batch x tokens) round a window
@@ -176,20 +200,7 @@ def test_rowwise_runs_the_outer_layers_a_window_at_a_time():
     each a window at a time: the same rows, the same result, whatever the batch."""
     from vecworld.flux.painter import ROWWISE, rowwise
 
-    class Rec(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.seen = []
-
-        def forward(self, x, y=None):
-            self.seen.append(x.shape[0])
-            return x * 2 + (0 if y is None else y.sum(-1, keepdim=True))
-
-    tr = torch.nn.Module()
-    tr.norm_out = torch.nn.Module()
-    for name in ROWWISE:
-        parent, _, leaf = name.rpartition(".")
-        setattr(tr.get_submodule(parent), leaf, Rec())
+    tr = _outer_layers()
     rowwise(tr)
     x, y = torch.randn(3, 5), torch.randn(3, 4)
     for name in ROWWISE:
@@ -204,21 +215,134 @@ def test_rowwise_runs_the_outer_layers_a_window_at_a_time():
     assert m.seen == [1, 1, 1]
 
 
+def test_rowwise_splits_only_batched_tensors_and_takes_keywords():
+    """Task 9 review M3 (a, b): keyword arguments are split like positional ones; a tensor whose dim 0 isn't the
+    batch (a shared bias) and a non-tensor (a scale) pass through whole to every row."""
+    from vecworld.flux.painter import rowwise
+
+    tr = _outer_layers()
+    rowwise(tr)
+    m = tr.x_embedder
+    x, y, bias = torch.randn(3, 5), torch.randn(3, 4), torch.randn(5)
+    want = (x * 2 + y.sum(-1, keepdim=True)) * 0.5 + bias
+    m.seen.clear()
+    assert torch.equal(m(x, y=y, bias=bias, scale=0.5), want) and m.seen == [1, 1, 1]
+    m.seen.clear()
+    assert torch.equal(m(x=x, y=y, bias=bias, scale=0.5), want) and m.seen == [1, 1, 1]   # the batch from a keyword
+
+
+def test_rowwise_is_safe_twice_after_a_rewrap_and_unwraps():
+    """Task 9 review M3 (c): rowwise() marks the module, so a second call after something else rewrapped the forward
+    (a hook registry) doesn't wrap again; rowwise(tr, False) puts the original forward back."""
+    from vecworld.flux.painter import ROWWISE, rowwise
+
+    tr = _outer_layers()
+    rowwise(tr)
+    m = tr.proj_out
+    inner = m.forward
+    m.forward = lambda *a, **k: inner(*a, **k)               # a hook rewraps it
+    rowwise(tr)
+    x = torch.randn(4, 5)
+    m.seen.clear()
+    m(x)
+    assert m.seen == [1, 1, 1, 1]                            # one level of rows, not rows of rows
+    tr2 = _outer_layers()
+    rowwise(tr2)
+    rowwise(tr2, False)
+    for name in ROWWISE:
+        assert "forward" not in tr2.get_submodule(name).__dict__, name
+        layer = tr2.get_submodule(name)
+        layer.seen.clear()
+        layer(x)
+        assert layer.seen == [4]
+
+
+def test_rowwise_keeps_no_reference_cycle():
+    """Task 9 review M3 (d): the wrapper holds its module weakly, so a wrapped layer is freed by refcount alone."""
+    import gc
+    import weakref
+
+    from vecworld.flux.painter import rowwise
+
+    gc.disable()
+    try:
+        tr = _outer_layers()
+        rowwise(tr)
+        ref = weakref.ref(tr.proj_out)
+        del tr
+        assert ref() is None
+    finally:
+        gc.enable()
+
+
 def test_engine_batch_rule(monkeypatch):
     """VECWORLD_BATCH (vecworld.engine.engine_batch, one rule for the painter, the walk and the bench): unset or empty,
-    config.FLUX_BATCH; otherwise a whole number >= 1, under every kernel ("off" too: the diffusers path batches the
-    same way). Anything else is refused."""
+    config.FLUX_BATCH; otherwise a whole number >= 1, under the engine kernels. Under VECWORLD_KERNEL=off (kernel None)
+    always 1, whatever FLUX_BATCH or VECWORLD_BATCH say: diffusers' cuBLAS GEMMs round by M inside the blocks too, so
+    the reference is pinned to one window a pass, its batch-invariant picture (Task 9 review I1). Anything else is
+    refused."""
     from vecworld.engine import engine_batch
 
     monkeypatch.delenv("VECWORLD_BATCH", raising=False)
-    assert engine_batch() == FLUX_BATCH
+    assert engine_batch() == engine_batch("w4a8") == engine_batch("mma") == FLUX_BATCH
+    assert engine_batch(None) == 1
     for value, want in (("", FLUX_BATCH), ("1", 1), ("6", 6), (" 8 ", 8)):
         monkeypatch.setenv("VECWORLD_BATCH", value)
-        assert engine_batch() == want, value
+        assert engine_batch("w4a8") == want, value
+        assert engine_batch(None) == 1, value
     for bad in ("0", "-2", "2.5", "lots"):
         monkeypatch.setenv("VECWORLD_BATCH", bad)
         with pytest.raises(ValueError, match="VECWORLD_BATCH"):
-            engine_batch()
+            engine_batch("w4a8")
+
+
+def test_painter_batch_follows_the_kernel(monkeypatch):
+    """FluxPainter reads its batch with its kernel: FLUX_BATCH (or VECWORLD_BATCH) under an engine kernel, 1 under
+    VECWORLD_KERNEL=off even with VECWORLD_BATCH=8 (stops at the VAE load: no models)."""
+    import diffusers
+
+    import vecworld.engine.ext as ext_mod
+    import vecworld.engine.graphs as graphs_mod
+    import vecworld.engine.swap as swap_mod
+    import vecworld.engine.blocks as blocks_mod
+    import vecworld.flux.painter as painter_mod
+
+    class Loaded(Exception):
+        pass
+
+    seen = []
+    tr = SimpleNamespace(transformer_blocks=[], single_transformer_blocks=[], enable_group_offload=lambda **k: None)
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: tr)
+    monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
+    monkeypatch.setattr(swap_mod, "swap_linears", lambda *a, **k: 1)
+    monkeypatch.setattr(blocks_mod, "patch_blocks", lambda tr: 57)
+    monkeypatch.setattr(painter_mod, "rowwise", lambda tr: None)
+    monkeypatch.setattr(painter_mod, "_pin_in_place", lambda mods: [])
+    monkeypatch.setattr(graphs_mod, "stream_blocks", lambda tr, dev, graphs, **k: ("slots", "runner"))
+
+    def stop_at_vae(*a, **k):
+        raise Loaded
+
+    monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", stop_at_vae)
+    real_init = FluxPainter.__init__
+
+    def init(self, *a, **k):
+        try:
+            real_init(self, *a, **k)
+        finally:
+            seen.append(self.batch)
+
+    monkeypatch.setattr(FluxPainter, "__init__", init)
+    for k in ("VECWORLD_FUSE", "VECWORLD_GRAPHS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("VECWORLD_BATCH", "8")
+    for kernel, want in (("w4a8", 8), ("mma", 8), ("off", 1)):
+        monkeypatch.setenv("VECWORLD_KERNEL", kernel)
+        with pytest.raises(Loaded):
+            FluxPainter()
+        assert seen[-1] == want, kernel
 
 
 def test_check_stop_between_steps():

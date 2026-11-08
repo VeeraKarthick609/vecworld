@@ -69,18 +69,21 @@ def engine_cache_threshold(kernel: str | None) -> float:
     return t if kernel is not None else 0.0
 
 
-def engine_batch() -> int:
+def engine_batch(kernel: str | None = "engine") -> int:
     """Windows per transformer pass (Task 9, docs/engine/09-batching.md), the one rule for the painter, the walk and the
-    bench: VECWORLD_BATCH (a whole number >= 1) or, unset or empty, config.FLUX_BATCH. Under every kernel ("off" too:
-    the diffusers path batches its windows the same way)."""
+    bench. Under an engine kernel (any name; the default, for callers without one such as the CPU fakes):
+    VECWORLD_BATCH (a whole number >= 1) or, unset or empty, config.FLUX_BATCH. Under "off" (kernel None: diffusers'
+    reference) always 1, whatever they say: diffusers' cuBLAS GEMMs inside the blocks round by M, so a batched window
+    would paint another picture there, and the reference is pinned to its one-window-a-pass, batch-invariant picture
+    (the engine's rowwise outer layers make any batch paint that same picture)."""
     from vecworld.config import FLUX_BATCH
 
     v = (os.environ.get("VECWORLD_BATCH") or "").strip()
-    if not v:
-        return int(FLUX_BATCH)
-    if not v.isdigit() or int(v) < 1:
+    if v and (not v.isdigit() or int(v) < 1):
         raise ValueError(f"VECWORLD_BATCH={v!r}; use a whole number >= 1 (unset: config.FLUX_BATCH)")
-    return int(v)
+    if kernel is None:
+        return 1
+    return int(v) if v else int(FLUX_BATCH)
 
 
 def keep_for(kernel: str | None) -> tuple[str, ...]:

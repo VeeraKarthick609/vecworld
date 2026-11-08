@@ -525,7 +525,7 @@ def main():
     from vecworld.engine import engine_fuse
     from vecworld.engine import engine_batch, engine_cache_threshold, engine_graphs
     R = {"what": a.what, "painter": a.painter, "kernel": engine_kernel(), "fused": engine_fuse(engine_kernel()),
-         "batch": engine_batch(),
+         "batch": engine_batch(engine_kernel()),
          "graphs": engine_graphs(engine_kernel()), "cache_threshold": engine_cache_threshold(engine_kernel()), "gpu_power": " ".join(smi("enforced.power.limit,pcie.link.gen.current,pcie.link.width.current"))}
     t0 = time.time()
     WHATS[a.what](R, mon)

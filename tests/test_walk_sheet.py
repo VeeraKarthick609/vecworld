@@ -184,6 +184,50 @@ def test_relative_refuses_walks_of_another_scene_or_route(tmp_path):
         walk_sheet.main(["--relative", str(tmp_path / "base"), str(tmp_path / "seedx"), "--scenes", "forest"])
 
 
+def test_relative_refuses_a_route_field_missing_on_both_sides(tmp_path):
+    """Task 9 review M6: a route field absent from both walks' timings.json is not a match: the gate can't tell they
+    walked the same route, so it refuses."""
+    clean = [_texture(64, 256, s) for s in range(2)]
+    _walk_dir(tmp_path / "a-forest", clean)
+    _walk_dir(tmp_path / "b-forest", clean)
+    for d in ("a-forest", "b-forest"):
+        f = tmp_path / d / "timings.json"
+        info = json.loads(f.read_text())
+        del info["walked"]
+        f.write_text(json.dumps(info))
+    with pytest.raises(SystemExit, match="walked"):
+        walk_sheet.relative(tmp_path / "a", tmp_path / "b", ["forest"])
+
+
+def test_a_walk_records_its_batch_never_none(tmp_path):
+    """Task 9 review M5: timings.json records the windows per pass the painter ran (painter.batch; 1 for a painter
+    that doesn't batch windows), never None."""
+    info = walk_sheet.run(FakePainter(), FakeDepth(), "t1", "forest", 1, [0, 0], 9.0, tmp_path / "a")
+    assert info["batch"] == 1
+    p = FakePainter()
+    p.batch = 8
+    assert walk_sheet.run(p, FakeDepth(), "t1", "forest", 1, [0, 0], 9.0, tmp_path / "b")["batch"] == 8
+
+
+def test_a_walk_refuses_a_dirty_tree_unless_allowed(tmp_path, monkeypatch):
+    """Task 9 review M5: a walk on uncommitted code can't be traced to a sha, so main() refuses it (before loading any
+    model) unless --allow-dirty, which keeps the diff beside the walk (git-dirty.diff)."""
+    import vecworld.flux.painter as painter_mod
+
+    def no_models():
+        raise AssertionError("a dirty walk loaded the painter")
+
+    monkeypatch.setattr(painter_mod, "FluxPainter", no_models)
+    monkeypatch.setattr(walk_sheet, "_git", lambda: "abc1234-dirty")
+    with pytest.raises(SystemExit, match="dirty"):
+        walk_sheet.main(["--out", str(tmp_path / "w")])
+    assert not (tmp_path / "w").exists()
+    monkeypatch.setattr(walk_sheet, "_git_diff", lambda: "diff --git a/x b/x\n")
+    d = tmp_path / "v"
+    walk_sheet.save_dirty_diff(d)
+    assert (d / "git-dirty.diff").read_text().startswith("diff --git")
+
+
 def test_relative_gate_flags_a_vacuous_pass(tmp_path, capsys):
     """Task 8 review M4: a candidate that claims a lossy setting (a cache threshold > 0, or --expect-change) but
     exercised nothing (no skipped pass, or every spot byte-identical to its base) is VACUOUS, not PASS (exit 2). A

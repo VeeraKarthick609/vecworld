@@ -9,8 +9,9 @@ fallback neighbours, journey drift, colour reference and seeds), with no browser
 is the world bearing spot i is reached by (headings[0] is the first spot's, 0). It writes spot{i}.png, prev{i}.png
 (the dollied view each step started from), sheet.png and timings.json into --out; timings.json also records the
 engine kernel, the linears kept on mma (FLUX_A16_KEEP under w4a8), whether the glue was fused (VECWORLD_FUSE),
-whether the blocks replayed as CUDA graphs (VECWORLD_GRAPHS), the windows per pass (painter.batch, VECWORLD_BATCH)
-and the git sha the walk ran.
+whether the blocks replayed as CUDA graphs (VECWORLD_GRAPHS), the windows per pass (painter.batch, VECWORLD_BATCH;
+1 for a painter that doesn't batch windows) and the git sha the walk ran. A walk refuses a tree with uncommitted
+changes (its sha wouldn't name the code) unless --allow-dirty, which keeps the diff beside it (git-dirty.diff).
 
 Each spot gets a seam score (seam_profile: the strongest full-height step in local detail between the columns
 either side of one column). A walk whose spot scores above --max-seam exits 1; --check re-scores walks already
@@ -237,6 +238,10 @@ def _info(d: Path) -> dict:
 def same_route(b: Path, c: Path) -> None:
     """Exit (1) unless walks b and c share their scene and route (ROUTE, from their timings.json)."""
     ib, ic = _info(b), _info(c)
+    missing = [k for k in ROUTE if k not in ib or k not in ic]
+    if missing:
+        raise SystemExit(f"{b.name} / {c.name}: timings.json lacks {', '.join(missing)}, so the gate can't tell they "
+                         f"walked the same route")
     diff = [k for k in ROUTE if ib.get(k) != ic.get(k)]
     if diff:
         raise SystemExit(f"{b.name} and {c.name} walked different scenes or routes ("
@@ -289,9 +294,11 @@ def _print_relative(base: Path, cand: Path, scenes, rows) -> None:
     for scene, b, c in _pairs(base, cand, scenes):
         ib, ic = (json.loads((d / "timings.json").read_text()) if (d / "timings.json").exists() else {} for d in (b, c))
         passes, skips = _cache_counts([ic])
+        bpasses, _ = _cache_counts([ib])
         print(f"{scene}: base {b.name} (git {ib.get('git')}, kernel {ib.get('kernel')}, batch {ib.get('batch')}, cache "
-              f"{ib.get('cache_threshold')}) vs {c.name} (git {ic.get('git')}, kernel {ic.get('kernel')}, batch "
-              f"{ic.get('batch')}, cache {ic.get('cache_threshold')}: passes {passes}, skips {skips})")
+              f"{ib.get('cache_threshold')}: passes {bpasses}) vs {c.name} (git {ic.get('git')}, kernel "
+              f"{ic.get('kernel')}, batch {ic.get('batch')}, cache {ic.get('cache_threshold')}: passes {passes}, "
+              f"skips {skips})")
         if ib.get("kernel") != ic.get("kernel") or ib.get("keep_a16") != ic.get("keep_a16"):
             print("  warning: the walks ran different kernels or keep-lists")
         for r in (r for r in rows if r["scene"] == scene):
@@ -330,6 +337,8 @@ def main(argv=None):
     ap.add_argument("--max-delta", type=float, default=MAX_DELTA, help="--relative: the largest seam rise allowed")
     ap.add_argument("--expect-change", action="store_true",
                     help="--relative: CAND runs a lossy setting, so byte-identical spots are VACUOUS, not PASS")
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="walk uncommitted code (the diff is kept as OUT/git-dirty.diff, the sha recorded -dirty)")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args(argv)
     scenes = [x.strip() for x in a.scenes.split(",") if x.strip()] if a.scenes else None
@@ -363,6 +372,12 @@ def main(argv=None):
     headings = [float(x) for x in a.headings.split(",")][:a.spots]
     if len(headings) < a.spots:
         ap.error(f"--headings gives {len(headings)} bearings for {a.spots} spots")
+    if _git().endswith("-dirty"):
+        if not a.allow_dirty:
+            sys.exit("the tree has uncommitted changes, so the walk's recorded sha wouldn't name its code: commit, "
+                     "or pass --allow-dirty (keeps the diff beside the walk)")
+        for d in ([a.out.with_name(f"{a.out.name}-{x}") for x in scenes] if scenes else [a.out]):
+            save_dirty_diff(d)
     from vecworld.flux.painter import FluxPainter
     from vecworld.roam.depth import AnythingDepth
 
@@ -379,6 +394,18 @@ def main(argv=None):
            for i, (sc, at) in enumerate(zip(info["seam"], info["seam_at"])) if sc > a.max_seam]
     if bad:
         sys.exit("seams above %.2f: %s" % (a.max_seam, "; ".join(bad)))
+
+
+def _git_diff() -> str:
+    import subprocess
+
+    return subprocess.run(["git", "diff", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout
+
+
+def save_dirty_diff(d: Path) -> None:
+    """Keep the uncommitted diff a --allow-dirty walk ran beside it."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "git-dirty.diff").write_text(_git_diff())
 
 
 def _git() -> str:
@@ -409,7 +436,7 @@ def run(painter, depth, recipe, theme, seed, headings, walked, out: Path, scene:
             "kernel": getattr(painter, "kernel", None), "keep_a16": list(getattr(painter, "keep_a16", ())),
             "fused": getattr(painter, "fused", None), "graphs": getattr(painter, "graphs", None),
             "cache_threshold": getattr(painter, "cache_threshold", 0.0), "cache": w["cache"],
-            "batch": getattr(painter, "batch", None), "git": _git(),
+            "batch": int(getattr(painter, "batch", 1)), "git": _git(),
             "spot_s": [round(x, 2) for x in w["spot_s"]], "paint_s": [round(x, 2) for x in w["paint_s"]],
             "distance": [round(s.distance, 3) for s in w["spots"]], "scale": [round(s.scale, 3) for s in w["spots"]],
             "prompts": [[[t, round(x, 3)] for t, x in p] for p in w["prompts"]]}
