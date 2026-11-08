@@ -37,6 +37,7 @@ def _save(dirs, i, spot):
 
 
 @pytest.mark.gpu
+@pytest.mark.card_limit
 def test_three_spots_in_a_row_timing(tmp_path):
     import torch
 

@@ -29,7 +29,7 @@ def _hand_host_memory_back():
 
 
 def pytest_collection_modifyitems(config, items):
-    """Tests marked card_limit run first. They need nearly all of the 4 GB card (the six-spot walk peaks at 3.32 GiB
+    """Tests marked card_limit run first. They need nearly all of the 4 GB card (the spot walks peak at 3.32 GiB
     allocated of 3.68 GiB usable), and every GPU module before them leaves device memory this process can't give back:
     not PyTorch tensors (allocated is back to ~0.01 GB between modules) but CUDA libraries' code and handles loaded
     into the context, 0.14 GB alone -> 0.24 GB after the GPU modules (measured with a per-test tracker, the same at
