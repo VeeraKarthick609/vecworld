@@ -19,10 +19,12 @@
 
 #include <linux/io_uring.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -114,6 +116,15 @@ class DirectReader {
     int64_t queue_depth() const { return qd_; }
     int64_t chunk() const { return chunk_; }
     int64_t inflight() const { return inflight_; }
+    int64_t queued() const { return static_cast<int64_t>(queue_.size()); }
+    int64_t completions() const { return completions_; }
+
+    // Test hook: the nth chunk completion from now (1 = the next) is reported with result `res` instead of its own
+    // (a negative errno, or a short byte count). The read itself still ran; only what we're told about it changes.
+    void inject_fault(int64_t nth, int64_t res) {
+        fault_at_ = completions_ + nth;
+        fault_res_ = static_cast<int>(res);
+    }
 
     // Start reading [offset, offset + nbytes) into dst (all three multiples of 4096). The request succeeds once its
     // first `need` bytes are in (a read may run past the end of the file, as the aligned tail of its last block does).
@@ -170,7 +181,9 @@ class DirectReader {
         char* out = static_cast<char*>(dst.data_ptr());
         int64_t lo = offset / ALIGN * ALIGN, hi = (offset + nbytes + ALIGN - 1) / ALIGN * ALIGN;
         int64_t cap = dst.numel() * dst.element_size();
-        bool direct = lo == offset && reinterpret_cast<uintptr_t>(out) % ALIGN == 0 && cap >= hi - lo;
+        // straight into dst only when the aligned superset is exactly the range (else dst[nbytes:] would be written)
+        bool direct = lo == offset && offset + nbytes == hi && reinterpret_cast<uintptr_t>(out) % ALIGN == 0 &&
+                      cap >= hi - lo;
         char* buf = out;
         if (!direct) {
             buf = static_cast<char*>(std::aligned_alloc(ALIGN, hi - lo));
@@ -219,6 +232,9 @@ class DirectReader {
 
     [[noreturn]] void fail_setup(const char* what) {
         int e = errno;
+        if (sqes_ && sqes_ != MAP_FAILED) munmap(sqes_, sqes_sz_);
+        if (!single_ && cq_ptr_ && cq_ptr_ != MAP_FAILED) munmap(cq_ptr_, cq_sz_);
+        if (sq_ptr_ && sq_ptr_ != MAP_FAILED) munmap(sq_ptr_, sq_sz_);
         ::close(ring_);
         ::close(fd_);
         ring_ = fd_ = -1;
@@ -226,6 +242,7 @@ class DirectReader {
     }
     void check_open() const {
         if (ring_ < 0) throw IOFailure("DirectReader on " + path_ + " is closed");
+        if (!broken_.empty()) throw IOFailure("DirectReader on " + path_ + " is broken: " + broken_);
     }
 
     // Move queued chunks into the submission ring while the kernel has room, and submit them.
@@ -257,8 +274,14 @@ class DirectReader {
         while (left) {
             int r = uring_enter(ring_, left, 0, 0);
             if (r < 0) {
-                if (errno == EINTR || errno == EAGAIN || errno == EBUSY) continue;
-                throw IOFailure("DirectReader: io_uring_enter (submit): " + errstr(errno));
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EBUSY) {    // the kernel wants completions reaped first
+                    reap(false);
+                    continue;
+                }
+                // SQEs are published but not taken: the ring no longer matches our books; refuse every later call
+                broken_ = "io_uring_enter (submit): " + errstr(errno);
+                throw IOFailure("DirectReader: " + broken_);
             }
             left -= static_cast<unsigned>(r);
             inflight_ += r;
@@ -282,7 +305,9 @@ class DirectReader {
         int got = 0;
         while (head != tail) {
             io_uring_cqe* c = &cqes_[head & cq_mask_];
-            complete(static_cast<unsigned>(c->user_data), c->res);
+            int res = c->res;
+            if (++completions_ == fault_at_) res = fault_res_;
+            complete(static_cast<unsigned>(c->user_data), res);
             ++head;
             ++got;
         }
@@ -298,11 +323,11 @@ class DirectReader {
         if (it == reqs_.end()) return;          // closed / forgotten
         Req& r = it->second;
         if (res < 0) {
-            fail(r, "read of " + std::to_string(c.len) + " bytes at offset " + std::to_string(c.off) + ": " +
+            fail(c.req, r, "read of " + std::to_string(c.len) + " bytes at offset " + std::to_string(c.off) + ": " +
                         errstr(-res));
         } else if (res < c.len && c.off + res < r.end) {
             if (res == 0 || res % 512) {            // end of file (or a torn tail) before the bytes asked for
-                fail(r, "short read at offset " + std::to_string(c.off + res) + ": the file ends before byte " +
+                fail(c.req, r, "short read at offset " + std::to_string(c.off + res) + ": the file ends before byte " +
                             std::to_string(r.end) + " (request at offset " + std::to_string(r.offset) + ")");
             } else {                                // a partial read: the rest goes again, still aligned
                 queue_.push_front(Chunk{c.req, c.off + res, c.dst + res, c.len - res});
@@ -312,20 +337,29 @@ class DirectReader {
         --r.left;
     }
 
-    void fail(Req& r, const std::string& why) {
+    // The request fails as a whole: its chunks still queued here are dropped (never submitted, so nothing more of it
+    // lands in its buffer); those in the kernel are waited for (left counts them) before anyone is told.
+    void fail(int64_t id, Req& r, const std::string& why) {
         if (!r.failed) {
             r.failed = true;
             r.err = "DirectReader " + path_ + ": " + why;
         }
+        auto keep = std::remove_if(queue_.begin(), queue_.end(), [&](const Chunk& q) { return q.req == id; });
+        r.left -= static_cast<int64_t>(queue_.end() - keep);
+        queue_.erase(keep, queue_.end());
     }
 
-    // GIL released: reap and top up until request id has finished (or failed).
+    // GIL released: reap and top up until every chunk of request id has completed or been dropped (a failed request
+    // too: nothing of it is in flight when this returns).
     void drive(int64_t id) {
         for (;;) {
             auto it = reqs_.find(id);
-            if (it == reqs_.end() || it->second.left == 0 || (it->second.failed && inflight_ == 0)) return;
+            if (it == reqs_.end() || it->second.left == 0) return;
             push();
-            if (reap(true) < 0 && queue_.empty()) return;
+            if (reap(true) < 0 && queue_.empty()) {
+                throw std::logic_error("DirectReader: request " + std::to_string(id) + " has chunks left but none "
+                                       "in flight or queued");
+            }
         }
     }
 
@@ -344,7 +378,9 @@ class DirectReader {
 
     std::string path_;
     int fd_ = -1, ring_ = -1;
-    int64_t size_ = -1, chunk_ = 0, issued_ = 0, inflight_ = 0;
+    int64_t size_ = -1, chunk_ = 0, issued_ = 0, inflight_ = 0, completions_ = 0, fault_at_ = 0;
+    int fault_res_ = 0;
+    std::string broken_;
     unsigned qd_ = 0, sq_entries_ = 0;
     bool single_ = false;
     void *sq_ptr_ = nullptr, *cq_ptr_ = nullptr;
@@ -376,5 +412,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_property_readonly("size", &DirectReader::size)
         .def_property_readonly("queue_depth", &DirectReader::queue_depth)
         .def_property_readonly("chunk", &DirectReader::chunk)
-        .def_property_readonly("inflight", &DirectReader::inflight);
+        .def_property_readonly("inflight", &DirectReader::inflight)
+        .def_property_readonly("queued", &DirectReader::queued)
+        .def_property_readonly("completions", &DirectReader::completions)
+        .def("_inject_fault", &DirectReader::inject_fault, py::arg("nth"), py::arg("res"));
 }

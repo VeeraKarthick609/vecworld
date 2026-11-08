@@ -19,12 +19,14 @@ O_DIRECT reads through io_uring, so they never stay resident in RAM (Task 10b, d
   streamer says that block's copy has run (copy_done, the reader's contract in docs/engine/10-streamer.md).
 """
 import time
+import weakref
 from dataclasses import dataclass, field
 
 import torch
 
+from vecworld.engine.slots import ALIGN as SLOT_ALIGN   # resident tensors keep the slots' alignment in the residue
+
 ALIGN = 4096            # O_DIRECT: offsets, lengths and addresses in multiples of this (the NVMe's block is 512)
-SLOT_ALIGN = 256        # engine.slots.ALIGN: resident tensors keep their 16-byte alignment in the residue buffer
 
 
 def _ext():
@@ -59,6 +61,25 @@ class DirectReader:
     @property
     def size(self) -> int:
         return self._r.size
+
+    @property
+    def inflight(self) -> int:
+        """Chunks in the kernel now."""
+        return self._r.inflight
+
+    @property
+    def queued(self) -> int:
+        """Chunks waiting here for room in the kernel's queue."""
+        return self._r.queued
+
+    @property
+    def completions(self) -> int:
+        """Chunk completions reaped so far."""
+        return self._r.completions
+
+    def _inject_fault(self, nth: int, res: int) -> None:
+        """Test hook: the nth chunk completion from now is reported as `res` (-errno, or a short byte count)."""
+        self._r._inject_fault(nth, res)
 
     def close(self) -> None:
         self._r.close()
@@ -242,6 +263,10 @@ class SsdSource:
         except BaseException:
             self._unpin()
             raise
+        # Collected without close(): the reads in flight are waited for before the buffers are unpinned and freed (the
+        # finalizer holds the buffers, so they outlive the reader's close()).
+        self._finalizer = weakref.finalize(self, SsdSource._release, self._reader, self._pinned,
+                                           (self._stage_raw, self._res_raw))
         base = self._stage.data_ptr()
         self._buf = [base + k * self.buf_bytes for k in range(buffers)]
         self._res_ptr = self._res.data_ptr()
@@ -285,10 +310,14 @@ class SsdSource:
             self._start(kk, j)
         req = self._req[k]
         if req is not None:
-            if not self._reader.done(req):
-                t = time.perf_counter()
-                self._reader.wait(req)                      # GIL released while the SSD catches up
-                self.stats["read_wait_s"] += time.perf_counter() - t
+            try:
+                if not self._reader.done(req):
+                    t = time.perf_counter()
+                    self._reader.wait(req)                  # GIL released while the SSD catches up
+                    self.stats["read_wait_s"] += time.perf_counter() - t
+            except OSError:
+                self._forget(k)                             # the next source(i) reads the block again
+                raise
             self._req[k] = None
         self._handed[k] = i
         g = self._gathers.get((i, k))
@@ -313,11 +342,22 @@ class SsdSource:
         self.stats["reads"] += 1
         self.stats["bytes"] += nbytes
 
+    def _forget(self, k: int) -> None:
+        """Buffer k holds nothing (its read failed: every chunk of it has completed or been dropped)."""
+        blk = self._block[k]
+        if blk is not None and self._where.get(blk) == k:
+            del self._where[blk]
+        self._block[k] = self._req[k] = self._handed[k] = None
+
     def _usable(self, k: int) -> bool:
         req = self._req[k]
         if req is not None:
-            if not self._reader.done(req):
-                return False
+            try:
+                if not self._reader.done(req):
+                    return False
+            except OSError:                                 # a read-ahead that failed: nobody wants it yet
+                self._forget(k)
+                return True
             self._req[k] = None
         h = self._handed[k]
         if h is not None:
@@ -347,25 +387,37 @@ class SsdSource:
                 return best
             if not urgent:
                 return None
+            if self._st is None:
+                raise RuntimeError("SsdSource: bind(streamer) first: every buffer is handed out, and only the "
+                                   "streamer's copy_done can say when one may be read into again")
             if t0 is None:
                 t0 = time.perf_counter()
             time.sleep(0.0002)                              # a copy (GPU) or a read (SSD) to finish; GIL released
 
-    def _unpin(self) -> None:
-        if self._pinned:
+    @staticmethod
+    def _unpin_all(pinned: list[int]) -> None:
+        if pinned:
             from vecworld.engine.stream import _unregister
 
-            for p in self._pinned:
-                _unregister(p)
-            self._pinned = []
+            while pinned:
+                _unregister(pinned.pop())
+
+    def _unpin(self) -> None:
+        SsdSource._unpin_all(self._pinned)
+
+    @staticmethod
+    def _release(reader, pinned: list[int], buffers) -> None:
+        """Close the reader (it waits for the reads in flight), then unpin; `buffers` are held until then. If the
+        reader can't be closed, the buffers stay pinned rather than be freed under a read."""
+        if reader is not None:
+            reader.close()
+        SsdSource._unpin_all(pinned)
 
     def close(self) -> None:
         """Wait for the reads in flight and unregister the buffers (safe twice)."""
         try:
-            if self._reader is not None:
-                self._reader.close()
+            self._finalizer()
         finally:
-            self._unpin()
             self._gathers.clear()
             self._where.clear()
             self._st = None
@@ -379,7 +431,8 @@ def ssd_source(gguf_path, layout: list[BlockFile], **kw) -> SsdSource:
 
 def drop_file_cache(root) -> int:
     """Ask the kernel to drop the clean page cache of every regular file under root (posix_fadvise DONTNEED; symlinks
-    skipped; no sudo, nothing deleted). Returns the bytes advised. The game calls it on the model cache once its models
+    skipped; no sudo, nothing deleted). Returns the size of the files advised (not what was dropped: pages still mapped
+    or dirty stay). The game calls it on the model cache once its models
     are loaded: the loads leave ~4.5 GB of model files cached, and with that much clean cache beside the painter and
     the dreamer the kernel was seen swapping 0.48 GB of the server out at the first walk step (MemAvailable 5.3 GB);
     started without it, a walk swapped nothing (docs/engine/11-io-uring.md)."""

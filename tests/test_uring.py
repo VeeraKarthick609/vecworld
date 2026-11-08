@@ -129,6 +129,55 @@ def test_uring_short_read_raises(ssd_dir):
         r.read_into(0, 10, torch.empty(10, dtype=torch.uint8))
 
 
+@pytest.mark.parametrize("qd, nth, res, what", [(1, 1, -5, "Input/output error"), (1, 3, -5, "Input/output error"),
+                                                (4, 3, -5, "Input/output error"), (1, 2, 1000, "short read"),
+                                                (4, 16, 0, "short read")])
+def test_uring_failed_chunk_fails_the_whole_request(ssd_dir, qd, nth, res, what):
+    """A request whose chunk fails (an injected EIO, or a torn / empty read in the middle of the file) fails as a whole:
+    wait() raises naming the offset, and only once every chunk of it has completed or been dropped, so nothing of it is
+    in the kernel or queued afterwards and no completion can still land in its buffer; done() raises the same, every
+    time. 16 chunks through 1 or 4 queue slots: most of the request is still queued when the chunk fails (with one
+    slot the failing completion is the only one in flight, the case that returned as if the read had succeeded)."""
+    from vecworld.engine.uring import DirectReader
+
+    path, data = _file(ssd_dir, 2**20)
+    r = DirectReader(str(path), queue_depth=qd, chunk=64 << 10)
+    try:
+        dst = _aligned(2**20)
+        i = r.submit(0, 2**20, 2**20, dst.data_ptr())
+        r._inject_fault(nth, res)
+        with pytest.raises(IOError, match=rf"{what}") as ei:
+            r.wait(i)
+        assert "offset" in str(ei.value)
+        assert r.inflight == 0 and r.queued == 0
+        seen = r.completions
+        with pytest.raises(IOError, match=what):
+            r.done(i)
+        assert r.completions == seen and r.inflight == 0 and r.queued == 0   # no completion arrives afterwards
+        out = torch.empty(5000, dtype=torch.uint8)
+        r.read_into(100, 5000, out)                     # the reader still works
+        assert bytes(out.numpy()) == data[100:5100]
+    finally:
+        r.close()
+
+
+def test_uring_partial_read_is_read_again(ssd_dir):
+    """O_DIRECT may return fewer bytes than asked mid-file (a multiple of the block size): the rest is read again and
+    the request succeeds with every byte in place."""
+    from vecworld.engine.uring import DirectReader
+
+    path, data = _file(ssd_dir, 2**20)
+    r = DirectReader(str(path), queue_depth=1, chunk=64 << 10)
+    try:
+        dst = _aligned(2**20)
+        i = r.submit(0, 2**20, 2**20, dst.data_ptr())
+        r._inject_fault(2, 8192)
+        r.wait(i)
+        assert bytes(dst.numpy()) == data and r.completions == 17
+    finally:
+        r.close()
+
+
 def test_uring_missing_file_raises(ssd_dir):
     from vecworld.engine.uring import DirectReader
 
@@ -343,3 +392,27 @@ def test_drop_file_cache_advises_every_regular_file_once(ssd_dir):
     assert drop_file_cache(ssd_dir) == 40_000
     assert a.read_bytes() == da and b.read_bytes() == db
     assert drop_file_cache(ssd_dir / "missing") == 0
+
+
+def test_ssd_source_recovers_from_a_failed_read_and_refuses_to_run_unbound(ssd_dir):
+    """A block read that fails raises OSError from source(i), and the buffer is forgotten, so the next source(i)
+    reads the block again (the painter isn't dead until a restart). An SsdSource that was never bind()-ed to its
+    streamer can't tell when a handed-out buffer is free: once it would have to wait for one, it raises instead of
+    waiting forever."""
+    from vecworld.engine.uring import SsdSource
+
+    sizes = [300_000, 123_457, 500_001]
+    path, data = _file(ssd_dir, 54048 + sum(sizes) + 999, seed=4)
+    lay = _toy_layout(path, sizes)
+    src = SsdSource(str(path), lay, buffers=2, ahead=0, pin=False, queue_depth=1, chunk=64 << 10)
+    try:
+        src._reader._inject_fault(1, -5)
+        with pytest.raises(IOError, match="Input/output error"):
+            src(0)
+        assert src.buffer_of(0) is None
+        assert _gathered(src(0))[0] == data[54048:54048 + sizes[0]]
+        src(1)                                          # both buffers handed out, nobody to say their copies are done
+        with pytest.raises(RuntimeError, match="bind"):
+            src(2)
+    finally:
+        src.close()

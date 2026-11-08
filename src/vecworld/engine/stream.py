@@ -1,5 +1,6 @@
-r"""The layer streamer: every FLUX block's weights in one page-locked host arena, streamed block by block through a
-ring of fixed-address device slots (Task 10a, docs/engine/10-streamer.md).
+r"""The layer streamer: every FLUX block's weights streamed block by block through a ring of fixed-address device
+slots, from one page-locked host arena (Task 10a, docs/engine/10-streamer.md) or read from the GGUF on the SSD
+(Task 10b, engine.uring, docs/engine/11-io-uring.md).
 
 Built on Task 7's BlockSlots (engine.slots), which already keeps the ring, the side stream and the events. What the
 streamer changes is where a block's bytes come from:
@@ -158,6 +159,8 @@ class BlockStreamer(BlockSlots):
         self._pending: deque = deque()                      # (ticket, source object) of copies maybe still running
         self._src = None                                    # the source object _copies just took
         self._info: dict[int, tuple] = {}                   # id(source) -> (weakref to it, address, bytes)
+        self._gathers: dict[int, tuple] = {}                # id(Gather) -> (weakref, block, copies with slot addresses)
+        self._tbytes = [sum(t.numel() * t.element_size() for t in _tensors(b).values()) for b in self.blocks]
 
     @classmethod
     def packed(cls, blocks: list[torch.nn.Module], ring: int = 2, device="cuda") -> "BlockStreamer":
@@ -221,35 +224,47 @@ class BlockStreamer(BlockSlots):
         # Called per block in the hot loop: what a source object is (address, size, page-locked) is worked out once
         # per object; a PyTorch call here (a slice, numel()) would release the GIL (see the module docstring).
         src = self.source(i)
-        e = self._info.get(id(src))
-        if e is None or e[0]() is not src or (e[2] is None and e[3] != i):
-            e = self._inspect(i, src)
-        if e[2] is None:                                    # a Gather: its copies, slot addresses in
+        if type(src) is Gather:                             # its copies, checked once per (object, block)
+            g = self._gathers.get(id(src))
+            if g is None or g[0]() is not src or g[1] != i:
+                g = self._inspect_gather(i, src)
             self._src = src
-            return e[1]
-        _, ptr, n, _ = e
+            return g[2]
+        e = self._info.get(id(src))
+        if e is None or e[0]() is not src:
+            e = self._inspect(i, src)
+        _, ptr, n = e
         if n != self.nbytes[i]:
             raise ValueError(f"block {i}: source gave {n} bytes; the block's layout is {self.nbytes[i]} bytes")
         self._src = src
         return [self._slot_ptr[i % self.ring], ptr, n]
 
+    def _inspect_gather(self, i: int, src: "Gather") -> tuple:
+        """(weakref, block, flat copies with slot addresses): every copy inside the block, page-locked, no two
+        overlapping, and together exactly the block's tensors' bytes (a tensor missed would keep the previous
+        block's bytes in its slot range)."""
+        c, base, flat, spans = src.copies, self._slot_ptr[i % self.ring], [], []
+        if len(c) % 3:
+            raise ValueError(f"block {i}: a Gather's copies must be (slot offset, host address, bytes) triples")
+        for k in range(0, len(c), 3):
+            so, hp, n = c[k], c[k + 1], c[k + 2]
+            if so < 0 or n < 0 or so + n > self.nbytes[i]:
+                raise ValueError(f"block {i}: a copy of {n} bytes to slot offset {so} runs outside the block's "
+                                 f"{self.nbytes[i]} bytes")
+            if n and not self._ext.host_pinned(hp, n):
+                raise ValueError(f"block {i}: a Gather copy's bytes at {hp:#x} are not page-locked")
+            spans.append((so, n))
+            flat += [base + so, hp, n]
+        spans.sort()
+        if any(a + na > b for (a, na), (b, _) in zip(spans, spans[1:])) or sum(n for _, n in spans) != self._tbytes[i]:
+            raise ValueError(f"block {i}: a Gather's copies must cover the block's tensors exactly "
+                             f"({sum(n for _, n in spans)} bytes copied, {self._tbytes[i]} in its tensors, or overlapping)")
+        if len(self._gathers) > 4 * self.n:
+            self._gathers = {k: v for k, v in self._gathers.items() if v[0]() is not None}
+        g = self._gathers[id(src)] = (weakref.ref(src), i, flat)
+        return g
+
     def _inspect(self, i: int, src) -> tuple:
-        if isinstance(src, Gather):
-            c, base, flat = src.copies, self._slot_ptr[i % self.ring], []
-            if len(c) % 3:
-                raise ValueError(f"block {i}: a Gather's copies must be (slot offset, host address, bytes) triples")
-            for k in range(0, len(c), 3):
-                so, hp, n = c[k], c[k + 1], c[k + 2]
-                if so < 0 or n < 0 or so + n > self.nbytes[i]:
-                    raise ValueError(f"block {i}: a copy of {n} bytes to slot offset {so} runs outside the block's "
-                                     f"{self.nbytes[i]} bytes")
-                if n and not self._ext.host_pinned(hp, n):
-                    raise ValueError(f"block {i}: a Gather copy's bytes at {hp:#x} are not page-locked")
-                flat += [base + so, hp, n]
-            if len(self._info) > 4 * self.n:
-                self._info = {k: v for k, v in self._info.items() if v[0]() is not None}
-            e = self._info[id(src)] = (weakref.ref(src), flat, None, i)
-            return e
         if isinstance(src, torch.Tensor):
             if src.device.type != "cpu" or not src.is_contiguous():
                 raise ValueError(f"block {i}: source gave a {src.device} tensor, contiguous {src.is_contiguous()}; "
@@ -264,10 +279,10 @@ class BlockStreamer(BlockSlots):
         try:
             ref = weakref.ref(src)                          # never keeps a source alive (a reader's buffers)
         except TypeError:                                   # (a memoryview: worked out again each time, numpy only)
-            return (lambda: src), ptr, n, i
+            return (lambda: src), ptr, n
         if len(self._info) > 4 * self.n:                    # sources that come and go
             self._info = {k: v for k, v in self._info.items() if v[0]() is not None}
-        e = self._info[id(src)] = (ref, ptr, n, i)
+        e = self._info[id(src)] = (ref, ptr, n)
         return e
 
     def load(self, i: int) -> int:
@@ -307,3 +322,4 @@ class BlockStreamer(BlockSlots):
         super().close()
         self._pending.clear()
         self._info.clear()
+        self._gathers.clear()

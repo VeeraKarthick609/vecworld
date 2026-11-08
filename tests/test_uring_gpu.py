@@ -108,3 +108,40 @@ def test_flux_from_ssd_matches():
     assert np.array_equal(np.asarray(ssd[0]), np.asarray(ram[0]))
     assert np.array_equal(np.asarray(ssd[2]), np.asarray(ram[2]))
     assert ssd[4] < 1e9 < 6e9 < ram[4]
+
+
+def test_gather_must_cover_the_block_exactly():
+    """A Gather whose copies miss a tensor (the slot would keep the previous block\x27s bytes there) or overlap is
+    refused when the block\x27s copy is issued (ValueError), as a copy outside the block is; an exact one streams."""
+    from vecworld.engine.slots import _tensors, block_layout
+    from vecworld.engine.stream import BlockStreamer, Gather, HostArena
+
+    from test_graphs import _toys
+
+    blocks, _ = _toys(3)
+    a = HostArena(blocks)
+    lays = [block_layout(b) for b in blocks]
+
+    def exact(i):
+        lay, base = lays[i][0], a.block(i).data_ptr()
+        out = []
+        for name, t in _tensors(blocks[i]).items():
+            out += [lay[name], base + lay[name], t.numel() * t.element_size()]
+        return out
+
+    bad = {"miss": lambda c: c[3:], "overlap": lambda c: c + c[:3]}
+    for kind, f in [("exact", lambda c: c), *bad.items()]:
+        keep = {i: Gather(f(exact(i)), a) for i in range(3)}
+        st = BlockStreamer(blocks, lambda i: keep[i], ring=3)
+        st.install()
+        try:
+            if kind == "exact":
+                for i in range(3):
+                    st.load(i)
+                torch.cuda.synchronize()
+            else:
+                with pytest.raises(ValueError, match="cover"):
+                    st.load(0)
+        finally:
+            st.close()
+    a.close()

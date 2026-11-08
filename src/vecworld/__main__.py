@@ -65,7 +65,7 @@ def main() -> None:
     from vecworld.config import _HF_HUB
     from vecworld.engine.uring import drop_file_cache
 
-    log.info("dropped %.1f GB of model files from the page cache", drop_file_cache(_HF_HUB) / 1e9)
+    log.info("advised the kernel to drop %.1f GB of model files from the page cache", drop_file_cache(_HF_HUB) / 1e9)
     uvicorn.run(create_app(service, WEB_DIR), host="0.0.0.0", port=8080)
 
 
