@@ -17,7 +17,7 @@ torch::Tensor glue_gated_residual(torch::Tensor res, torch::Tensor y, torch::Ten
 void glue_qk_norm_rope(torch::Tensor x, c10::optional<torch::Tensor> weight, torch::Tensor cos, torch::Tensor sin,
                        torch::Tensor out, int64_t offset, double eps);
 
-void register_stream(pybind11::module& m);   // stream.cpp: SlotRing, host_pinned
+void register_stream(pybind11::module& m);   // stream.cpp: SlotRing, host_pinned, graph_launch
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     register_stream(m);

@@ -98,6 +98,7 @@ class BlockSlots:
         self.loaded: list[int | None] = [None] * ring       # the block each slot holds (or is receiving)
         self._used = [False] * ring
         self._hooks: list = []
+        self._ring = None                                   # the extension's SlotRing while installed
         self._views: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
         self.copies = 0
         # Blocks whose after() holds back the prefetch of their slot's next user until release(i) (engine.cache: block
@@ -108,39 +109,62 @@ class BlockSlots:
 
     def install(self) -> None:
         """Allocate the slots, make every block's tensors views into its slot and hook the blocks (a no-op while
-        installed)."""
+        installed). Everything that can fail (the extension, the side stream, the SlotRing, the slots' memory, the
+        alignment checks, the copy lists) happens before any block tensor is repointed; if repointing or hooking
+        fails, the tensors and hooks are put back. A failed install() leaves the blocks as they were."""
         from vecworld.engine.ext import load_ext
 
         if self._hooks:
             return
         ring = self.ring
-        self.slots = [torch.empty(self.slot_bytes, dtype=torch.uint8, device=self.device) for _ in range(ring)]
-        # (block tensor, slot view) per block: what the block's tensors are while installed
-        self._views = []
-        for i, b in enumerate(self.blocks):
-            slot, views = self.slots[i % ring], []
-            for name, t in _tensors(b).items():
-                off, nb = self._layout[i][name], t.numel() * t.element_size()
-                view = slot[off:off + nb].view(t.dtype).view(t.shape)
-                if nb:
-                    check_aligned(view, f"block {i} {name} in slot {i % ring} (offset {off})")
-                views.append((t, view))
-            self._views.append(views)
-        self._installed()
-        for views in self._views:
-            for t, view in views:
-                t.data = view
-        self.stream = torch.cuda.Stream(self.device)
-        self._ring = load_ext().SlotRing(ring, self.stream.cuda_stream, self.device.index)
+        try:
+            self._ext = load_ext()
+            self.stream = torch.cuda.Stream(self.device)
+            self._ring = self._ext.SlotRing(ring, self.stream.cuda_stream, self.device.index)
+            self.slots = [torch.empty(self.slot_bytes, dtype=torch.uint8, device=self.device) for _ in range(ring)]
+            # (block tensor, slot view) per block: what the block's tensors are while installed
+            self._views = []
+            for i, b in enumerate(self.blocks):
+                slot, views = self.slots[i % ring], []
+                for name, t in _tensors(b).items():
+                    off, nb = self._layout[i][name], t.numel() * t.element_size()
+                    view = slot[off:off + nb].view(t.dtype).view(t.shape)
+                    if nb:
+                        check_aligned(view, f"block {i} {name} in slot {i % ring} (offset {off})")
+                    views.append((t, view))
+                self._views.append(views)
+            self._prepare_copies()
+        except BaseException:
+            self._teardown()
+            raise
+        swapped, hooks = [], []
+        try:
+            for views in self._views:
+                for t, view in views:
+                    swapped.append((t, t.data))
+                    t.data = view
+            # always_call: the slot is released after a block whose forward raised too, ordered after whatever
+            # kernels it queued, so a later copy into the slot can't overwrite weights they still read
+            for i, b in enumerate(self.blocks):
+                hooks.append(b.register_forward_pre_hook(lambda m, a, i=i: self.before(i)))
+                hooks.append(b.register_forward_hook(lambda m, a, o, i=i: self.after(i), always_call=True))
+        except BaseException:
+            for h in hooks:
+                h.remove()
+            for t, old in reversed(swapped):
+                t.data = old
+            self._teardown()
+            raise
         self.loaded, self._used = [None] * ring, [False] * ring
         self._held.clear()
-        # always_call: the slot is released after a block whose forward raised too, ordered after whatever kernels
-        # it queued, so a later copy into the slot can't overwrite weights they still read
-        self._hooks = [h for i, b in enumerate(self.blocks) for h in (
-            b.register_forward_pre_hook(lambda m, a, i=i: self.before(i)),
-            b.register_forward_hook(lambda m, a, o, i=i: self.after(i), always_call=True))]
+        self._hooks = hooks
 
-    def _installed(self) -> None:
+    def _teardown(self) -> None:
+        """Drop what install() made (the blocks' tensors must not view the slots any more)."""
+        self.slots, self._views, self.loaded = [], [], [None] * self.ring
+        self._ring = None
+
+    def _prepare_copies(self) -> None:
         """Called by install() before the blocks' tensors become slot views: the per-tensor copy lists (device view,
         host tensor, bytes), fixed for the run."""
         self._flat = []
@@ -165,12 +189,14 @@ class BlockSlots:
         j = i + self.ring
         return j if j < self.n else i % self.ring
 
-    def load(self, i: int) -> None:
-        """Copy block i's tensors into its slot on the side stream, after the slot's last user is done."""
+    def load(self, i: int) -> int:
+        """Copy block i's tensors into its slot on the side stream, after the slot's last user is done. Returns the
+        copy's ticket (SlotRing: 1, 2, 3, ... in issue order)."""
         s = i % self.ring
-        self._ring.load(s, self._used[s], self._copies(i))
+        ticket = self._ring.load(s, self._used[s], self._copies(i))
         self.loaded[s] = i
         self.copies += 1
+        return ticket
 
     def before(self, i: int) -> None:
         """Block i is about to run: make the current stream wait for its weights. The slots' bookkeeping and event
@@ -225,5 +251,4 @@ class BlockSlots:
             back = self._restore(i)
             for name, t in _tensors(b).items():
                 t.data = back[name]
-        self.slots, self._views, self.loaded = [], [], [None] * self.ring
-        self._ring = None
+        self._teardown()

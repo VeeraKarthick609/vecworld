@@ -197,55 +197,193 @@ def test_graph_launch_keeps_the_gil():
     assert ours < 1e-3
 
 
-# VmHWM, this process' own peak: getrusage's ru_maxrss carries the parent's peak over fork + exec (pytest's, after
-# the modules before it loaded a transformer from a memory-mapped file).
-PAINTER_RSS = """
-import sys
-import vecworld.engine.stream as stream
-if sys.argv[1] == "notrim":
-    stream._trim = lambda: None
-from vecworld.flux.painter import FluxPainter
-p = FluxPainter()
-hwm = [int(x.split()[1]) for x in open("/proc/self/status") if x.startswith("VmHWM:")][0] * 1024
-print("RESULT", hwm, p._arena.nbytes, flush=True)
-p.close()
-"""
+def test_reader_may_reuse_a_buffer_only_once_its_copy_is_done():
+    """The 10b reader's contract: the bytes source(i) handed over may be changed once copy_done(i) is True, and not
+    before. A reader that gives each block a fresh page-locked buffer and scribbles on every buffer whose copy is done
+    (while the GPU is held back, so the copies queue up) must leave every block computing on its own weights; the
+    streamer keeps each buffer alive until its copy has run; and copy_done(i) is False from inside source(i) on (a
+    reader thread that asks in the window between handing the bytes over and the copy being issued)."""
+    import weakref
+
+    from vecworld.engine.stream import BlockStreamer, HostArena
+
+    from test_graphs import Toy, _toys
+
+    blocks, _ = _toys(6)
+    ref = [Toy(i).cuda() for i in range(6)]
+    a = HostArena(blocks)
+    handed, early = [], []                                  # (block, weakref to its buffer); copy_done inside source
+
+    def source(i):
+        early.append(st.copy_done(i))
+        buf = torch.empty(a.sizes[i], dtype=torch.uint8, pin_memory=True)
+        buf.copy_(a.block(i))
+        handed.append((i, weakref.ref(buf)))
+        return buf                                          # the reader keeps no reference of its own
+
+    st = BlockStreamer(blocks, source, ring=3)
+    st.install()
+    x = torch.randn(8, 64, device="cuda").bfloat16()
+    outs = []
+    with torch.inference_mode():
+        for _ in range(3):                                  # three passes, the GPU held back before every block
+            for i in range(6):
+                torch.cuda._sleep(2_000_000)
+                outs.append((i, blocks[i](x)))
+        # the reader, before any sync: reuse every buffer whose copy is done. The k-th source() call is the k-th
+        # load, ticket k + 1 (BlockStreamer.load returns it; the hooks issue them in this order)
+        assert st._ring.issued() == len(handed)
+        for k, (i, ref_buf) in enumerate(handed):
+            buf, done = ref_buf(), st.done(k + 1)
+            if done and buf is not None:
+                buf.fill_(0xFF)
+            elif not done:
+                assert buf is not None, f"block {i}'s buffer (load {k + 1}) was released before its copy ran"
+            if k + 1 == st._ticket[i]:
+                assert st.copy_done(i) == done
+        pending = sum(not st.done(k + 1) for k in range(len(handed)))
+        torch.cuda.synchronize()
+        for i, y in outs:
+            assert torch.equal(y, ref[i](x)), i
+    assert early and not any(early)
+    assert pending > 0                                      # copies were still queued when the reader looked
+    st.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        st.copy_done(0)
+    a.close()
 
 
-def _painter_rss(mode="trim"):
-    import os
-    import subprocess
-    import sys
+def test_failed_install_leaves_the_blocks_and_frees_the_arena(monkeypatch):
+    """BlockStreamer.packed(): an install() that fails (here the SlotRing; on the 4 GB card most likely the slots'
+    cudaMalloc) leaves every block on its host tensors and the arena unregistered (a registered range freed later
+    breaks other copies); a BlockSlots / BlockStreamer whose install() fails leaves the blocks' tensors as they were."""
+    from types import SimpleNamespace as NS
 
-    _trim()                         # hand the freed memory of earlier tests back first: two processes share 14 GB
-    env = {k: v for k, v in os.environ.items() if not k.startswith("VECWORLD_")}
-    out = subprocess.run([sys.executable, "-c", PAINTER_RSS, mode], capture_output=True, text=True, env=env,
-                         timeout=900)
-    line = [x for x in out.stdout.splitlines() if x.startswith("RESULT")]
-    assert line, out.stderr[-2000:]
-    peak, arena = map(int, line[0].split()[1:])
-    return peak, arena
+    import vecworld.engine.ext as ext_mod
+    from vecworld.engine.stream import BlockStreamer, HostArena
+
+    from test_graphs import _toys
+
+    real = ext_mod.load_ext()
+
+    class Boom:
+        def __init__(self, *a):
+            raise RuntimeError("SlotRing failed")
+
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: NS(SlotRing=Boom, host_pinned=real.host_pinned))
+    blocks, host = _toys(4)
+    with pytest.raises(RuntimeError, match="SlotRing failed"):
+        BlockStreamer.packed(blocks, ring=2)
+    for b in blocks:
+        for t in (*b.parameters(), *b.buffers()):
+            assert t.device.type == "cpu"
+            assert not real.host_pinned(t.data_ptr(), t.numel() * t.element_size())
+    for b, h in zip(blocks, host):
+        assert torch.equal(b.w, h["w"])
+    a = HostArena(blocks)
+    st = BlockStreamer(blocks, a.block, ring=2)
+    before = [t.data_ptr() for b in blocks for t in b.parameters()]
+    with pytest.raises(RuntimeError, match="SlotRing failed"):
+        st.install()
+    assert [t.data_ptr() for b in blocks for t in b.parameters()] == before and not st._hooks
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: real)
+    st.install()                                            # and a later install works
+    x = torch.randn(8, 64, device="cuda").bfloat16()
+    with torch.inference_mode():
+        assert blocks[0](x).isfinite().all()
+    st.close()
+    a.close()
 
 
-def test_painter_packs_the_arena_without_a_second_copy():
-    """FluxPainter reads the GGUF into ordinary host memory and packs it into the arena block by block: the process'
-    peak resident memory stays about one model (arena + ~1 GB of the rest), not two (13.8 GB, OOM-killed on this 14 GB
-    laptop, when glibc kept the freed copies). Measured in a fresh process, before this module loads its transformer."""
-    peak, arena = _painter_rss()
-    print(f"\npeak RSS {peak / 1e9:.2f} GB, arena {arena / 1e9:.3f} GB")
-    assert arena > 6e9 and peak < arena + 2e9
+class Sleepy(torch.nn.Module):
+    """A toy block that holds the GPU back, then reads its weight into a buffer kept outside it, then (once) raises."""
+
+    def __init__(self, i, n=256):
+        super().__init__()
+        g = torch.Generator().manual_seed(i)
+        self.w = torch.nn.Parameter(torch.randn(n, n, generator=g).bfloat16(), requires_grad=False)
+        self.out = None
+        self.boom = False
+
+    def forward(self, x):
+        torch.cuda._sleep(50_000_000)                      # tens of ms: the next copy would overtake it
+        self.out = x @ self.w.T
+        if self.boom:
+            raise RuntimeError("boom")
+        return self.out
+
+
+def test_a_raising_block_keeps_its_slot_until_its_kernels_have_read_it():
+    """after() runs for a block whose forward raised (always_call), so its slot's next copy waits for the kernels it
+    queued: the raising block's queued output is still computed from its own weights, even though the slot's next
+    user runs straight after it (without always_call that copy waits only for the slot's previous pass and overwrites
+    the weights under the sleeping kernel)."""
+    from vecworld.engine.stream import BlockStreamer, HostArena
+
+    blocks = [Sleepy(i) for i in range(4)]
+    ref = [b.w.detach().clone().cuda() for b in blocks]
+    a = HostArena(blocks)
+    st = BlockStreamer(blocks, a.block, ring=2)
+    st.install()
+    x = torch.randn(64, 256, device="cuda").bfloat16()
+    with torch.inference_mode():
+        for b in blocks:                                    # a first pass: every slot used once
+            b(x)
+        torch.cuda.synchronize()
+        blocks[0].boom = True
+        with pytest.raises(RuntimeError, match="boom"):
+            blocks[0](x)
+        kept = blocks[0].out
+        blocks[2](x)                                        # slot 0's next user, at once
+        torch.cuda.synchronize()
+        assert torch.equal(kept, x @ ref[0].T)
+    st.close()
+    a.close()
+
+
+def test_graph_capture_refuses_a_block_that_draws_random_numbers():
+    """graph_launch skips CUDAGraph.replay()'s RNG prologue, so a captured block drawing random numbers would repeat
+    the capture's numbers on every replay: the runner refuses it at capture, naming the block; dropout_p = 0
+    attention and blocks without randomness capture as before."""
+    from vecworld.engine.graphs import GraphRunner
+
+    class Blk(torch.nn.Module):
+        def __init__(self, noise):
+            super().__init__()
+            self.noise = noise
+
+        def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb=None,
+                    joint_attention_kwargs=None):
+            h = hidden_states * 2
+            if self.noise == "rand":
+                h = h + torch.rand_like(h)
+            q = h.view(h.shape[0], 1, h.shape[1], h.shape[2])
+            h = torch.nn.functional.scaled_dot_product_attention(q, q, q, dropout_p=0.0).view_as(h)
+            return encoder_hidden_states, h
+
+    def call(b):
+        hs = torch.randn(1, 64, 128, device="cuda").bfloat16()
+        es = torch.randn(1, 8, 128, device="cuda").bfloat16()
+        temb = torch.randn(1, 128, device="cuda").bfloat16()
+        rot = (torch.ones(72, 128, device="cuda"), torch.zeros(72, 128, device="cuda"))
+        return b(hidden_states=hs, encoder_hidden_states=es, temb=temb, image_rotary_emb=rot)
+
+    ok, bad = Blk(None), Blk("rand")
+    r = GraphRunner([ok, bad], None, enabled=True)
+    call(ok)
+    assert r.stats["captures"] == 1
+    with pytest.raises(RuntimeError, match="block 1.*random"):
+        call(bad)
+    r.close()
 
 
 # --- the real model ---------------------------------------------------------------------------------------------------
 
 def _trim():
-    import ctypes
+    from vecworld.engine.stream import _trim as trim
 
     gc.collect()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except OSError:
-        pass
+    trim()
 
 
 @pytest.fixture(scope="module")
@@ -423,10 +561,20 @@ def test_stream_stop_then_reuse(fx):
         torch.cuda.synchronize()
         return out
 
+    from vecworld.engine.ext import load_ext
+
+    def pinned():
+        """torch's page-locked pool in use (a reader's or a stray pin_memory buffer), and whether the arena is still
+        registered with the driver (asked of the driver, not of the streamer)."""
+        st = torch.cuda.host_memory_stats()
+        return st.get("active_bytes.current", 0), load_ext().host_pinned(fx.st.arena.buf.data_ptr(),
+                                                                         fx.st.arena.nbytes)
+
     want = job()
     torch.cuda.synchronize()
-    mem0, pin0 = torch.cuda.memory_allocated(), fx.st.pinned_bytes
+    mem0, pin0 = torch.cuda.memory_allocated(), pinned()
     slots0 = [t.data_ptr() for t in fx.st.slots]
+    assert pin0[1]
 
     # 1. Stopped at check_stop between the two passes of step 1 (after pass 3)
     stop = threading.Event()
@@ -468,5 +616,5 @@ def test_stream_stop_then_reuse(fx):
     del got
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() == mem0
-    assert fx.st.pinned_bytes == pin0 and [t.data_ptr() for t in fx.st.slots] == slots0
+    assert pinned() == pin0 and [t.data_ptr() for t in fx.st.slots] == slots0
 

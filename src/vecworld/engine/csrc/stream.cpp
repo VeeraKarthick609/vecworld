@@ -11,7 +11,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 
+#include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -25,6 +27,11 @@ void check(cudaError_t e, const char* what) {
 // Per slot s: copied[s], recorded on the side stream after the copy into s; freed[s], recorded on the compute stream
 // after the block that read s. load waits freed (once the slot was used) before copying, before() makes the compute
 // stream wait copied.
+//
+// Every load also gets a ticket (1, 2, 3, ... in issue order) and its own event, so a reader can ask whether THAT copy
+// has finished reading its source (done(ticket)), however the slots have been reused since. The side stream runs its
+// copies in order, so tickets complete in order: done() retires finished events from the front of the queue and
+// keeps the highest finished ticket. The ticket is assigned inside load(), under the GIL, together with the record.
 class SlotRing {
   public:
     SlotRing(int64_t ring, int64_t side_stream, int64_t device)
@@ -42,12 +49,15 @@ class SlotRing {
     ~SlotRing() {
         for (auto e : copied_) cudaEventDestroy(e);
         for (auto e : freed_) cudaEventDestroy(e);
+        for (auto& p : pending_) cudaEventDestroy(p.second);
+        for (auto e : spare_) cudaEventDestroy(e);
     }
     SlotRing(const SlotRing&) = delete;
     SlotRing& operator=(const SlotRing&) = delete;
 
-    // copies: flat (device dst, host src, bytes) triples, all into slot s, after its last user if wait_freed
-    void load(int64_t s, bool wait_freed, const std::vector<int64_t>& copies) {
+    // copies: flat (device dst, host src, bytes) triples, all into slot s, after its last user if wait_freed; returns
+    // the load's ticket
+    int64_t load(int64_t s, bool wait_freed, const std::vector<int64_t>& copies) {
         TORCH_CHECK(copies.size() % 3 == 0, "SlotRing.load: copies must be (dst, src, bytes) triples");
         c10::cuda::CUDAGuard g(device_);
         if (wait_freed) check(cudaStreamWaitEvent(side_, freed_.at(s), 0), "cudaStreamWaitEvent");
@@ -57,7 +67,33 @@ class SlotRing {
                   "cudaMemcpyAsync");
         }
         check(cudaEventRecord(copied_.at(s), side_), "cudaEventRecord");
+        cudaEvent_t t;
+        if (spare_.empty()) {
+            check(cudaEventCreateWithFlags(&t, cudaEventDisableTiming), "cudaEventCreate");
+        } else {
+            t = spare_.back();
+            spare_.pop_back();
+        }
+        check(cudaEventRecord(t, side_), "cudaEventRecord");
+        pending_.emplace_back(++issued_, t);
+        return issued_;
     }
+    // whether load ticket's copy has finished (it no longer reads its source); a ticket not issued yet is not done
+    bool done(int64_t ticket) {
+        while (!pending_.empty()) {
+            cudaError_t e = cudaEventQuery(pending_.front().second);
+            if (e == cudaErrorNotReady) {
+                cudaGetLastError();
+                break;
+            }
+            check(e, "cudaEventQuery");
+            finished_ = pending_.front().first;
+            spare_.push_back(pending_.front().second);
+            pending_.pop_front();
+        }
+        return ticket <= finished_;
+    }
+    int64_t issued() const { return issued_; }
     // the current (compute) stream waits until slot s holds what was last loaded into it
     void before(int64_t s) {
         c10::cuda::CUDAGuard g(device_);
@@ -84,10 +120,12 @@ class SlotRing {
     c10::DeviceIndex device_;
     cudaStream_t side_;
     std::vector<cudaEvent_t> copied_, freed_;
+    std::deque<std::pair<int64_t, cudaEvent_t>> pending_;  // (ticket, its event) of copies not known finished
+    std::vector<cudaEvent_t> spare_;
+    int64_t issued_ = 0, finished_ = 0;
 };
 
-// whether host address ptr is page-locked (cudaHostAlloc'd or cudaHostRegister'ed): a copy from it is asynchronous
-bool host_pinned(int64_t ptr) {
+bool pinned_at(int64_t ptr) {
     cudaPointerAttributes a;
     cudaError_t e = cudaPointerGetAttributes(&a, reinterpret_cast<const void*>(ptr));
     if (e != cudaSuccess) {
@@ -95,6 +133,12 @@ bool host_pinned(int64_t ptr) {
         return false;
     }
     return a.type == cudaMemoryTypeHost;
+}
+
+// whether host bytes [ptr, ptr + nbytes) are page-locked (cudaHostAlloc'd or cudaHostRegister'ed): a copy from them is
+// asynchronous. Checks the first and the last byte (a buffer starting inside a registered range may run past it).
+bool host_pinned(int64_t ptr, int64_t nbytes) {
+    return pinned_at(ptr) && (nbytes <= 1 || pinned_at(ptr + nbytes - 1));
 }
 
 // Launch an instantiated CUDA graph (torch.cuda.CUDAGraph.raw_cuda_graph_exec()) on the current stream, keeping the
@@ -115,7 +159,10 @@ void register_stream(pybind11::module& m) {
         .def("load", &SlotRing::load, py::arg("slot"), py::arg("wait_freed"), py::arg("copies"))
         .def("before", &SlotRing::before, py::arg("slot"))
         .def("after", &SlotRing::after, py::arg("slot"))
-        .def("copied", &SlotRing::copied, py::arg("slot"));
-    m.def("host_pinned", &host_pinned, "whether a host address is page-locked", py::arg("ptr"));
+        .def("copied", &SlotRing::copied, py::arg("slot"))
+        .def("done", &SlotRing::done, py::arg("ticket"))
+        .def("issued", &SlotRing::issued);
+    m.def("host_pinned", &host_pinned, "whether host bytes [ptr, ptr + nbytes) are page-locked", py::arg("ptr"),
+          py::arg("nbytes") = 1);
     m.def("graph_launch", &graph_launch, "cudaGraphLaunch(exec, current stream), keeping the GIL", py::arg("exec"));
 }
