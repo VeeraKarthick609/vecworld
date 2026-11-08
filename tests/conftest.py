@@ -9,6 +9,9 @@ from PIL import Image
 # pools that fit the game run out of memory in the tests. Set before anything touches CUDA.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# A failing card_limit test gives its GPU memory back (the hook lives in gpu_release.py so a toy session can load it too).
+from gpu_release import pytest_runtest_makereport  # noqa: E402,F401
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _hand_host_memory_back():
