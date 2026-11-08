@@ -288,4 +288,12 @@ def stream_blocks(transformer: torch.nn.Module, device="cuda", ring: int = FLUX_
     else:
         host = [{n: t.data for n, t in _tensors(b).items()} for b in blocks]
         slots = BlockSlots(blocks, lambda i: host[i], ring=ring, device=device)
-    return slots, GraphRunner(blocks, slots, max_graphs=max_graphs, enabled=graphs)
+    try:
+        return slots, GraphRunner(blocks, slots, max_graphs=max_graphs, enabled=graphs)
+    except BaseException:
+        if pack:                    # the arena is registered and nobody else owns it yet (the caller never got `slots`)
+            try:
+                slots.close()       # the blocks back on their arena views, then the arena unregistered
+            finally:
+                slots.arena.close()
+        raise

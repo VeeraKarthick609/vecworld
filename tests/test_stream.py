@@ -296,6 +296,34 @@ def test_failed_install_leaves_the_blocks_and_frees_the_arena(monkeypatch):
     a.close()
 
 
+def test_stream_blocks_unregisters_the_arena_if_the_runner_fails(monkeypatch):
+    """N2 (Task 10a re-review): stream_blocks(pack=True) builds its GraphRunner after the arena is registered and the
+    blocks installed; if that raises, the blocks go back to host tensors and the arena is unregistered."""
+    import vecworld.engine.ext as ext_mod
+    import vecworld.engine.graphs as graphs_mod
+
+    from test_graphs import _toys
+
+    real = ext_mod.load_ext()
+    blocks, host = _toys(4)
+    tr = torch.nn.Module()
+    tr.transformer_blocks = torch.nn.ModuleList(blocks)
+    tr.single_transformer_blocks = torch.nn.ModuleList()
+
+    def boom(*a, **k):
+        raise RuntimeError("GraphRunner failed")
+
+    monkeypatch.setattr(graphs_mod, "GraphRunner", boom)
+    with pytest.raises(RuntimeError, match="GraphRunner failed"):
+        graphs_mod.stream_blocks(tr, "cuda", ring=2, graphs=True, pack=True)
+    for b in blocks:
+        for t in (*b.parameters(), *b.buffers()):
+            assert t.device.type == "cpu"
+            assert not real.host_pinned(t.data_ptr(), t.numel() * t.element_size())
+    for b, h in zip(blocks, host):
+        assert torch.equal(b.w, h["w"])
+
+
 class Sleepy(torch.nn.Module):
     """A toy block that holds the GPU back, then reads its weight into a buffer kept outside it, then (once) raises."""
 

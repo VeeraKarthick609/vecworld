@@ -853,6 +853,55 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
         assert order == want, (kernel, graphs)
 
 
+def test_painter_releases_the_arena_if_construction_fails_after_the_streamer(monkeypatch):
+    """N2 (Task 10a re-review): once stream_blocks has registered the host arena, anything that raises later in
+    FluxPainter.__init__ (a CUDA OOM moving the VAE or CLIP onto the card) must close the runner, the slots and the
+    arena, or the transformer's collection frees registered memory. The original error is the one that propagates,
+    even when closing fails too."""
+    import diffusers
+
+    import vecworld.engine.blocks as blocks_mod
+    import vecworld.engine.ext as ext_mod
+    import vecworld.engine.graphs as graphs_mod
+    import vecworld.engine.swap as swap_mod
+    import vecworld.flux.painter as painter_mod
+
+    class Boom(Exception):
+        pass
+
+    done = []
+    tr = SimpleNamespace(transformer_blocks=[], single_transformer_blocks=[], enable_group_offload=lambda **k: None)
+    arena = SimpleNamespace(close=lambda: done.append("arena"))
+    slots = SimpleNamespace(arena=arena, close=lambda: done.append("slots"))
+    runner = SimpleNamespace(close=lambda: done.append("runner"))
+    monkeypatch.setattr(ext_mod, "load_ext", lambda: None)
+    monkeypatch.setattr(painter_mod, "_read_gguf", lambda path: {})
+    monkeypatch.setattr(diffusers.FluxTransformer2DModel, "from_single_file", lambda *a, **k: tr)
+    monkeypatch.setattr(swap_mod, "gguf_linears", lambda tr: {})
+    monkeypatch.setattr(swap_mod, "swap_linears", lambda *a, **k: 1)
+    monkeypatch.setattr(blocks_mod, "patch_blocks", lambda tr: 57)
+    monkeypatch.setattr(painter_mod, "rowwise", lambda tr: None)
+    monkeypatch.setattr(graphs_mod, "stream_blocks", lambda tr, dev, graphs, **k: (slots, runner))
+
+    def oom_on_vae(*a, **k):
+        raise Boom("CUDA out of memory (moving the VAE)")
+
+    monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", oom_on_vae)
+    for k in ("VECWORLD_FUSE", "VECWORLD_GRAPHS", "VECWORLD_KERNEL"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(Boom) as ei:         # held: the traceback keeps the half-built painter alive, as pytest's does
+        FluxPainter()
+    assert done == ["runner", "slots", "arena"]
+    del ei
+
+    done.clear()
+    slots.close = lambda: (_ for _ in ()).throw(RuntimeError("sticky"))   # a failing close must not hide Boom
+    with pytest.raises(Boom) as ei:
+        FluxPainter()
+    assert "arena" in done
+    del ei
+
+
 def test_close_frees_slots_and_unpins_even_if_the_runner_fails(monkeypatch):
     """FluxPainter.close() still closes the weight slots and unregisters the page-locked host memory when closing the
     graph runner raises (e.g. a sticky CUDA error surfacing in its sync); the error is raised after that."""

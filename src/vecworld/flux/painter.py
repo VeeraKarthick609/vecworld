@@ -281,12 +281,22 @@ class FluxPainter(Painter):
         else:
             tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"),
                                     offload_type="block_level", num_blocks_per_group=1, use_stream=True)
-        vae = AutoencoderKL.from_pretrained(FLUX_BASE, subfolder="vae", torch_dtype=bf16).to(dev)
-        self._clip = CLIPTextModel.from_pretrained(FLUX_BASE, subfolder="text_encoder", torch_dtype=bf16).to(dev)
-        self._ctok = CLIPTokenizer.from_pretrained(FLUX_BASE, subfolder="tokenizer")
-        self.t5 = T5Text(cache=64)
-        self._pooled: OrderedDict = OrderedDict()
-        self._setup(tr, vae, self._encode_text, progress, dev="cuda", dtype=bf16)
+        try:
+            vae = AutoencoderKL.from_pretrained(FLUX_BASE, subfolder="vae", torch_dtype=bf16).to(dev)
+            self._clip = CLIPTextModel.from_pretrained(FLUX_BASE, subfolder="text_encoder", torch_dtype=bf16).to(dev)
+            self._ctok = CLIPTokenizer.from_pretrained(FLUX_BASE, subfolder="tokenizer")
+            self.t5 = T5Text(cache=64)
+            self._pooled: OrderedDict = OrderedDict()
+            self._setup(tr, vae, self._encode_text, progress, dev="cuda", dtype=bf16)
+        except BaseException:
+            # The arena is registered with CUDA and the slots hold the card's memory: nobody can call close() on a
+            # painter whose constructor raised (a CUDA OOM moving the VAE or CLIP onto the 4 GB card is the likely one),
+            # and a collected transformer would free registered memory. The original error is the one raised.
+            try:
+                self.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
 
     def _setup(self, transformer, vae, encode_text, progress, dev, dtype):
         """Everything but model loading (tests build a painter from fakes through here)."""
