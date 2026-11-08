@@ -558,3 +558,34 @@ def test_ssd_source_that_cannot_drain_keeps_its_buffers(ssd_dir, caplog):
         for r, _, _ in uring._LEAKED[n0:]:             # the fault was one-shot: these drain now
             r.close()
         del uring._LEAKED[n0:]
+
+
+@pytest.mark.parametrize("buffers, ahead", [(3, 2), (2, 1)])
+def test_ssd_source_raises_when_the_requested_blocks_read_ahead_failed(ssd_dir, buffers, ahead):
+    """Final review I1: block i already read ahead into a buffer, and that read failed (one chunk -EIO). source(i)
+    must raise OSError, never hand out data: the read-ahead claim for blocks after i must not probe (and forget) the
+    buffer holding block i, which would let it be read into for another block (block i's Gather over that block's
+    bytes) or hand it out half-written. The next source(i) reads it again."""
+    from vecworld.engine.uring import SsdSource
+
+    sizes = [300_000, 700_001, 400_000, 350_000, 250_000]
+    path, data = _file(ssd_dir, 54048 + sum(sizes) + 999, seed=9)
+    src = SsdSource(str(path), _toy_layout(path, sizes), buffers=buffers, ahead=ahead, pin=False, queue_depth=1,
+                    chunk=64 << 10)
+    src.bind(_FakeStreamer())                           # every copy done at once
+    try:
+        src(0)                                          # block 0 read; block 1 (and 2) read ahead, queued in order
+        k = src.buffer_of(1)
+        assert k is not None and src._req[k] is not None    # block 1's read is not finished yet
+        src._reader._inject_fault(1, -5)                # the next chunk completion, block 1's first, fails
+        last = src.buffer_of(ahead)                     # the SSD gets on meanwhile: block 1's failed read (and any
+        try:                                            # read-ahead queued behind it) fully drains before source(1)
+            src._reader.wait(src._req[last][-1])
+        except OSError:                                 # (with ahead 1 that is block 1's own read: its error)
+            pass
+        with pytest.raises(OSError, match="Input/output error"):
+            src(1)
+        assert src.buffer_of(1) is None
+        assert _gathered(src(1))[0] == data[54048 + sizes[0]:54048 + sizes[0] + sizes[1]]
+    finally:
+        src.close()

@@ -330,10 +330,12 @@ class SsdSource:
             j = (i + m) % self.n
             if j in self._where:
                 continue
-            kk = self._claim(i, urgent=False)
+            kk = self._claim(i, urgent=False, keep=k)
             if kk is None:
                 break
             self._start(kk, j)
+        # the read-ahead never touches block i's buffer (keep=k): its read, failed or not, is still k's to wait on
+        assert self._block[k] == i and self._where.get(i) == k, (i, k, self._block[k], self._where.get(i))
         if self._req[k] is not None:
             try:
                 self._wait_all(k)                           # GIL released while the SSD catches up
@@ -409,16 +411,18 @@ class SsdSource:
             self._handed[k] = None
         return True
 
-    def _claim(self, i: int, urgent: bool) -> int | None:
+    def _claim(self, i: int, urgent: bool, keep: int | None = None) -> int | None:
         """A buffer to read into, for block i (urgent) or for a block after it (read-ahead). Never one whose read is in
-        flight or whose handed-out block's copy may be pending; of the rest, the one holding the block needed furthest
+        flight or whose handed-out block's copy may be pending, and never keep (the buffer holding the block being
+        handed out: it is not even probed, so a failed read there is never mistaken for a failed read-ahead and
+        forgotten; its error is raised by the caller's wait). Of the rest, the one holding the block needed furthest
         ahead (empty first). Read-ahead never takes one holding blocks i .. i+ahead (None instead); block i waits for
         a buffer if it must."""
         t0 = None
         while True:
             best, bestd = None, -1
             for k in range(self.buffers):
-                if not self._usable(k):
+                if k == keep or not self._usable(k):
                     continue
                 blk = self._block[k]
                 d = self.n + 1 if blk is None else (blk - i) % self.n
