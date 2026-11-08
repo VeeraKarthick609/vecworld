@@ -115,13 +115,31 @@ both kernels, about what any one-ulp change does (Task 3's 4.2%). Under w4a8 it 
 and four Euler steps later the panorama is another sample.
 
 `rowwise(transformer)` runs those layers a window at a time: `x_embedder`, `context_embedder`, `time_text_embed`,
-`norm_out.linear` and `proj_out`, each split along the batch and concatenated. They are a few MFLOP a window, so the
-cost does not show. Now a window's pass is the same in any batch:
+`norm_out.linear` and `proj_out`. Each tensor argument whose dim 0 is the batch is split into rows (positional or
+keyword); anything else goes to every row whole. The results are concatenated. The wrapper holds its module weakly
+and marks it, so a second `rowwise()` wraps nothing, even after a hook rewrapped the forward. These layers are a
+few MFLOP a window. Measured same-session at batch 8, interleaved, on against off
+(`bench/t9-r1-rowwise-ab.json`, 3 panoramas each, order alternated): **0.9543 vs 0.9528 s a window-step (+0.16%),
+panorama 32.01 vs 31.94 s**, inside the runs' own 0.936-0.956 spread. The cost is noise. Now a window's pass
+is the same in any batch:
 
-- `test_batched_windows_match_single_windows[eager|graphs]`: every window of a batch of 8, 5 and 2 `torch.equal` to
-  that window alone, and far from any other window alone (a misplaced embedding would show);
+- `test_batched_windows_match_single_windows[eager|graphs]` (w4a8) and `test_mma_batched_windows_match_single_windows`
+  (mma, eager and graphs): every window of a batch of 8, 5 and 2 `torch.equal` to that window alone, and far from
+  any other window alone (a misplaced embedding would show);
 - `test_flux_pano_batched_matches`: the batch-8 panorama vs batch 1, **PSNR inf** (identical);
 - `test_batched_equals_unbatched` (CPU fake, ragged batches, a step whose active set changes).
+
+### The reference runs a window a pass
+
+`rowwise` can only fix the layers outside the blocks. Under `VECWORLD_KERNEL=off` (diffusers' reference) the blocks'
+own GEMMs are cuBLAS bf16 after a GGUF dequant, so they round by M too. A reviewer probe measured a window in a batch
+of 2 or 8 at 2.8e-3 to 7.6e-3 rel from itself alone, and never bit-equal. So `engine.engine_batch(kernel)` returns
+**1 under off**, whatever `FLUX_BATCH` or `VECWORLD_BATCH` say. The reference always paints its one-window-a-pass
+picture, which is the picture every engine batch now paints too.
+`test_reference_paints_a_window_a_pass_whatever_the_batch`: an off painter given `VECWORLD_BATCH=8` runs batch 1, its
+windows equal themselves alone, and the same windows forced to batch 2 do not. `FLUX_BATCH` is a pure speed and
+latency knob **under the engine kernels**; the reference is always batch 1 (2.8 s a window-step, as in Task 1's
+single-window pass).
 
 ## Correctness under the new sizes
 
@@ -135,7 +153,12 @@ cost does not show. Now a window's pass is the same in any batch:
   (`test_painter_batches_never_reuse_another_compositions_residual`). Bigger batches mean fewer keys, so the cache,
   if ever turned on, has the same one candidate step per batch as in Task 8.
 - **Stop between steps.** As before, `check_stop()` runs before every pass, so a stop now waits up to one 7.2 s pass
-  (was 3.6 s). That is still between denoising steps, as the global constraint asks.
+  (was 3.6 s). At batch 8 a panorama step's 8 windows are one pass, so every pass boundary is a step boundary, as
+  the global constraint asks. `test_graph_stop_between_steps` still holds memory flat after a stop. No GPU-queue
+  timeout depends on the pass length: `RoamService._wait` waits unbounded.
+- **Progress gets coarser.** `progress(done, total)` is called once a pass, so a panorama now reports 4 ticks (was
+  8) and the bench walk step 5 (was 10). Each tick is twice the work, so the bar moves in bigger steps but at the
+  same average rate. No test or UI contract counts ticks.
 
 ## The numbers
 

@@ -1,0 +1,45 @@
+{
+ "power": "ac",
+ "git": "47d40a3-dirty",
+ "results": {
+  "batch": 8,
+  "runs": {
+   "on": [
+    {
+     "s": 31.36,
+     "s_per_window_step": 0.9356
+    },
+    {
+     "s": 32.02,
+     "s_per_window_step": 0.9557
+    },
+    {
+     "s": 32.01,
+     "s_per_window_step": 0.9543
+    }
+   ],
+   "off": [
+    {
+     "s": 31.79,
+     "s_per_window_step": 0.9487
+    },
+    {
+     "s": 31.94,
+     "s_per_window_step": 0.9528
+    },
+    {
+     "s": 32.04,
+     "s_per_window_step": 0.9561
+    }
+   ]
+  },
+  "median_s": {
+   "on": 32.01,
+   "off": 31.94
+  },
+  "median_s_per_window_step": {
+   "on": 0.9543,
+   "off": 0.9528
+  }
+ }
+}
