@@ -111,8 +111,9 @@ def test_flux_from_ssd_matches():
 
 
 def test_gather_must_cover_the_block_exactly():
-    """A Gather whose copies miss a tensor (the slot would keep the previous block\x27s bytes there) or overlap is
-    refused when the block\x27s copy is issued (ValueError), as a copy outside the block is; an exact one streams."""
+    """A Gather whose copies miss a tensor (the slot would keep the previous block's bytes there), overlap, or put a
+    tensor anywhere but its own range (N4: shifted into its padding, the byte total unchanged) is refused when the
+    block's copy is issued (ValueError), as a copy outside the block is; an exact one streams."""
     from vecworld.engine.slots import _tensors, block_layout
     from vecworld.engine.stream import BlockStreamer, Gather, HostArena
 
@@ -129,7 +130,16 @@ def test_gather_must_cover_the_block_exactly():
             out += [lay[name], base + lay[name], t.numel() * t.element_size()]
         return out
 
-    bad = {"miss": lambda c: c[3:], "overlap": lambda c: c + c[:3]}
+    def shifted(c):
+        # N4: the smallest tensor's copy moved 16 bytes into its own padding: no overlap, the same byte total, but
+        # the tensor's first 16 bytes would keep the previous block's
+        c = list(c)
+        k = min(range(0, len(c), 3), key=lambda k: c[k + 2] if c[k + 2] else 1 << 60)
+        assert c[k + 2] + 16 <= 256
+        c[k] += 16
+        return c
+
+    bad = {"miss": lambda c: c[3:], "overlap": lambda c: c + c[:3], "shifted": shifted}
     for kind, f in [("exact", lambda c: c), *bad.items()]:
         keep = {i: Gather(f(exact(i)), a) for i in range(3)}
         st = BlockStreamer(blocks, lambda i: keep[i], ring=3)

@@ -87,6 +87,10 @@ class DirectReader:
         """Test hook: the nth chunk completion from now is reported as `res` (-errno, or a short byte count)."""
         self._r._inject_fault(nth, res)
 
+    def _inject_enter_fault(self, err: int) -> None:
+        """Test hook: the next io_uring_enter that reaps completions fails with errno err."""
+        self._r._inject_enter_fault(err)
+
     def close(self) -> None:
         self._r.close()
 

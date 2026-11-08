@@ -111,6 +111,19 @@ class HostArena:
             _unregister(self._raw.data_ptr())
 
 
+def _merged(spans) -> list[tuple[int, int]]:
+    """Sorted (start, bytes) ranges with the empty ones dropped and touching ones joined."""
+    out: list[list[int]] = []
+    for a, n in spans:
+        if not n:
+            continue
+        if out and out[-1][0] + out[-1][1] == a:
+            out[-1][1] += n
+        else:
+            out.append([a, n])
+    return [(a, n) for a, n in out]
+
+
 _ISSUING = -1      # BlockStreamer._ticket[i] while block i's copy is being issued (source(i) called, no ticket yet)
 
 
@@ -161,6 +174,7 @@ class BlockStreamer(BlockSlots):
         self._info: dict[int, tuple] = {}                   # id(source) -> (weakref to it, address, bytes)
         self._gathers: dict[int, tuple] = {}                # id(Gather) -> (weakref, block, copies with slot addresses)
         self._tbytes = [sum(t.numel() * t.element_size() for t in _tensors(b).values()) for b in self.blocks]
+        self._tspans: dict[int, list[tuple[int, int]]] = {}   # block -> its tensors' merged slot ranges (_spans)
 
     @classmethod
     def packed(cls, blocks: list[torch.nn.Module], ring: int = 2, device="cuda") -> "BlockStreamer":
@@ -261,13 +275,25 @@ class BlockStreamer(BlockSlots):
             spans.append((so, n))
             flat += [base + so, hp, n]
         spans.sort()
-        if any(a + na > b for (a, na), (b, _) in zip(spans, spans[1:])) or sum(n for _, n in spans) != self._tbytes[i]:
+        if any(a + na > b for (a, na), (b, _) in zip(spans, spans[1:])) or _merged(spans) != self._spans(i):
             raise ValueError(f"block {i}: a Gather's copies must cover the block's tensors exactly "
-                             f"({sum(n for _, n in spans)} bytes copied, {self._tbytes[i]} in its tensors, or overlapping)")
+                             f"({sum(n for _, n in spans)} bytes copied, {self._tbytes[i]} in its tensors; overlapping, "
+                             f"or not each tensor's own range)")
         if len(self._gathers) > 4 * self.n:
             self._gathers = {k: v for k, v in self._gathers.items() if v[0]() is not None}
         g = self._gathers[id(src)] = (weakref.ref(src), i, flat)
         return g
+
+    def _spans(self, i: int) -> list[tuple[int, int]]:
+        """Block i's tensors' byte ranges in its slot (block_layout's offsets, each tensor's own bytes, no padding),
+        adjacent ones merged: what a Gather's copies must cover, exactly (N4: comparing byte totals let a copy shifted
+        into a tensor's padding pass)."""
+        sp = self._tspans.get(i)
+        if sp is None:
+            lay = self._layout[i]
+            sp = self._tspans[i] = _merged(sorted((lay[name], t.numel() * t.element_size())
+                                                  for name, t in _tensors(self.blocks[i]).items()))
+        return sp
 
     def _inspect(self, i: int, src) -> tuple:
         if isinstance(src, torch.Tensor):

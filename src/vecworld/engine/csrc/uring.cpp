@@ -127,6 +127,8 @@ class DirectReader {
         fault_at_ = completions_ + nth;
         fault_res_ = static_cast<int>(res);
     }
+    // Test hook: the next io_uring_enter while reaping completions fails with errno err (a hard error such as EFAULT).
+    void inject_enter_fault(int err) { enter_fault_ = err; }
 
     // Start reading [offset, offset + nbytes) into dst (all three multiples of 4096). The request succeeds once its
     // first `need` bytes are in (a read may run past the end of the file, as the aligned tail of its last block does).
@@ -296,11 +298,22 @@ class DirectReader {
         if (inflight_ == 0) return -1;
         unsigned head = *cq_head_;
         unsigned tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
-        if (head == tail) {
+        if (head == tail || enter_fault_) {
             // nothing posted yet: let the kernel run pending completion work (and wait for one if block)
-            int r = uring_enter(ring_, 0, block ? 1 : 0, IORING_ENTER_GETEVENTS);
-            if (r < 0 && errno != EINTR && errno != EAGAIN && errno != EBUSY && errno != ETIME) {
-                throw IOFailure("DirectReader: io_uring_enter (wait): " + errstr(errno));
+            int r, e;
+            if (enter_fault_) {                     // test hook (_inject_enter_fault): this call fails with it
+                r = -1;
+                e = enter_fault_;
+                enter_fault_ = 0;
+            } else {
+                r = uring_enter(ring_, 0, block ? 1 : 0, IORING_ENTER_GETEVENTS);
+                e = errno;
+            }
+            if (r < 0 && e != EINTR && e != EAGAIN && e != EBUSY && e != ETIME) {
+                // chunks may still be in the kernel, their destinations no longer tracked by any request the caller
+                // waits on: refuse every later call (as a hard submit error does), so none is read into again (N1)
+                broken_ = "io_uring_enter (wait): " + errstr(e);
+                throw IOFailure("DirectReader: " + broken_);
             }
             tail = __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE);
         }
@@ -381,7 +394,7 @@ class DirectReader {
     std::string path_;
     int fd_ = -1, ring_ = -1;
     int64_t size_ = -1, chunk_ = 0, issued_ = 0, inflight_ = 0, completions_ = 0, fault_at_ = 0;
-    int fault_res_ = 0;
+    int fault_res_ = 0, enter_fault_ = 0;
     std::string broken_;
     unsigned qd_ = 0, sq_entries_ = 0;
     bool single_ = false;
@@ -417,5 +430,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_property_readonly("inflight", &DirectReader::inflight)
         .def_property_readonly("queued", &DirectReader::queued)
         .def_property_readonly("completions", &DirectReader::completions)
-        .def("_inject_fault", &DirectReader::inject_fault, py::arg("nth"), py::arg("res"));
+        .def("_inject_fault", &DirectReader::inject_fault, py::arg("nth"), py::arg("res"))
+        .def("_inject_enter_fault", &DirectReader::inject_enter_fault, py::arg("err"));
 }

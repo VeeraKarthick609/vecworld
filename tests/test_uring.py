@@ -480,3 +480,41 @@ def test_ssd_source_reads_a_block_in_several_runs(ssd_dir):
                 assert src.stats["reads"] == 2, src.stats         # block 1's read-ahead didn't wrap to block 0
         finally:
             src.close()
+
+
+def test_uring_hard_reap_error_breaks_the_reader(ssd_dir):
+    """N1 (10b re-review): a hard io_uring_enter error while reaping completions (EFAULT, EBADF, EINVAL on a healthy
+    ring) leaves chunks of the request in the kernel. The reader is then broken, as after a hard submit error: every
+    later call raises, so no new read can be submitted into a buffer those chunks may still land in. SsdSource's next
+    source(i) raises too, never hands a buffer out again."""
+    import errno
+
+    from vecworld.engine.uring import DirectReader, SsdSource
+
+    path, _ = _file(ssd_dir, 4 << 20, seed=6)
+    r = DirectReader(str(path), queue_depth=1, chunk=64 << 10)
+    dst = _aligned(4 << 20)
+    try:
+        req = r.submit(0, 4 << 20, 4 << 20, dst.data_ptr())
+        r._inject_enter_fault(errno.EFAULT)
+        with pytest.raises(OSError, match="io_uring_enter"):
+            r.wait(req)
+        with pytest.raises(OSError, match="broken"):
+            r.submit(0, 4096, 4096, dst.data_ptr())
+    finally:
+        r.close()
+
+    sizes = [300_000, 123_457, 500_001]
+    path, data = _file(ssd_dir, 54048 + sum(sizes) + 999, seed=7)
+    src = SsdSource(str(path), _toy_layout(path, sizes), buffers=2, ahead=0, pin=False, queue_depth=1,
+                    chunk=64 << 10)
+    src.bind(_FakeStreamer())
+    try:
+        src._reader._inject_enter_fault(errno.EFAULT)
+        with pytest.raises(OSError, match="io_uring_enter"):
+            src(0)
+        for i in (0, 1):
+            with pytest.raises(OSError, match="broken"):
+                src(i)
+    finally:
+        src.close()
