@@ -382,14 +382,17 @@ def test_stream_stop_then_reuse(fx):
     assert fx.st.pinned_bytes == pin0 and [t.data_ptr() for t in fx.st.slots] == slots0
 
 
+# VmHWM, this process' own peak: getrusage's ru_maxrss carries the parent's peak over fork + exec (pytest's, after
+# the modules before it loaded a transformer from a memory-mapped file).
 PAINTER_RSS = """
-import resource, sys
+import sys
 import vecworld.engine.stream as stream
 if sys.argv[1] == "notrim":
     stream._trim = lambda: None
 from vecworld.flux.painter import FluxPainter
 p = FluxPainter()
-print("RESULT", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024, p._arena.nbytes, flush=True)
+hwm = [int(x.split()[1]) for x in open("/proc/self/status") if x.startswith("VmHWM:")][0] * 1024
+print("RESULT", hwm, p._arena.nbytes, flush=True)
 p.close()
 """
 
