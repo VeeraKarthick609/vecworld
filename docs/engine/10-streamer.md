@@ -58,7 +58,7 @@ milliseconds is the 20 s. The GPU sat idle waiting for the CPU to enqueue the ne
   then registers the whole buffer with the driver once. The old copies are freed as it goes, and `malloc_trim` after
   each block hands them back to the OS: without it glibc keeps the freed heap (each GGUF tensor is under its 32 MB
   mmap threshold) and the process holds both copies (9.1 GB peak in a fresh process, and OOM-killed at 13.8 GB inside
-  the GPU suite). With it the painter's peak RSS is 7.87 GB, Task 9 7.52 after setup (Task 9 bench) GB.
+  the GPU suite). With it the painter process peaks at 7.87 GB while it loads (VmHWM) and holds 7.52 GB after setup, as at Task 9.
 - **`BlockStreamer(blocks, source, ring)`** is a `BlockSlots` whose copy list for block i is one triple: (slot i % ring,
   `source(i)`, block i's size). `source(i)` returns block i's bytes (a tensor or any buffer), page-locked and exactly
   the block's size, or the copy raises `ValueError`. Nothing touches the blocks until `install()`; `close()` syncs,
@@ -71,6 +71,32 @@ milliseconds is the 20 s. The GPU sat idle waiting for the CPU to enqueue the ne
   "freed" event, the memcpys, record "copied"), `before(slot)` (compute stream waits "copied"), `after(slot)` (record
   "freed" on the compute stream). The bookkeeping (which block is in which slot, holds for the block cache, the owner
   thread) stays in Python, where it costs microseconds and never releases the GIL.
+
+### The reader's contract (for Task 10b)
+
+`source(i)` hands the streamer block i's bytes; the copy that reads them runs later, on the GPU. A reader that reuses
+its buffers (the SSD reader will) must not touch a buffer until that copy has run:
+
+- `load(i)` returns the copy's **ticket** (1, 2, 3, ... in issue order, assigned by `SlotRing.load` under the GIL in
+  the same call that records the copy's event); `done(ticket)` says whether that copy has finished. Each ticket has
+  its own CUDA event, so the answer is exact however the slots have been reused since; the side stream runs copies
+  in order, so finished tickets are retired from the front of a queue.
+- `copy_done(i)` is the same for block i's latest copy, and is **False from the moment `source(i)` is called** until
+  that copy has run, so a reader thread asking in the window between handing the bytes over and the copy being
+  issued is told to wait (the first version answered per slot, from the slot's previous copy: True in that window).
+- The streamer keeps every source object alive until its copy has finished (the first version kept only the latest
+  per slot: a buffer the reader didn't keep itself could go back to torch's pinned pool while the DMA still read it).
+- A reader may call `done` / `copy_done` from another thread: they hold the GIL. After `close()` they raise.
+
+### Why graph replays don't draw random numbers
+
+`graph_launch` launches a captured block graph itself instead of through `CUDAGraph.replay()`, which hands the GIL
+away. `replay()` also runs the RNG prologue (it advances the philox seed / offset that random ops inside the graph
+read), which `graph_launch` skips: a graph that drew random numbers would draw the same ones on every replay. The
+FLUX block graphs draw none (attention runs with `dropout_p = 0`), and the runner now makes sure: the eager warm-up
+before each capture runs under a dispatch mode that raises, naming the block, on any op tagged
+`nondeterministic_seeded` other than attention or dropout with probability 0. A custom extension kernel drawing its
+own random numbers would not be seen.
 
 ### Pinned vs pageable memory, DMA, streams and events (the background)
 
