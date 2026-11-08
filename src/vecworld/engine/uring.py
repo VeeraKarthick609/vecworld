@@ -156,12 +156,19 @@ def flux_block_extents(meta) -> list[tuple[int, int]]:
 class BlockFile:
     """How block i comes off the disk: read file bytes [lo, lo + nbytes) (4096-aligned; the first `need` of them must
     be there), then copy (slot offset, offset in what was read, bytes) for each weight, and the resident tensors
-    (slot offset, tensor) from RAM."""
+    (slot offset, tensor) from RAM. A block whose tensors lie in several runs of the file (T5's GGUF orders its
+    tensors by name: flux.text.t5_file_layout) gives `extents` instead: (file offset, bytes, need, offset in the
+    buffer) per run, each read like the single range (lo and nbytes then span the buffer)."""
     lo: int
     nbytes: int
     need: int
     copies: list[tuple[int, int, int]]
     resident: list[tuple[int, torch.Tensor]] = field(default_factory=list)
+    extents: list[tuple[int, int, int, int]] | None = None
+
+    def runs(self) -> list[tuple[int, int, int, int]]:
+        """(file offset, bytes, need, offset in the buffer) of each read."""
+        return list(self.extents) if self.extents is not None else [(self.lo, self.nbytes, self.need, 0)]
 
 
 def flux_file_layout(blocks: list[torch.nn.Module], gguf_path) -> list[BlockFile]:
@@ -223,22 +230,23 @@ class SsdSource:
     (waiting for it with the GIL released if it hasn't) and starting the reads of blocks i+1 .. i+ahead (cyclically:
     passes repeat) into buffers that are free. A buffer is free when its read has finished and the block last handed
     out from it has been copied (bind(streamer): its copy_done). A block still in a buffer is handed out again without
-    a read. pin=False skips page-locking (tests without a GPU). stats: reads, bytes read, seconds waited.
+    a read. pin=False skips page-locking (tests without a GPU). wrap=False: one pass, no read-ahead past the last
+    block. stats: reads, bytes read, seconds waited.
 
     One thread (the streamer's). close() waits for the reads in flight, then unregisters the buffers (safe twice);
     call it after the streamer's close()."""
 
     def __init__(self, path: str, layout: list[BlockFile], buffers: int = 3, ahead: int = 2, queue_depth: int = 64,
-                 chunk: int = 1 << 20, pin: bool = True):
+                 chunk: int = 1 << 20, pin: bool = True, wrap: bool = True):
         from vecworld.engine.stream import Gather
 
         if buffers < 2:
             raise ValueError(f"SsdSource needs 2 or more staging buffers, got {buffers}")
         self._Gather = Gather
         self.path, self.n = str(path), len(layout)
-        self.buffers, self.ahead = buffers, max(0, min(ahead, buffers - 1))
-        self._plans = [(b.lo, b.nbytes, b.need, list(b.copies)) for b in layout]
-        self.buf_bytes = -(-max(b.nbytes for b in layout) // ALIGN) * ALIGN
+        self.buffers, self.ahead, self.wrap = buffers, max(0, min(ahead, buffers - 1)), wrap
+        self._plans = [(b.runs(), list(b.copies)) for b in layout]
+        self.buf_bytes = -(-max(bo + n for runs, _ in self._plans for _, n, _, bo in runs) // ALIGN) * ALIGN
         # the resident tensors, packed into one buffer (copied: the blocks' own tensors can then be freed)
         res, off = [], 0
         for b in layout:
@@ -277,7 +285,7 @@ class SsdSource:
         self._buf = [base + k * self.buf_bytes for k in range(buffers)]
         self._res_ptr = self._res.data_ptr()
         self._block: list[int | None] = [None] * buffers      # the block buffer k holds (or is reading)
-        self._req: list[int | None] = [None] * buffers        # buffer k's read in flight
+        self._req: list[list[int] | None] = [None] * buffers  # buffer k's reads in flight (one per run)
         self._handed: list[int | None] = [None] * buffers     # the block handed out from k, its copy maybe pending
         self._where: dict[int, int] = {}                      # block -> the buffer that holds it
         self._gathers: dict[tuple[int, int], object] = {}
@@ -307,6 +315,8 @@ class SsdSource:
         else:
             self.stats["hits"] += 1
         for m in range(1, self.ahead + 1):                  # read ahead, behind block i's own read
+            if not self.wrap and i + m >= self.n:
+                break                                       # one pass: nothing after the last block
             j = (i + m) % self.n
             if j in self._where:
                 continue
@@ -314,13 +324,9 @@ class SsdSource:
             if kk is None:
                 break
             self._start(kk, j)
-        req = self._req[k]
-        if req is not None:
+        if self._req[k] is not None:
             try:
-                if not self._reader.done(req):
-                    t = time.perf_counter()
-                    self._reader.wait(req)                  # GIL released while the SSD catches up
-                    self.stats["read_wait_s"] += time.perf_counter() - t
+                self._wait_all(k)                           # GIL released while the SSD catches up
             except OSError:
                 self._forget(k)                             # the next source(i) reads the block again
                 raise
@@ -330,7 +336,7 @@ class SsdSource:
         if g is None:
             buf = self._buf[k]
             flat = []
-            for so, bo, n in self._plans[i][3]:
+            for so, bo, n in self._plans[i][1]:
                 flat += [so, buf + bo, n]
             for so, o, n in self._res_copies[i]:
                 flat += [so, self._res_ptr + o, n]
@@ -341,12 +347,29 @@ class SsdSource:
         old = self._block[k]
         if old is not None and self._where.get(old) == k:
             del self._where[old]
-        lo, nbytes, need, _ = self._plans[i]
+        runs, _ = self._plans[i]
         self._block[k], self._handed[k] = i, None
-        self._req[k] = self._reader.submit(lo, nbytes, need, self._buf[k])
+        reqs = self._req[k] = []                            # kept as they go: a later submit failing leaves them known
+        for lo, nbytes, need, bo in runs:
+            reqs.append(self._reader.submit(lo, nbytes, need, self._buf[k] + bo))
+            self.stats["bytes"] += nbytes
         self._where[i] = k
         self.stats["reads"] += 1
-        self.stats["bytes"] += nbytes
+
+    def _wait_all(self, k: int) -> None:
+        """Wait for every read into buffer k; if one failed, the others are still waited for (the buffer is then
+        free of reads in flight) before its error is raised."""
+        err = None
+        for req in self._req[k]:
+            try:
+                if not self._reader.done(req):
+                    t = time.perf_counter()
+                    self._reader.wait(req)
+                    self.stats["read_wait_s"] += time.perf_counter() - t
+            except OSError as e:
+                err = err or e
+        if err is not None:
+            raise err
 
     def _forget(self, k: int) -> None:
         """Buffer k holds nothing (its read failed: every chunk of it has completed or been dropped)."""
@@ -356,12 +379,16 @@ class SsdSource:
         self._block[k] = self._req[k] = self._handed[k] = None
 
     def _usable(self, k: int) -> bool:
-        req = self._req[k]
-        if req is not None:
+        reqs = self._req[k]
+        if reqs is not None:
             try:
-                if not self._reader.done(req):
+                if not all(self._reader.done(req) for req in reqs):
                     return False
             except OSError:                                 # a read-ahead that failed: nobody wants it yet
+                try:
+                    self._wait_all(k)                       # its other runs' reads end first
+                except OSError:
+                    pass
                 self._forget(k)
                 return True
             self._req[k] = None

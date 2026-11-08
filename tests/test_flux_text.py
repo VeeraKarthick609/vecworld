@@ -103,3 +103,64 @@ def test_gguf_rows_dequantize_like_gguf_py(tiny_gguf, name, rows):
     # the error is relative to the tensor's magnitude, not each value: allow 2^-7 of the largest.
     err = np.abs(mine.float().numpy() - ref).max()
     assert err <= 2 ** -7 * np.abs(ref).max(), (name, err, np.abs(ref).max())
+
+
+# --- the engine path's switch and file layout (Task 10c) -----------------------------------------------------------------
+
+def test_t5_path_rule(monkeypatch):
+    """FLUX_T5 (environment, else config) picks engine or pread under an engine kernel; under VECWORLD_KERNEL=off (the
+    diffusers reference all the way) always pread; anything else is refused."""
+    from vecworld.config import FLUX_T5
+    from vecworld.engine import engine_t5
+
+    monkeypatch.delenv("FLUX_T5", raising=False)
+    assert engine_t5("w4a8") == FLUX_T5 == "engine"
+    assert engine_t5(None) == "pread"
+    monkeypatch.setenv("FLUX_T5", " PREAD ")
+    assert engine_t5("w4a8") == "pread"
+    monkeypatch.setenv("FLUX_T5", "cpu")
+    with pytest.raises(ValueError, match="engine or pread"):
+        engine_t5("w4a8")
+
+
+def _t5_meta():
+    from vecworld.config import FLUX_T5_GGUF
+    from vecworld.flux.text import _read_meta
+
+    if not FLUX_T5_GGUF.exists():
+        pytest.skip("no T5 GGUF here")
+    return _read_meta(str(FLUX_T5_GGUF))
+
+
+def test_t5_file_layout_reads_every_tensor_of_its_block_once():
+    """The streamed encoder blocks' BlockFiles (flux.text.t5_file_layout) against the GGUF's tensor table: every tensor
+    of block i goes to its slot offset from exactly its own file bytes, the runs a block is read in don't overlap and
+    tile its staging buffer, and nothing else is read but small gaps. The file orders tensors by name, so some blocks
+    come in two runs (blocks 5 and 12 here)."""
+    from vecworld.engine.slots import block_layout
+    from vecworld.flux.text import NAMES, _streamed_block, t5_file_layout
+
+    meta, n_blocks, n_heads = _t5_meta()
+    assert (n_blocks, n_heads) == (24, 64)
+    blocks = [_streamed_block(meta, i) for i in range(n_blocks)]
+    lays = t5_file_layout(blocks, meta)
+    assert len(lays) == 24 and any(len(b.extents) > 1 for b in lays)
+    for i, (blk, bf) in enumerate(zip(blocks, lays)):
+        lay, _ = block_layout(blk)
+        runs = bf.runs()
+        bo = 0
+        for lo, nbytes, need, at in runs:
+            assert lo % 4096 == 0 and nbytes % 4096 == 0 and at == bo and need <= nbytes
+            bo += nbytes
+        assert bf.nbytes == bo and not bf.resident
+        want = {}
+        for n in NAMES:
+            _, _, off, nb = meta[f"enc.blk.{i}.{n}.weight"]
+            want[lay[n]] = (off, nb)
+        assert len(bf.copies) == len(NAMES)
+        for so, in_buf, nb in bf.copies:
+            lo, _, need, at = next(r for r in runs if r[3] <= in_buf < r[3] + r[1])
+            assert in_buf + nb <= at + need
+            assert (lo + in_buf - at, nb) == want[so], (i, so)
+        read = sum(r[1] for r in runs)
+        assert read - sum(nb for _, nb in want.values()) < (1 << 17) * len(runs), (i, read)

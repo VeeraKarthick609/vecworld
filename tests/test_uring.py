@@ -445,3 +445,38 @@ def test_direct_reads_leave_the_file_out_of_the_page_cache(ssd_dir):
         assert bytes(dst.numpy()) == data
         got = resident_bytes(path)
         assert (got >= n - ALIGN) if cached else (got <= 64 * ALIGN), (direct, got)
+
+
+def test_ssd_source_reads_a_block_in_several_runs(ssd_dir):
+    """A block whose tensors lie in several runs of the file (BlockFile.extents: T5's GGUF) is read run by run into one
+    staging buffer, and its Gather sends each tensor's own file bytes to its slot offset, every pass. One-pass sources
+    (wrap=False) read nothing past the last block."""
+    from vecworld.engine.uring import BlockFile, SsdSource
+
+    path, data = _file(ssd_dir, 3_000_000, seed=5)
+    # block 0: [100_000, +200_000) and [1_500_000, +90_000); block 1: [700_000, +300_000) and [2_600_000, +12_345)
+    plan = [[(100_000, 200_000, 0), (1_500_000, 90_000, 200_192)], [(700_000, 300_000, 0), (2_600_000, 12_345, 300_032)]]
+    lay = []
+    for tensors in plan:
+        extents, copies, bo = [], [], 0
+        for off, n, so in tensors:
+            lo, hi = off // ALIGN * ALIGN, -(-(off + n) // ALIGN) * ALIGN
+            extents.append((lo, hi - lo, off + n - lo, bo))
+            copies.append((so, bo + off - lo, n))
+            bo += hi - lo
+        lay.append(BlockFile(lo=extents[0][0], nbytes=bo, need=bo, copies=copies, extents=extents))
+    for wrap in (True, False):
+        src = SsdSource(str(path), lay, buffers=2, ahead=1, pin=False, wrap=wrap, queue_depth=4, chunk=64 << 10)
+        fake = _FakeStreamer()
+        src.bind(fake)
+        try:
+            for rnd in range(2 if wrap else 1):
+                for i, tensors in enumerate(plan):
+                    got = _gathered(src(i))
+                    assert set(got) == {so for _, _, so in tensors}
+                    for off, n, so in tensors:
+                        assert got[so] == data[off:off + n], (wrap, rnd, i, so)
+            if not wrap:
+                assert src.stats["reads"] == 2, src.stats         # block 1's read-ahead didn't wrap to block 0
+        finally:
+            src.close()

@@ -106,6 +106,8 @@ class BlockSlots:
         self.hold: set[int] = set()
         self._held: dict[int, int] = {}
         self._owner: int | None = None                      # the thread that ran the first block (see before())
+        # One pass only (T5's encode, flux.text): the last blocks don't prefetch the next pass's first ones.
+        self.one_pass = False
 
     def install(self) -> None:
         """Allocate the slots, make every block's tensors views into its slot and hook the blocks (a no-op while
@@ -185,9 +187,12 @@ class BlockSlots:
         return self._host[i]
 
     def next_user(self, i: int) -> int:
-        """The block that uses block i's slot after it, cyclically (the blocks repeat every pass)."""
+        """The block that uses block i's slot after it, cyclically (the blocks repeat every pass); i itself (nothing
+        to prefetch) past the last block when one_pass."""
         j = i + self.ring
-        return j if j < self.n else i % self.ring
+        if j < self.n:
+            return j
+        return i if self.one_pass else i % self.ring
 
     def load(self, i: int) -> int:
         """Copy block i's tensors into its slot on the side stream, after the slot's last user is done. Returns the

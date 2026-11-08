@@ -42,7 +42,7 @@ from vecworld.dream.gpu import check_stop
 from vecworld.dream.painter import Painter, Prompt, TurboPainter
 from vecworld.dream.pano import focus_mask, ramp, windows, wrap_cols
 from vecworld.engine import (engine_batch, engine_cache_threshold, engine_fuse, engine_graphs, engine_kernel,
-                             engine_weights_source, keep_for, load_engine_ext)
+                             engine_t5, engine_weights_source, keep_for, load_engine_ext)
 from vecworld.engine.cache import BlockCache, cached_forward
 
 POOLED_CACHE = 64     # CLIP pooled embeddings kept (least recently used dropped); T5 keeps its own
@@ -305,7 +305,7 @@ class FluxPainter(Painter):
             vae = AutoencoderKL.from_pretrained(FLUX_BASE, subfolder="vae", torch_dtype=bf16).to(dev)
             self._clip = CLIPTextModel.from_pretrained(FLUX_BASE, subfolder="text_encoder", torch_dtype=bf16).to(dev)
             self._ctok = CLIPTokenizer.from_pretrained(FLUX_BASE, subfolder="tokenizer")
-            self.t5 = T5Text(cache=64)
+            self.t5 = T5Text(cache=64, engine=engine_t5(self.kernel))   # FLUX_T5: streamed by the engine (10c)
             self._pooled: OrderedDict = OrderedDict()
             self._setup(tr, vae, self._encode_text, progress, dev="cuda", dtype=bf16)
         except BaseException:

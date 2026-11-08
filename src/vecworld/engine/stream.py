@@ -176,20 +176,25 @@ class BlockStreamer(BlockSlots):
         return st
 
     @classmethod
-    def from_ssd(cls, blocks: list[torch.nn.Module], gguf_path, ring: int = 2, device="cuda",
-                 **reader) -> "BlockStreamer":
-        """Stream the FLUX blocks from their GGUF file on the SSD (engine.uring: O_DIRECT reads through io_uring into a
-        few page-locked staging buffers; reader: SsdSource's buffers, ahead, queue_depth, chunk), installed. The
-        blocks' weights in RAM are dropped (only the resident biases and norms are kept, copied into the reader): they
-        are not read from them, so a loader may leave them unread (FluxPainter does). The reader is self.reader:
-        close() it after the streamer."""
+    def from_ssd(cls, blocks: list[torch.nn.Module], gguf_path, ring: int = 2, device="cuda", layout=None,
+                 one_pass: bool = False, **reader) -> "BlockStreamer":
+        """Stream the blocks from their GGUF file on the SSD (engine.uring: O_DIRECT reads through io_uring into a
+        few page-locked staging buffers; reader: SsdSource's buffers, ahead, queue_depth, chunk), installed. layout:
+        where each block's tensors lie in the file (engine.uring.BlockFile per block); None: the FLUX blocks'
+        (flux_file_layout; T5's is flux.text.t5_file_layout). The blocks' weights in RAM are dropped (only the
+        resident biases and norms are kept, copied into the reader): they are not read from them, so a loader may
+        leave them unread (FluxPainter does). one_pass: the blocks run once (T5's encode), so neither the streamer nor
+        the reader reads past the last block into the next pass. The reader is self.reader: close() it after the
+        streamer."""
         from vecworld.engine.uring import SsdSource, flux_file_layout
 
-        layout = flux_file_layout(blocks, gguf_path)
-        src = SsdSource(str(gguf_path), layout, **reader)
+        if layout is None:
+            layout = flux_file_layout(blocks, gguf_path)
+        src = SsdSource(str(gguf_path), layout, wrap=not one_pass, **reader)
         del layout                                          # its resident tensors are the blocks'; src copied them
         try:
             st = cls(blocks, src, ring=ring, device=device)
+            st.one_pass = one_pass
             st.reader = src
             src.bind(st)
             st.install()

@@ -85,6 +85,22 @@ def engine_weights_source(kernel: str | None) -> str:
     return v if kernel is not None else "ram"
 
 
+T5_PATHS = ("engine", "pread")
+
+
+def engine_t5(kernel: str | None = "engine") -> str:
+    """How T5-XXL runs (vecworld.flux.text; Task 10c, docs/engine/12-t5-and-results.md), the one rule for the painter,
+    the game and the bench: FLUX_T5 in the environment, else config.FLUX_T5; "engine" (its blocks streamed from the
+    SSD by the engine's streamer and reader) or "pread" (Task 1's path). Under "off" (kernel None: the diffusers
+    reference all the way) always "pread"."""
+    from vecworld.config import FLUX_T5
+
+    v = (os.environ.get("FLUX_T5") or FLUX_T5).strip().lower()
+    if v not in T5_PATHS:
+        raise ValueError(f"FLUX_T5={v!r}; use engine or pread")
+    return v if kernel is not None else "pread"
+
+
 def engine_batch(kernel: str | None = "engine") -> int:
     """Windows per transformer pass (Task 9, docs/engine/09-batching.md), the one rule for the painter, the walk and the
     bench. Under an engine kernel (any name; the default, for callers without one such as the CPU fakes):

@@ -127,6 +127,16 @@ FLUX_SSD_BUFFERS = 3
 FLUX_SSD_AHEAD = 2
 FLUX_SSD_QUEUE_DEPTH = 64       # 1 MB reads in the kernel at once (the SSD saturates at any depth from 4)
 FLUX_SSD_CHUNK = 1 << 20
+# T5-XXL (vecworld.flux.text, Task 10c, docs/engine/12-t5-and-results.md; FLUX_T5 in the environment overrides it):
+# "engine" streams its 24 encoder blocks (141 MB each, Q5_K / Q6_K) from the GGUF on the SSD through the FLUX engine's
+# streamer and reader, into FLUX_T5_RING device slots from FLUX_T5_BUFFERS page-locked staging buffers, reading
+# FLUX_T5_AHEAD blocks ahead; built per encode and freed after it, so nothing of T5 stays in RAM or on the card between
+# encodes. "pread" is the Task 1 path (each tensor pread into host memory, dequantized on the GPU). Under
+# VECWORLD_KERNEL=off always "pread".
+FLUX_T5 = "engine"
+FLUX_T5_RING = 2
+FLUX_T5_BUFFERS = 2
+FLUX_T5_AHEAD = 1
 # First-block cache (Task 8, docs/engine/08-block-cache.md): a pass skips blocks 1..56 while block 0's residual has
 # changed by less than this (summed relative L1 change over the window batch's steps); 0.0 is off.
 # VECWORLD_CACHE_THRESHOLD overrides it; under VECWORLD_KERNEL=off it is always off. Off by the Task 8 sweep: 0.3 and
