@@ -54,14 +54,16 @@ int uring_enter(int fd, unsigned to_submit, unsigned min_complete, unsigned flag
 
 class DirectReader {
   public:
-    DirectReader(const std::string& path, int64_t queue_depth, int64_t chunk) : path_(path) {
+    // direct=false opens the file without O_DIRECT (through the page cache): a test switch, to show that the
+    // page-cache checks can fail.
+    DirectReader(const std::string& path, int64_t queue_depth, int64_t chunk, bool direct) : path_(path) {
         TORCH_CHECK(queue_depth >= 1 && queue_depth <= 4096, "DirectReader: queue_depth must be 1..4096, got ",
                     queue_depth);
         TORCH_CHECK(chunk >= ALIGN && chunk % ALIGN == 0 && chunk <= (1LL << 30),
                     "DirectReader: chunk must be a multiple of 4096 up to 1 GiB, got ", chunk);
         qd_ = static_cast<unsigned>(queue_depth);
         chunk_ = chunk;
-        fd_ = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        fd_ = open(path.c_str(), O_RDONLY | O_CLOEXEC | (direct ? O_DIRECT : 0));
         if (fd_ < 0) throw IOFailure("DirectReader: open(" + path + ", O_DIRECT): " + errstr(errno));
         struct stat st;
         if (fstat(fd_, &st) == 0) size_ = st.st_size;
@@ -402,8 +404,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::register_exception<IOFailure>(m, "DirectReadError", PyExc_OSError);
     py::class_<DirectReader>(m, "DirectReader",
                              "O_DIRECT reads of one file through io_uring (raw syscalls); one thread at a time")
-        .def(py::init<const std::string&, int64_t, int64_t>(), py::arg("path"), py::arg("queue_depth") = 8,
-             py::arg("chunk") = 1 << 20)
+        .def(py::init<const std::string&, int64_t, int64_t, bool>(), py::arg("path"), py::arg("queue_depth") = 8,
+             py::arg("chunk") = 1 << 20, py::arg("direct") = true)
         .def("submit", &DirectReader::submit, py::arg("offset"), py::arg("nbytes"), py::arg("need"), py::arg("dst"))
         .def("done", &DirectReader::done, py::arg("id"))
         .def("wait", &DirectReader::wait, py::arg("id"))

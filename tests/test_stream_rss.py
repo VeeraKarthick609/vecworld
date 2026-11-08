@@ -22,13 +22,19 @@ p.close()
 """
 
 
-# The painter from the SSD (Task 10b): its peak and settled RSS, its page-locked bytes, and the page cache (Cached in
-# /proc/meminfo) before and after a pass, which reads the whole 6.66 GB of blocks from the file.
+# The painter from the SSD (Task 10b): its peak and settled RSS, its page-locked bytes, and the GGUF's own pages in the
+# page cache (mincore) before and after two passes, which read the whole 6.66 GB of blocks from the file twice: the
+# file is evicted first (posix_fadvise DONTNEED), so a reader that went through the page cache would leave it there.
 SSD_RSS = """
 import importlib.util, sys
 from pathlib import Path
+import os
 import torch
+from vecworld.config import FLUX_GGUF
+from vecworld.engine.uring import resident_bytes
 from vecworld.flux.painter import FluxPainter
+def evict(path):
+    fd = os.open(path, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
 def cached():
     return [int(x.split()[1]) for x in open("/proc/meminfo") if x.startswith("Cached:")][0] * 1024
 def status(k):
@@ -39,11 +45,13 @@ p = FluxPainter()
 hwm, rss = status("VmHWM"), status("VmRSS")
 with torch.inference_mode():
     e = p._embed([("a quiet lake at dawn", 1.0)])
-    c0 = cached()
+    gguf = os.path.realpath(FLUX_GGUF)
+    evict(gguf)
+    c0, r0 = cached(), resident_bytes(gguf)
     bench.run_tile512(p, e, 2)
     torch.cuda.synchronize()
-    c1 = cached()
-print("RESULT", p.weights_source, hwm, rss, status("VmRSS"), p._slots.pinned_bytes, c0, c1, flush=True)
+    c1, r1 = cached(), resident_bytes(gguf)
+print("RESULT", p.weights_source, hwm, rss, status("VmRSS"), p._slots.pinned_bytes, c0, c1, r0, r1, flush=True)
 p.close()
 """
 
@@ -93,12 +101,15 @@ def test_painter_from_ssd_holds_no_weights():
     """From the SSD (FLUX_WEIGHTS_SOURCE=ssd, Task 10b) the painter never reads the blocks' 6.6 GB of Q4_K weights into
     RAM: its load peaks under 4 GB and it settles under 3 GB (the arena path: 7.87 / 7.52 GB), page-locking the staging
     ring and the resident biases only (< 1 GB). A pass reads every block from the file with O_DIRECT, which doesn't go
-    through the page cache: Cached grows by less than 0.5 GB over two passes (13.3 GB read)."""
-    src, hwm, rss, rss_pass, pinned, c0, c1 = _painter_rss("ssd")
-    hwm, rss, rss_pass, pinned, c0, c1 = map(int, (hwm, rss, rss_pass, pinned, c0, c1))
+    through the page cache: with the GGUF evicted first, its own resident pages (mincore) stay under 64 MB over two
+    passes (13.3 GB read). Red check: FLUX_SSD_BUFFERED_TEST=1 (the reader without O_DIRECT) leaves ~6.6 GB of the file
+    cached and fails here."""
+    src, hwm, rss, rss_pass, pinned, c0, c1, r0, r1 = _painter_rss("ssd")
+    hwm, rss, rss_pass, pinned, c0, c1, r0, r1 = map(int, (hwm, rss, rss_pass, pinned, c0, c1, r0, r1))
     print(f"\nSSD painter: peak RSS {hwm / 1e9:.2f} GB, after setup {rss / 1e9:.2f} GB, after 2 passes "
-          f"{rss_pass / 1e9:.2f} GB, pinned {pinned / 1e9:.3f} GB, Cached {c0 / 1e9:.2f} -> {c1 / 1e9:.2f} GB")
+          f"{rss_pass / 1e9:.2f} GB, pinned {pinned / 1e9:.3f} GB, Cached {c0 / 1e9:.2f} -> {c1 / 1e9:.2f} GB, "
+          f"GGUF resident {r0 / 1e6:.1f} -> {r1 / 1e6:.1f} MB")
     assert src == "ssd"
     assert hwm < 4e9 and rss < 3e9 and rss_pass < 3e9
     assert 0 < pinned < 1e9
-    assert c1 - c0 < 0.5e9
+    assert r0 < 64e6 and r1 < 64e6

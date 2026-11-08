@@ -42,8 +42,14 @@ class DirectReader:
     and addresses. A short read (the file ends first) raises IOError naming the offset. queue_depth: chunks of
     `chunk` bytes in the kernel at once. One thread at a time; close() waits for reads in flight (safe twice)."""
 
-    def __init__(self, path: str, queue_depth: int = 8, chunk: int = 1 << 20):
-        self._r = _ext().DirectReader(str(path), queue_depth, chunk)
+    def __init__(self, path: str, queue_depth: int = 8, chunk: int = 1 << 20, direct: bool | None = None):
+        # direct=False opens without O_DIRECT (buffered, through the page cache): a test switch only, to show the
+        # page-cache checks can fail. None: FLUX_SSD_BUFFERED_TEST=1 in the environment turns it off, else on.
+        if direct is None:
+            import os
+
+            direct = os.environ.get("FLUX_SSD_BUFFERED_TEST") != "1"
+        self._r = _ext().DirectReader(str(path), queue_depth, chunk, direct)
         self.path = str(path)
 
     def read_into(self, offset: int, nbytes: int, dst: torch.Tensor) -> None:
@@ -456,3 +462,35 @@ def drop_file_cache(root) -> int:
         except OSError:
             continue
     return total
+
+
+def resident_bytes(path) -> int:
+    """How many bytes of the file are in the page cache now (its pages, by mmap + mincore; the last page counted whole).
+    Reads nothing: mapping a file and asking mincore doesn't fault pages in."""
+    import ctypes
+    import mmap
+    import os
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+    libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
+    size = os.path.getsize(path)
+    if size == 0:
+        return 0
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        addr = libc.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0)
+        if addr in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_errno(), f"mmap of {path} failed")
+        try:
+            page = mmap.PAGESIZE
+            vec = ctypes.create_string_buffer((size + page - 1) // page)
+            if libc.mincore(addr, size, vec) != 0:
+                raise OSError(ctypes.get_errno(), f"mincore of {path} failed")
+            return sum(b & 1 for b in vec.raw) * page
+        finally:
+            libc.munmap(addr, size)
+    finally:
+        os.close(fd)

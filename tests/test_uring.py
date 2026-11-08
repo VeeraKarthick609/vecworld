@@ -416,3 +416,32 @@ def test_ssd_source_recovers_from_a_failed_read_and_refuses_to_run_unbound(ssd_d
             src(2)
     finally:
         src.close()
+
+
+def test_direct_reads_leave_the_file_out_of_the_page_cache(ssd_dir):
+    """resident_bytes(path) counts the file's own pages in the page cache (mmap + mincore). A buffered read caches the
+    file; drop_file_cache evicts it; DirectReader's O_DIRECT reads leave it at ~0. The same reads with O_DIRECT turned
+    off (direct=False, a test switch) cache it again: the check can fail."""
+    from vecworld.engine.uring import DirectReader, drop_file_cache, resident_bytes
+
+    n = 8 * 2**20
+    path, data = _file(ssd_dir, n, seed=5)
+    fd = os.open(path, os.O_RDONLY)
+    os.fsync(fd)                                            # written: clean pages can be dropped, dirty ones can't
+    os.close(fd)
+    with open(path, "rb") as f:
+        f.read()
+    assert resident_bytes(path) >= n - ALIGN               # just written and read: cached
+    drop_file_cache(ssd_dir)
+    assert resident_bytes(path) <= 64 * ALIGN
+    dst = _aligned(n)
+    for direct, cached in ((True, False), (False, True)):
+        drop_file_cache(ssd_dir)
+        r = DirectReader(str(path), queue_depth=8, direct=direct)
+        try:
+            r.read_into(0, n, dst)
+        finally:
+            r.close()
+        assert bytes(dst.numpy()) == data
+        got = resident_bytes(path)
+        assert (got >= n - ALIGN) if cached else (got <= 64 * ALIGN), (direct, got)
