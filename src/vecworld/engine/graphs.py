@@ -25,6 +25,7 @@ import weakref
 from collections import Counter, OrderedDict
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vecworld.config import FLUX_GRAPH_MAX, FLUX_SLOT_RING
 from vecworld.engine.slots import BlockSlots, _tensors
@@ -48,6 +49,41 @@ class _Shared:
             self.t.copy_(src)
             self.src, self.ver = weakref.ref(src), ver
         return self.t
+
+
+def _arg(func, args, kwargs, name):
+    for k, a in enumerate(func._schema.arguments):
+        if a.name == name:
+            if name in kwargs:
+                return kwargs[name]
+            return args[k] if k < len(args) else a.default_value
+    return None
+
+
+class _NoRandom(TorchDispatchMode):
+    """Raises on any op that draws random numbers (torch.Tag.nondeterministic_seeded), except attention and dropout
+    with a dropout probability of 0 (FLUX's attention dispatches with dropout_p = 0).
+
+    The runner replays graphs with the extension's graph_launch, which skips CUDAGraph.replay()'s RNG prologue (the
+    philox seed / offset update): a graph that draws random numbers would draw the capture's numbers on every replay,
+    silently. Run over the eager warm-up that precedes each capture, it makes such a block fail at capture, naming it.
+    It sees PyTorch ops only: a custom extension kernel drawing its own random numbers (cuRAND) is not caught."""
+
+    def __init__(self, i: int):
+        super().__init__()
+        self.i = i
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if torch.Tag.nondeterministic_seeded in func.tags:
+            p = _arg(func, args, kwargs, "dropout_p")
+            if p is None and func.overloadpacket is torch.ops.aten.native_dropout:
+                p = 0.0 if not _arg(func, args, kwargs, "train") else _arg(func, args, kwargs, "p")
+            if p is None or float(p) != 0.0:
+                raise RuntimeError(f"block {self.i}: {func} draws random numbers, and its CUDA graph would repeat the "
+                                   "capture's numbers on every replay (graph_launch skips replay()'s RNG prologue); "
+                                   "run it eagerly (VECWORLD_GRAPHS=0)")
+        return func(*args, **kwargs)
 
 
 class _Key:
@@ -182,7 +218,8 @@ class GraphRunner:
             ins = (self._static(k, "es", es), self._static(k, "hs", hs))
         args = dict(hidden_states=ins[1], encoder_hidden_states=ins[0], temb=self._static(k, "temb", temb),
                     image_rotary_emb=(self._static(k, "cos", rot[0]), self._static(k, "sin", rot[1])))
-        w = inner(**args)                                   # warm-up, eager; also tells the output layout
+        with _NoRandom(i):
+            w = inner(**args)                               # warm-up, eager; also tells the output layout
         joint = w[0].untyped_storage().data_ptr() == w[1].untyped_storage().data_ptr()
         T, parity = w[0].shape[1], (i + 1) % 2
         if joint:
