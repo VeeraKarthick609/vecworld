@@ -15,7 +15,8 @@ crossfade. The differences:
 - The transformer is the 4-bit GGUF through diffusers. Its Q4_K linears run on the engine's hand-written kernel
   (vecworld.engine; VECWORLD_KERNEL, default FLUX_KERNEL = "w4a8") instead of diffusers' dequantize-then-matmul, its
   blocks run their norm / modulate / residual and q / k norm + RoPE glue fused (VECWORLD_FUSE, default on with an
-  engine kernel), bit-identical to diffusers', and they stream block by block through fixed-address weight slots,
+  engine kernel), bit-identical to diffusers', and they stream block by block from one page-locked host arena
+  (vecworld.engine.stream, Task 10a) through fixed-address weight slots,
   optionally replayed as CUDA graphs (VECWORLD_GRAPHS=1; default off: eager on the same slots, as fast). A
   first-block cache (vecworld.engine.cache, FLUX_CACHE_THRESHOLD / VECWORLD_CACHE_THRESHOLD; 0 = off) may skip
   blocks 1..56 of a pass when block 0's output barely changed since the window batch's previous step.
@@ -264,16 +265,19 @@ class FluxPainter(Painter):
 
             patch_blocks(tr)
         rowwise(tr)                             # a window's pass is the same in any batch (Task 9)
-        self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
+        if self.kernel is None:                 # group offload copies from the tensors where they lie
+            self._pinned = _pin_in_place([*tr.transformer_blocks, *tr.single_transformer_blocks])
         self.graphs = engine_graphs(self.kernel)
         self.cache_threshold = engine_cache_threshold(self.kernel)
         if self.kernel is not None:
-            # The engine streams the blocks through fixed-address slots and replays them as CUDA graphs (Task 7,
-            # docs/engine/07-cuda-graphs.md); after the patch, which the runner wraps.
+            # The engine streams the blocks from one page-locked host arena through fixed-address slots (Task 10a,
+            # docs/engine/10-streamer.md, on Task 7's slots), optionally replayed as CUDA graphs; after the patch,
+            # which the runner wraps.
             from vecworld.engine import graphs as graphs_mod
 
-            self._slots, self._runner = graphs_mod.stream_blocks(tr, dev, graphs=self.graphs,
-                                                                 ring=FLUX_SLOT_RING, max_graphs=FLUX_GRAPH_MAX)
+            self._slots, self._runner = graphs_mod.stream_blocks(tr, dev, graphs=self.graphs, ring=FLUX_SLOT_RING,
+                                                                 max_graphs=FLUX_GRAPH_MAX, pack=True)
+            self._arena = self._slots.arena
         else:
             tr.enable_group_offload(onload_device=dev, offload_device=torch.device("cpu"),
                                     offload_type="block_level", num_blocks_per_group=1, use_stream=True)
@@ -298,7 +302,8 @@ class FluxPainter(Painter):
         self.keep_a16: tuple[str, ...] = getattr(self, "keep_a16", ())   # the linears kept on mma (keep_for)
         self.fused: bool = getattr(self, "fused", False)                # blocks run fused glue (engine_fuse)
         self.graphs: bool = getattr(self, "graphs", False)              # blocks replay as graphs (engine_graphs)
-        self._slots = getattr(self, "_slots", None)                     # engine.slots.BlockSlots (engine kernels)
+        self._slots = getattr(self, "_slots", None)                     # engine.stream.BlockStreamer (engine kernels)
+        self._arena = getattr(self, "_arena", None)                     # its engine.stream.HostArena
         self._runner = getattr(self, "_runner", None)                   # engine.graphs.GraphRunner
         self.cache_threshold: float = getattr(self, "cache_threshold", 0.0)
         self.batch: int = getattr(self, "batch", None) or engine_batch()   # windows per pass, at most
@@ -328,8 +333,8 @@ class FluxPainter(Painter):
         can't paint after it."""
         self._closed = True
         runner, slots = getattr(self, "_runner", None), getattr(self, "_slots", None)
-        ptrs = getattr(self, "_pinned", [])
-        self._runner = self._slots = None
+        arena, ptrs = getattr(self, "_arena", None), getattr(self, "_pinned", [])
+        self._runner = self._slots = self._arena = None
         self._pinned = []
         try:
             if runner is not None:
@@ -339,8 +344,12 @@ class FluxPainter(Painter):
                 if slots is not None:
                     slots.close()           # waits for the copies from the pinned memory before it is released
             finally:
-                if ptrs:
-                    _unpin(ptrs)
+                try:
+                    if arena is not None:
+                        arena.close()
+                finally:
+                    if ptrs:
+                        _unpin(ptrs)
 
     def __del__(self):
         try:

@@ -13,7 +13,11 @@ stream; CUDA events order the copy after the slot's previous user (block i - rin
 So block i + 1's copy overlaps block i's compute. A block that runs out of order (or first) has its copy issued on
 demand. A block in `hold` keeps its slot's next copy back until release(i): the first-block cache (engine.cache)
 holds block 0's, so a pass that skips blocks 1..56 copies nothing and block 0 stays in place for the next pass.
-Task 10 grows this into BlockStreamer (reads from the SSD instead of host memory).
+
+The copies and events are issued by the extension's SlotRing (csrc/stream.cpp), one call per hook that keeps the GIL
+(Task 10a: a PyTorch op releases and re-takes it, milliseconds each with another Python thread busy).
+engine.stream.BlockStreamer feeds the slots from one contiguous run of bytes per block (a host arena now, the SSD in
+Task 10b) instead of per-tensor host copies.
 """
 import threading
 from collections.abc import Callable
@@ -29,6 +33,17 @@ def _tensors(block: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {**dict(block.named_parameters()), **dict(block.named_buffers())}
 
 
+def block_layout(block: torch.nn.Module) -> tuple[dict[str, int], int]:
+    """Where each of a block's tensors (named_parameters + named_buffers, in that order) sits in its slot: byte offsets,
+    each rounded up to ALIGN, and the block's size (its end, rounded up to ALIGN). engine.stream.HostArena packs a
+    block's host bytes in this same layout, so a block is copied in with one copy."""
+    lay, off = {}, 0
+    for name, t in _tensors(block).items():
+        lay[name] = off
+        off += -(-t.numel() * t.element_size() // ALIGN) * ALIGN
+    return lay, off
+
+
 class BlockSlots:
     """`ring` device slots of fixed address the blocks' weights are copied into, block i into slot i % ring.
 
@@ -39,65 +54,111 @@ class BlockSlots:
     Forward hooks on the blocks drive the copies: before block i runs, the current stream waits until block i's
     weights are in its slot (issuing the copy if it isn't under way); after it, the next block that uses the same
     slot (cyclically: blocks wrap to the next pass) is copied in on the side stream. Hooks run outside a block's
-    forward, so a CUDA graph replayed inside it (engine.graphs.GraphRunner) sees the weights in place."""
+    forward, so a CUDA graph replayed inside it (engine.graphs.GraphRunner) sees the weights in place.
+
+    Subclasses (engine.stream.BlockStreamer) give the copies another source by overriding _copies(i) and _restore(i),
+    and may defer install()."""
 
     def __init__(self, blocks: list[torch.nn.Module], host: Callable[[int], dict[str, torch.Tensor]], ring: int = 2,
                  device="cuda"):
-        if ring < 1 or len(blocks) == 0:
-            raise ValueError(f"BlockSlots needs a ring >= 1 and blocks (ring {ring}, {len(blocks)} blocks)")
-        self.blocks, self.ring, self.n = list(blocks), ring, len(blocks)
-        self.device = torch.device(device)
-        self._host, self._layout, size = [], [], 0
+        self._init(blocks, ring, device)
+        self._host = []
         for i, b in enumerate(self.blocks):
             mine, h = _tensors(b), host(i)
             if set(mine) != set(h):
                 raise ValueError(f"block {i}: host tensors {sorted(set(h) ^ set(mine))} don't match the block's")
-            lay, off = {}, 0
             for name, t in mine.items():
                 ht = h[name]
                 if ht.shape != t.shape or ht.dtype != t.dtype:
                     raise ValueError(f"block {i} {name}: host {ht.dtype} {tuple(ht.shape)} for {t.dtype} "
                                      f"{tuple(t.shape)}")
-                lay[name] = off
-                off += -(-ht.numel() * ht.element_size() // ALIGN) * ALIGN
             bad = [k for k in mine if not h[k].is_contiguous()]
             if bad:
                 # Loud, like check_aligned: a contiguous copy would be pageable (no asynchronous copy) and close()
                 # would hand it back in place of the page-locked original.
                 raise ValueError(f"block {i}: host tensors {bad} are not contiguous")
             self._host.append({k: h[k] for k in mine})
+        self.install()
+
+    def _init(self, blocks, ring, device) -> None:
+        """The layout and the state that outlives install() / close()."""
+        if ring < 1 or len(blocks) == 0:
+            raise ValueError(f"BlockSlots needs a ring >= 1 and blocks (ring {ring}, {len(blocks)} blocks)")
+        self.blocks, self.ring, self.n = list(blocks), ring, len(blocks)
+        self.device = torch.device(device)
+        if self.device.index is None:
+            self.device = torch.device(self.device.type, torch.cuda.current_device())
+        self._layout, self.nbytes = [], []
+        for b in self.blocks:
+            lay, size = block_layout(b)
             self._layout.append(lay)
-            size = max(size, off)
-        self.slot_bytes = size
-        self.slots = [torch.empty(size, dtype=torch.uint8, device=self.device) for _ in range(ring)]
-        # (dst view, host tensor) per block: the copies, and the views the block's tensors become
-        self._pairs: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
-        for i, b in enumerate(self.blocks):
-            slot, pairs = self.slots[i % ring], []
-            for name, t in _tensors(b).items():
-                ht, off = self._host[i][name], self._layout[i][name]
-                view = slot[off:off + ht.numel() * ht.element_size()].view(ht.dtype).view(ht.shape)
-                if ht.numel():
-                    check_aligned(view, f"block {i} {name} in slot {i % ring} (offset {off})")
-                t.data = view
-                pairs.append((view, ht))
-            self._pairs.append(pairs)
-        self.stream = torch.cuda.Stream(self.device)
+            self.nbytes.append(size)
+        self.slot_bytes = max(self.nbytes)
+        self.slots: list[torch.Tensor] = []
         self.loaded: list[int | None] = [None] * ring       # the block each slot holds (or is receiving)
-        self._copied = [torch.cuda.Event() for _ in range(ring)]   # slot s holds loaded[s] (recorded on the side)
-        self._freed = [torch.cuda.Event() for _ in range(ring)]    # slot s's last user ended (recorded on main)
         self._used = [False] * ring
+        self._hooks: list = []
+        self._views: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
         self.copies = 0
         # Blocks whose after() holds back the prefetch of their slot's next user until release(i) (engine.cache: block
         # 0's, until the cache decides whether blocks 1..56 run at all), and the prefetches held back.
         self.hold: set[int] = set()
         self._held: dict[int, int] = {}
         self._owner: int | None = None                      # the thread that ran the first block (see before())
+
+    def install(self) -> None:
+        """Allocate the slots, make every block's tensors views into its slot and hook the blocks (a no-op while
+        installed)."""
+        from vecworld.engine.ext import load_ext
+
+        if self._hooks:
+            return
+        ring = self.ring
+        self.slots = [torch.empty(self.slot_bytes, dtype=torch.uint8, device=self.device) for _ in range(ring)]
+        # (block tensor, slot view) per block: what the block's tensors are while installed
+        self._views = []
+        for i, b in enumerate(self.blocks):
+            slot, views = self.slots[i % ring], []
+            for name, t in _tensors(b).items():
+                off, nb = self._layout[i][name], t.numel() * t.element_size()
+                view = slot[off:off + nb].view(t.dtype).view(t.shape)
+                if nb:
+                    check_aligned(view, f"block {i} {name} in slot {i % ring} (offset {off})")
+                views.append((t, view))
+            self._views.append(views)
+        self._installed()
+        for views in self._views:
+            for t, view in views:
+                t.data = view
+        self.stream = torch.cuda.Stream(self.device)
+        self._ring = load_ext().SlotRing(ring, self.stream.cuda_stream, self.device.index)
+        self.loaded, self._used = [None] * ring, [False] * ring
+        self._held.clear()
         # always_call: the slot is released after a block whose forward raised too, ordered after whatever kernels
         # it queued, so a later copy into the slot can't overwrite weights they still read
         self._hooks = [h for i, b in enumerate(self.blocks) for h in (
             b.register_forward_pre_hook(lambda m, a, i=i: self.before(i)),
             b.register_forward_hook(lambda m, a, o, i=i: self.after(i), always_call=True))]
+
+    def _installed(self) -> None:
+        """Called by install() before the blocks' tensors become slot views: the per-tensor copy lists (device view,
+        host tensor, bytes), fixed for the run."""
+        self._flat = []
+        for i, views in enumerate(self._views):
+            flat = []
+            for (t, view), name in zip(views, _tensors(self.blocks[i])):
+                ht = self._host[i][name]
+                if ht.numel():
+                    flat += [view.data_ptr(), ht.data_ptr(), ht.numel() * ht.element_size()]
+            self._flat.append(flat)
+
+    def _copies(self, i: int) -> list[int]:
+        """Block i's copies into its slot: flat (device dst, host src, bytes) triples."""
+        return self._flat[i]
+
+    def _restore(self, i: int) -> dict[str, torch.Tensor]:
+        """What block i's tensors become at close()."""
+        return self._host[i]
 
     def next_user(self, i: int) -> int:
         """The block that uses block i's slot after it, cyclically (the blocks repeat every pass)."""
@@ -107,12 +168,7 @@ class BlockSlots:
     def load(self, i: int) -> None:
         """Copy block i's tensors into its slot on the side stream, after the slot's last user is done."""
         s = i % self.ring
-        with torch.cuda.stream(self.stream):
-            if self._used[s]:
-                self.stream.wait_event(self._freed[s])
-            for dst, src in self._pairs[i]:
-                dst.copy_(src, non_blocking=True)
-            self._copied[s].record(self.stream)
+        self._ring.load(s, self._used[s], self._copies(i))
         self.loaded[s] = i
         self.copies += 1
 
@@ -128,12 +184,12 @@ class BlockSlots:
         s = i % self.ring
         if self.loaded[s] != i:
             self.load(i)
-        torch.cuda.current_stream(self.device).wait_event(self._copied[s])
+        self._ring.before(s)
 
     def after(self, i: int) -> None:
         """Block i's work is queued: its slot is free once it ends; start copying the slot's next user in."""
         s = i % self.ring
-        self._freed[s].record(torch.cuda.current_stream(self.device))   # (a wait already queued keeps its state)
+        self._ring.after(s)                                 # (a wait already queued keeps its state)
         self._used[s] = True
         j = self.next_user(i)
         if j == i:
@@ -166,6 +222,8 @@ class BlockSlots:
             h.remove()
         self._hooks = []
         for i, b in enumerate(self.blocks):
+            back = self._restore(i)
             for name, t in _tensors(b).items():
-                t.data = self._host[i][name]
-        self.slots, self._pairs, self.loaded = [], [], [None] * self.ring
+                t.data = back[name]
+        self.slots, self._views, self.loaded = [], [], [None] * self.ring
+        self._ring = None

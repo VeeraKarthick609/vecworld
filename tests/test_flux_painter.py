@@ -320,7 +320,8 @@ def test_painter_batch_follows_the_kernel(monkeypatch):
     monkeypatch.setattr(blocks_mod, "patch_blocks", lambda tr: 57)
     monkeypatch.setattr(painter_mod, "rowwise", lambda tr: None)
     monkeypatch.setattr(painter_mod, "_pin_in_place", lambda mods: [])
-    monkeypatch.setattr(graphs_mod, "stream_blocks", lambda tr, dev, graphs, **k: ("slots", "runner"))
+    monkeypatch.setattr(graphs_mod, "stream_blocks",
+                        lambda tr, dev, graphs, **k: (SimpleNamespace(arena="arena"), "runner"))
 
     def stop_at_vae(*a, **k):
         raise Loaded
@@ -803,7 +804,9 @@ def test_graphs_default_off_opt_in(monkeypatch):
 def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
     """Under an engine kernel FluxPainter puts the blocks on fixed-address slots with a GraphRunner
     (vecworld.engine.graphs.stream_blocks; graphs as engine_graphs says) instead of diffusers' group offload, after
-    the swap, the fused patch, the rowwise outer layers (Task 9, every kernel) and the pinning; under VECWORLD_KERNEL=off it keeps group offload (the reference)."""
+    the swap, the fused patch and the rowwise outer layers (Task 9, every kernel), packing the blocks into one
+    page-locked host arena (pack=True, Task 10a) instead of pinning them in place; under VECWORLD_KERNEL=off it pins in
+    place and keeps group offload (the reference)."""
     import diffusers
 
     import vecworld.engine.blocks as blocks_mod
@@ -827,14 +830,15 @@ def test_painter_streams_blocks_from_slots_under_an_engine_kernel(monkeypatch):
     monkeypatch.setattr(painter_mod, "rowwise", lambda tr: order.append("rows"))
     monkeypatch.setattr(painter_mod, "_pin_in_place", lambda mods: order.append("pin") or [])
     monkeypatch.setattr(graphs_mod, "stream_blocks",
-                        lambda tr, dev, graphs, **k: order.append(f"slots graphs={graphs}") or ("slots", "runner"))
+                        lambda tr, dev, graphs, **k: order.append(f"slots graphs={graphs} pack={k.get('pack')}")
+                        or (SimpleNamespace(arena="arena"), "runner"))
 
     def stop_at_vae(*a, **k):
         raise Loaded
 
     monkeypatch.setattr(diffusers.AutoencoderKL, "from_pretrained", stop_at_vae)
-    for kernel, graphs, want in ((None, None, ["swap", "patch", "rows", "pin", "slots graphs=False"]),
-                                 ("mma", "1", ["swap", "patch", "rows", "pin", "slots graphs=True"]),
+    for kernel, graphs, want in ((None, None, ["swap", "patch", "rows", "slots graphs=False pack=True"]),
+                                 ("mma", "1", ["swap", "patch", "rows", "slots graphs=True pack=True"]),
                                  ("off", None, ["rows", "pin", "offload"]), ("off", "1", ["rows", "pin", "offload"])):
         for k in ("VECWORLD_KERNEL", "VECWORLD_FUSE", "VECWORLD_GRAPHS"):
             monkeypatch.delenv(k, raising=False)
@@ -863,11 +867,15 @@ def test_close_frees_slots_and_unpins_even_if_the_runner_fails(monkeypatch):
         def close(self):
             done.append("slots")
 
+    class Arena:
+        def close(self):
+            done.append("arena")
+
     monkeypatch.setattr(painter_mod, "_unpin", lambda ptrs: done.append(("unpin", tuple(ptrs))))
     p = fake_painter()
-    p._runner, p._slots, p._pinned = Runner(), Slots(), [1, 2]
+    p._runner, p._slots, p._arena, p._pinned = Runner(), Slots(), Arena(), [1, 2]
     with pytest.raises(RuntimeError, match="sticky"):
         p.close()
-    assert done == ["slots", ("unpin", (1, 2))]
-    assert p._runner is None and p._slots is None and p._pinned == []
+    assert done == ["slots", "arena", ("unpin", (1, 2))]
+    assert p._runner is None and p._slots is None and p._arena is None and p._pinned == []
     p.close()                                               # safe twice

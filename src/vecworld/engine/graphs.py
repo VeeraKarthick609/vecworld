@@ -225,15 +225,23 @@ class GraphRunner:
 
 
 def stream_blocks(transformer: torch.nn.Module, device="cuda", ring: int = FLUX_SLOT_RING, graphs: bool = True,
-                  max_graphs: int = FLUX_GRAPH_MAX) -> tuple[BlockSlots, GraphRunner]:
+                  max_graphs: int = FLUX_GRAPH_MAX, pack: bool = False) -> tuple[BlockSlots, GraphRunner]:
     """Put a FLUX transformer on the engine's block streaming, in place of diffusers' group offload: everything but
-    the blocks moves to `device` for good (embedders, output norm and projection: ~57 MB), the blocks' current (host,
-    page-locked) tensors become BlockSlots' host copies and the blocks view into `ring` slots, and a GraphRunner
-    replays them (graphs=False: eagerly). Call it after swap_linears and patch_blocks."""
+    the blocks moves to `device` for good (embedders, output norm and projection: ~57 MB), the blocks view into `ring`
+    slots, and a GraphRunner replays them (graphs=False: eagerly). Call it after swap_linears and patch_blocks.
+
+    pack=False: the blocks' current (host, page-locked) tensors become BlockSlots' host copies (Task 7). pack=True (the
+    painter, Task 10a): their (not page-locked) host tensors are moved into one page-locked arena, block by block, and
+    an engine.stream.BlockStreamer streams each block with one copy from it (its arena: the streamer's .arena)."""
     for name, child in transformer.named_children():
         if name not in BLOCK_LISTS:
             child.to(device)
     blocks = [b for name in BLOCK_LISTS for b in getattr(transformer, name)]
-    host = [{n: t.data for n, t in _tensors(b).items()} for b in blocks]
-    slots = BlockSlots(blocks, lambda i: host[i], ring=ring, device=device)
+    if pack:
+        from vecworld.engine.stream import BlockStreamer
+
+        slots = BlockStreamer.packed(blocks, ring=ring, device=device)
+    else:
+        host = [{n: t.data for n, t in _tensors(b).items()} for b in blocks]
+        slots = BlockSlots(blocks, lambda i: host[i], ring=ring, device=device)
     return slots, GraphRunner(blocks, slots, max_graphs=max_graphs, enabled=graphs)
