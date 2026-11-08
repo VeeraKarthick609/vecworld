@@ -8,6 +8,18 @@ from PIL import Image
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
+def pytest_collection_modifyitems(config, items):
+    """Tests marked card_limit run first. They need nearly all of the 4 GB card (the six-spot walk peaks at 3.32 GiB
+    allocated of 3.68 GiB usable), and every GPU module before them leaves device memory this process can't give back:
+    not PyTorch tensors (allocated is back to ~0.01 GB between modules) but CUDA libraries' code and handles loaded
+    into the context, 0.14 GB alone -> 0.24 GB after the GPU modules (measured with a per-test tracker, the same at
+    fcbfe73 and fe9e0a2). The walk then ran out of memory 5 MB short. A fresh process can't host it either: the
+    suite's own context holds the card's last 0.24 GB."""
+    first = [it for it in items if it.get_closest_marker("card_limit")]
+    if first:
+        items[:] = first + [it for it in items if not it.get_closest_marker("card_limit")]
+
+
 class FakePainter:
     """Solid tiny panoramas; records every call; fail_next raises a CUDA OOM once."""
 

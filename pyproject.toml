@@ -32,7 +32,8 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-markers = ["gpu: needs real models/GPU", "ui: drives headless Firefox"]
+markers = ["gpu: needs real models/GPU", "ui: drives headless Firefox",
+           "card_limit: needs nearly the whole 4 GB card; runs before every other test (conftest)"]
 addopts = "-m 'not gpu and not ui'"
 testpaths = ["tests"]
 pythonpath = ["tests"]

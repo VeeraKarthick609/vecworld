@@ -187,7 +187,8 @@ def test_graph_launch_keeps_the_gil():
     for t in th:
         t.start()
     try:
-        ours = per_call(lambda: launch(g.raw_cuda_graph_exec()))
+        ex = g.raw_cuda_graph_exec()                        # the runner keeps each graph's handle too
+        ours = per_call(lambda: launch(ex))
         theirs = per_call(g.replay)
     finally:
         stop[0] = True

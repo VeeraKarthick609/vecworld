@@ -75,6 +75,7 @@ def test_three_spots_in_a_row_timing(tmp_path):
 
 
 @pytest.mark.gpu
+@pytest.mark.card_limit
 def test_six_spot_walk_at_the_walk_limit():
     """Heading 0, 0, 60, 60, -60, 0, each spot built for an exit at its parent's walk limit (as a pre-dream is):
     the distances are what was walked, and the frames go to /tmp/roam_t8b (sheet.png) to be looked at."""
